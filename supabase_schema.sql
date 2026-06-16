@@ -17,6 +17,10 @@ create policy "Allow read access to authenticated users" on public.users
 create policy "Allow users to update their own profile" on public.users
   for update to authenticated using (auth.uid() = id);
 
+-- Add insert policy so client can register their own profile data during signup
+create policy "Allow insert for self registration" on public.users
+  for insert with check (true);
+
 -- Trigger to automatically insert user details from auth.users on signup
 create or replace function public.handle_new_user()
 returns trigger as $$
@@ -26,7 +30,8 @@ begin
     new.id,
     new.email,
     coalesce(new.raw_user_meta_data->>'gst_number', '')
-  );
+  )
+  on conflict (id) do nothing;
   return new;
 end;
 $$ language plpgsql security definer;
