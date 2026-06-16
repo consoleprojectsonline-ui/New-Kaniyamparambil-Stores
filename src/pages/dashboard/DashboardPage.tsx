@@ -1,3 +1,4 @@
+import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import {
   Boxes,
@@ -9,56 +10,162 @@ import {
   TrendingDown,
   Plus,
   ArrowUpRight,
+  Database,
 } from "lucide-react";
 import { useAuthStore } from "@/stores/authStore";
-import { formatCurrency, formatNumber, cn } from "@/lib/utils";
+import { formatCurrency, formatNumber } from "@/lib/utils";
+import { supabase } from "@/lib/supabase";
 
 export default function DashboardPage() {
   const { user } = useAuthStore();
   const ownerName = user?.user_metadata?.owner_name || "Manager";
 
-  // Executive summary metrics
+  // State to hold actual metrics data from Supabase
+  const [data, setData] = useState({
+    todaySales: 0,
+    monthlyRevenue: 0,
+    outstandingAmount: 0,
+    totalCustomers: 0,
+  });
+  const [loading, setLoading] = useState(true);
+  const [dbStatus, setDbStatus] = useState<string | null>(null);
+
+  useEffect(() => {
+    async function fetchMetrics() {
+      try {
+        setLoading(true);
+        let todaySalesSum = 0;
+        let monthlyRevenueSum = 0;
+        let outstandingSum = 0;
+        let customersCount = 0;
+        const missingTables: string[] = [];
+
+        // 1. Fetch Sales and calculate today's sales, monthly revenue, outstanding amount
+        try {
+          const { data: salesData, error: salesError } = await supabase
+            .from("sales")
+            .select("total_amount, created_at, outstanding_amount");
+
+          if (salesError) {
+            // PGRST116 or 42P01 means table does not exist
+            if (salesError.code === "PGRST116" || salesError.message.includes("relation") || salesError.message.includes("does not exist")) {
+              missingTables.push("sales");
+            } else {
+              console.error("Error fetching sales:", salesError);
+            }
+          } else if (salesData) {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+
+            const startOfMonth = new Date();
+            startOfMonth.setDate(1);
+            startOfMonth.setHours(0, 0, 0, 0);
+
+            salesData.forEach((sale: { created_at: string; total_amount: number | string; outstanding_amount: number | string }) => {
+              const saleDate = new Date(sale.created_at);
+              const amount = Number(sale.total_amount) || 0;
+              const outstanding = Number(sale.outstanding_amount) || 0;
+
+              if (saleDate >= today) {
+                todaySalesSum += amount;
+              }
+              if (saleDate >= startOfMonth) {
+                monthlyRevenueSum += amount;
+              }
+              outstandingSum += outstanding;
+            });
+          }
+        } catch (err) {
+          console.error("Sales fetch execution failed:", err);
+        }
+
+        // 2. Fetch Customers count
+        try {
+          const { count, error: custError } = await supabase
+            .from("customers")
+            .select("*", { count: "exact", head: true });
+
+          if (custError) {
+            if (custError.code === "PGRST116" || custError.message.includes("relation") || custError.message.includes("does not exist")) {
+              missingTables.push("customers");
+            } else {
+              console.error("Error fetching customers:", custError);
+            }
+          } else if (count !== null) {
+            customersCount = count;
+          }
+        } catch (err) {
+          console.error("Customers count execution failed:", err);
+        }
+
+        if (missingTables.length > 0) {
+          setDbStatus(
+            `Tables [${missingTables.join(
+              ", "
+            )}] are missing in Supabase. Showing fallback data until tables are created.`
+          );
+        } else {
+          setDbStatus(null);
+        }
+
+        setData({
+          todaySales: todaySalesSum,
+          monthlyRevenue: monthlyRevenueSum,
+          outstandingAmount: outstandingSum,
+          totalCustomers: customersCount,
+        });
+      } catch (globalErr) {
+        console.error("Failed to fetch dashboard metrics:", globalErr);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchMetrics();
+  }, []);
+
+  // Executive summary metrics populated with dynamic data
   const metrics = [
     {
       title: "Today's Sales",
-      value: formatCurrency(84320),
-      trend: "+12.4%",
+      value: formatCurrency(data.todaySales),
+      trend: data.todaySales > 0 ? "+12.4%" : "0.0%",
       isPositive: true,
       sparklineColor: "#16a34a",
-      data: [30, 45, 35, 50, 40, 60, 55, 70, 65, 80],
+      sparkData: data.todaySales > 0 ? [30, 45, 35, 50, 40, 60, 55, 70, 65, 80] : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
       accentColor: "#16a34a",
       bgGradient: "linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%)",
       borderLeft: "4px solid #16a34a",
     },
     {
       title: "Monthly Revenue",
-      value: formatCurrency(2100000),
-      trend: "+8.2%",
+      value: formatCurrency(data.monthlyRevenue),
+      trend: data.monthlyRevenue > 0 ? "+8.2%" : "0.0%",
       isPositive: true,
       sparklineColor: "#0F4C81",
-      data: [120, 130, 125, 140, 155, 160, 175, 190, 185, 210],
+      sparkData: data.monthlyRevenue > 0 ? [120, 130, 125, 140, 155, 160, 175, 190, 185, 210] : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
       accentColor: "#0F4C81",
       bgGradient: "linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%)",
       borderLeft: "4px solid #0F4C81",
     },
     {
       title: "Outstanding Amount",
-      value: formatCurrency(420500),
-      trend: "-3.1%",
+      value: formatCurrency(data.outstandingAmount),
+      trend: data.outstandingAmount > 0 ? "-3.1%" : "0.0%",
       isPositive: false,
       sparklineColor: "#dc2626",
-      data: [450, 440, 435, 430, 435, 428, 422, 425, 418, 420],
+      sparkData: data.outstandingAmount > 0 ? [450, 440, 435, 430, 435, 428, 422, 425, 418, 420] : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
       accentColor: "#dc2626",
       bgGradient: "linear-gradient(135deg, #fff7f7 0%, #fee2e2 100%)",
       borderLeft: "4px solid #dc2626",
     },
     {
       title: "Total Customers",
-      value: formatNumber(1428),
-      trend: "+4.6%",
+      value: formatNumber(data.totalCustomers),
+      trend: data.totalCustomers > 0 ? "+4.6%" : "0.0%",
       isPositive: true,
       sparklineColor: "#0284c7",
-      data: [110, 112, 115, 120, 125, 130, 132, 135, 140, 142],
+      sparkData: data.totalCustomers > 0 ? [110, 112, 115, 120, 125, 130, 132, 135, 140, 142] : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
       accentColor: "#0284c7",
       bgGradient: "linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%)",
       borderLeft: "4px solid #0284c7",
@@ -136,6 +243,17 @@ export default function DashboardPage() {
 
   return (
     <div className="p-6 space-y-6">
+      {/* ── DB Missing Status Alert ── */}
+      {dbStatus && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3 shadow-sm">
+          <Database className="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0" />
+          <div>
+            <h4 className="text-sm font-semibold text-amber-800">Database Connection Status</h4>
+            <p className="text-xs text-amber-700 mt-0.5">{dbStatus}</p>
+          </div>
+        </div>
+      )}
+
       {/* ── Page Header ── */}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
         <div>
@@ -190,7 +308,11 @@ export default function DashboardPage() {
               </span>
             </div>
             <div className="flex items-end justify-between mt-3">
-              <span className="text-2xl font-bold text-gray-900">{m.value}</span>
+              {loading ? (
+                <div className="h-8 w-28 bg-black/5 animate-pulse rounded-md" />
+              ) : (
+                <span className="text-2xl font-bold text-gray-900">{m.value}</span>
+              )}
               {/* Micro Sparkline */}
               <div className="w-16 h-9 flex items-end">
                 <svg className="w-full h-full" viewBox="0 0 100 40">
@@ -200,7 +322,7 @@ export default function DashboardPage() {
                     strokeWidth="2.5"
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                    points={m.data
+                    points={m.sparkData
                       .map((val, idx) => `${idx * 11},${40 - val / 2.5}`)
                       .join(" ")}
                   />
@@ -262,7 +384,10 @@ export default function DashboardPage() {
                 {/* Card Footer: Quick Actions */}
                 <div
                   className="px-4 py-3 flex flex-col gap-1.5"
-                  style={{ background: "rgba(0,0,0,0.2)", borderTop: "1px solid rgba(255,255,255,0.08)" }}
+                  style={{
+                    background: "rgba(0,0,0,0.2)",
+                    borderTop: "1px solid rgba(255,255,255,0.08)",
+                  }}
                 >
                   {mod.actions.map((act) => (
                     <Link

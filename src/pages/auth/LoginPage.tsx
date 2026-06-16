@@ -175,8 +175,9 @@ export default function LoginPage() {
         setError("Unable to authenticate. Please check your credentials.");
         setLoading(false);
       }
-    } catch (err: any) {
-      setError(err?.message || "An unexpected error occurred. Please try again.");
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "An unexpected error occurred. Please try again.";
+      setError(errMsg);
       setLoading(false);
     }
   };

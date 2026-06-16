@@ -16,20 +16,13 @@ import {
 import { useAuthStore } from "@/stores/authStore";
 import { cn } from "@/lib/utils";
 
-// Sub-pages placeholders
+// Sub-pages
 import DashboardPage from "@/pages/dashboard/DashboardPage";
-
-// Temporary component placeholders for other screens
-function PlaceholderPage({ title }: { title: string }) {
-  return (
-    <div className="p-6 bg-background h-full">
-      <div className="bg-white rounded border border-border p-8 shadow-card">
-        <h1 className="text-page-title font-semibold text-text-primary mb-2">{title}</h1>
-        <p className="text-text-secondary text-sm">This module is under construction.</p>
-      </div>
-    </div>
-  );
-}
+import InventoryPage from "@/pages/inventory/InventoryPage";
+import PurchasePage from "@/pages/purchase/PurchasePage";
+import SalesPage from "@/pages/sales/SalesPage";
+import DayBookPage from "@/pages/daybook/DayBookPage";
+import QuotationPage from "@/pages/quotation/QuotationPage";
 
 export default function AppLayout() {
   const { user, logout, loading } = useAuthStore();
@@ -39,7 +32,10 @@ export default function AppLayout() {
 
   // Auto-close sidebar on route change (for mobile)
   useEffect(() => {
-    setSidebarOpen(false);
+    const timer = setTimeout(() => {
+      setSidebarOpen(false);
+    }, 0);
+    return () => clearTimeout(timer);
   }, [location.pathname]);
 
   // Protect route
@@ -195,11 +191,11 @@ export default function AppLayout() {
         <main className="flex-1 overflow-y-auto">
           <Routes>
             <Route path="dashboard" element={<DashboardPage />} />
-            <Route path="inventory" element={<PlaceholderPage title="Inventory (Items)" />} />
-            <Route path="purchase"  element={<PlaceholderPage title="Purchase Details" />} />
-            <Route path="sales"     element={<PlaceholderPage title="Sales & Billing" />} />
-            <Route path="daybook"   element={<PlaceholderPage title="Day Book" />} />
-            <Route path="quotation" element={<PlaceholderPage title="Quotation Management" />} />
+            <Route path="inventory" element={<InventoryPage />} />
+            <Route path="purchase"  element={<PurchasePage />} />
+            <Route path="sales"     element={<SalesPage />} />
+            <Route path="daybook"   element={<DayBookPage />} />
+            <Route path="quotation" element={<QuotationPage />} />
             <Route path="*"         element={<Navigate to="dashboard" replace />} />
           </Routes>
         </main>

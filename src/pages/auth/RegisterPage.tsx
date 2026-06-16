@@ -277,7 +277,7 @@ function PasswordStrength({ password }: { password: string }) {
     { label: "At least 8 characters",       pass: password.length >= 8 },
     { label: "Contains uppercase letter",    pass: /[A-Z]/.test(password) },
     { label: "Contains number",              pass: /\d/.test(password) },
-    { label: "Contains special character",   pass: /[!@#$%^&*()_+\-=[\]{}|;':\",./<>?]/.test(password) },
+    { label: "Contains special character",   pass: /[!@#$%^&*()_+\-=[\]{}|;':",./<>?]/.test(password) },
   ];
 
   const score = checks.filter((c) => c.pass).length;
@@ -540,8 +540,9 @@ export default function RegisterPage() {
 
       setLoading(false);
       navigate("/login");
-    } catch (err: any) {
-      setSignUpError(err?.message || "An unexpected error occurred. Please try again.");
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "An unexpected error occurred. Please try again.";
+      setSignUpError(errMsg);
       setLoading(false);
     }
   };
