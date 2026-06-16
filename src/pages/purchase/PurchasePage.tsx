@@ -49,21 +49,22 @@ export interface PurchaseItem {
 }
 
 export interface PurchaseRecord {
-  invoice_no: string;    // unique bill number (digits only)
-  serial_no?: string;    // internal serial / reference number
+  invoice_no: string;      // unique bill number (digits only)
+  serial_no?: string;      // internal serial / reference number
   supplier_name: string;
-  purchase_type: string; // e.g., "Local Purchase"
-  branch_godown: string; // e.g., "Shop", "Godown A"
-  entry_date: string;    // Pur. Entry Date
-  invoice_date: string;  // Invoice Date
+  purchase_type: string;   // e.g., "Local Purchase"
+  branch_godown: string;   // e.g., "Shop", "Godown A"
+  entry_date: string;      // Pur. Entry Date
+  invoice_date: string;    // Invoice Date
   vehicle_no?: string;
   items: PurchaseItem[];
-  expenses: number;      // freight / overheads
-  subtotal: number;      // base subtotal before tax
-  total_sgst: number;    // aggregate SGST
-  total_cgst: number;    // aggregate CGST
-  net_amount: number;    // final payable
-  paid_amount: number;   // amount paid to supplier
+  expenses: number;        // freight / overheads
+  subtotal: number;        // base subtotal (qty × rate) before discount/tax
+  total_discount: number;  // aggregate trade discount across all items
+  total_sgst: number;      // aggregate SGST
+  total_cgst: number;      // aggregate CGST
+  net_amount: number;      // final payable = subtotal - discount + sgst + cgst + expenses
+  paid_amount: number;     // amount paid to supplier
   payment_status: string;
   created_at?: string;
 }
@@ -155,6 +156,7 @@ function normalizePurchase(raw: Record<string, unknown>): PurchaseRecord {
     items,
     expenses: Number(raw.expenses ?? 0),
     subtotal: Number(raw.subtotal ?? raw.amount ?? 0),
+    total_discount: Number(raw.total_discount ?? 0),
     total_sgst: Math.round(totalSgst * 100) / 100,
     total_cgst: Math.round(totalCgst * 100) / 100,
     net_amount: Number(raw.net_amount ?? raw.amount ?? 0),
@@ -390,6 +392,7 @@ export default function PurchasePage() {
           ],
           expenses: 1500,
           subtotal: 125000,
+          total_discount: 1250,
           total_sgst: 11137.5,
           total_cgst: 11137.5,
           net_amount: 147575,
@@ -589,6 +592,7 @@ export default function PurchasePage() {
       items: gridItems,
       expenses: expensesNum,
       subtotal: calculatedTotals.subtotal,
+      total_discount: calculatedTotals.discount,
       total_sgst: calculatedTotals.totalSgst,
       total_cgst: calculatedTotals.totalCgst,
       net_amount: calculatedTotals.netAmount,
@@ -879,6 +883,10 @@ export default function PurchasePage() {
                 <td style="text-align: right;">&#8377;${rec.subtotal.toFixed(2)}</td>
               </tr>
               <tr>
+                <td>Discount (–):</td>
+                <td style="text-align: right; color:#dc2626;">–&#8377;${(rec.total_discount ?? 0).toFixed(2)}</td>
+              </tr>
+              <tr>
                 <td>Total SGST:</td>
                 <td style="text-align: right; color:#b45309;">&#8377;${(rec.total_sgst ?? 0).toFixed(2)}</td>
               </tr>
@@ -887,19 +895,19 @@ export default function PurchasePage() {
                 <td style="text-align: right; color:#b45309;">&#8377;${(rec.total_cgst ?? 0).toFixed(2)}</td>
               </tr>
               <tr>
-                <td>Additional Charges (Expenses):</td>
+                <td>Expenses (Freight/Overhead):</td>
                 <td style="text-align: right;">&#8377;${rec.expenses.toFixed(2)}</td>
               </tr>
               <tr class="bold">
-                <td>Net Invoice Amount:</td>
+                <td>Net Amount:</td>
                 <td style="text-align: right;">&#8377;${rec.net_amount.toFixed(2)}</td>
               </tr>
               <tr>
-                <td>Amount Paid:</td>
+                <td>Paid:</td>
                 <td style="text-align: right; color: green; font-weight:600;">&#8377;${rec.paid_amount.toFixed(2)}</td>
               </tr>
               <tr>
-                <td>Payment status:</td>
+                <td>Payment Status:</td>
                 <td style="text-align: right; font-weight:700;">${rec.payment_status}</td>
               </tr>
             </table>
@@ -1068,20 +1076,24 @@ export default function PurchasePage() {
             </p>
             <pre className="text-[10px] font-mono bg-blue-900/5 text-blue-900 border border-blue-200 p-2.5 rounded-md mt-2 overflow-x-auto select-all max-w-full">
               {`CREATE TABLE public.purchases (
-  invoice_no text PRIMARY KEY,
-  supplier_name text NOT NULL,
-  purchase_type text NOT NULL,
-  branch_godown text NOT NULL,
-  entry_date date NOT NULL,
-  invoice_date date NOT NULL,
-  vehicle_no text,
-  items jsonb NOT NULL,
-  expenses numeric DEFAULT 0 NOT NULL,
-  subtotal numeric NOT NULL,
-  net_amount numeric NOT NULL,
-  paid_amount numeric DEFAULT 0 NOT NULL,
-  payment_status text NOT NULL,
-  created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+  invoice_no      text PRIMARY KEY,
+  serial_no       text,
+  supplier_name   text NOT NULL,
+  purchase_type   text NOT NULL DEFAULT 'Local Purchase',
+  branch_godown   text NOT NULL DEFAULT 'Shop (Main Showroom)',
+  entry_date      date NOT NULL,
+  invoice_date    date NOT NULL,
+  vehicle_no      text,
+  items           jsonb NOT NULL DEFAULT '[]',
+  expenses        numeric NOT NULL DEFAULT 0,
+  subtotal        numeric NOT NULL DEFAULT 0,
+  total_discount  numeric NOT NULL DEFAULT 0,
+  total_sgst      numeric NOT NULL DEFAULT 0,
+  total_cgst      numeric NOT NULL DEFAULT 0,
+  net_amount      numeric NOT NULL DEFAULT 0,
+  paid_amount     numeric NOT NULL DEFAULT 0,
+  payment_status  text NOT NULL DEFAULT 'Pending',
+  created_at      timestamptz DEFAULT timezone('utc', now()) NOT NULL
 );`}
             </pre>
           </div>
@@ -1363,13 +1375,28 @@ export default function PurchasePage() {
 
                           {/* Unit */}
                           <td className="p-2 text-center">
-                            <input
-                              type="text"
+                            <select
                               value={item.unit}
                               onChange={(e) => updateGridRow(idx, "unit", e.target.value)}
-                              className="w-full text-center border border-slate-300 rounded p-1 text-xs"
+                              className="w-full text-center border border-slate-300 rounded p-1 text-xs bg-white cursor-pointer"
                               required
-                            />
+                            >
+                              <option value="Nos">Nos</option>
+                              <option value="Mtr">Mtr</option>
+                              <option value="Kg">Kg</option>
+                              <option value="Ltr">Ltr</option>
+                              <option value="Box">Box</option>
+                              <option value="Pcs">Pcs</option>
+                              <option value="Set">Set</option>
+                              <option value="Pair">Pair</option>
+                              <option value="Roll">Roll</option>
+                              <option value="Bag">Bag</option>
+                              <option value="Bundle">Bundle</option>
+                              <option value="Dozen">Dozen</option>
+                              <option value="Sqft">Sqft</option>
+                              <option value="Sqm">Sqm</option>
+                              <option value="Ton">Ton</option>
+                            </select>
                           </td>
 
                           {/* Rate */}
@@ -1516,13 +1543,16 @@ export default function PurchasePage() {
 
                   {/* Right column — live calculation breakdown */}
                   <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-4 space-y-2 text-xs">
+                    <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-400 pb-1 border-b border-slate-100">
+                      Financial Summary
+                    </h4>
                     <div className="flex justify-between text-slate-500">
-                      <span>Subtotal (Base Value):</span>
+                      <span>SubTotal (Base Value):</span>
                       <span className="font-mono">{formatCurrency(calculatedTotals.subtotal)}</span>
                     </div>
-                    <div className="flex justify-between text-slate-500">
-                      <span>Trade Discount (–):</span>
-                      <span className="font-mono text-red-600">–{formatCurrency(calculatedTotals.discount)}</span>
+                    <div className="flex justify-between text-red-600 border-b border-slate-100 pb-1.5">
+                      <span>Discount (–):</span>
+                      <span className="font-mono">–{formatCurrency(calculatedTotals.discount)}</span>
                     </div>
 
                     {/* SGST row */}
@@ -1545,21 +1575,21 @@ export default function PurchasePage() {
                     </div>
 
                     <div className="flex justify-between text-slate-500">
-                      <span>Freight / Extra Expenses (+):</span>
+                      <span>Expenses (Freight/Overhead) (+):</span>
                       <span className="font-mono">+{formatCurrency(Number(expenses) || 0)}</span>
                     </div>
 
                     <div className="flex justify-between text-sm font-bold text-slate-900 border-t border-slate-200 pt-2">
-                      <span>Net Payable Amount:</span>
+                      <span>Net Amount:</span>
                       <span className="font-mono text-base text-purple-700">{formatCurrency(calculatedTotals.netAmount)}</span>
                     </div>
 
                     <div className="flex justify-between text-xs font-semibold border-t border-dashed border-slate-100 pt-1.5">
-                      <span className="text-slate-500">Paid to Supplier:</span>
+                      <span className="text-slate-500">Paid:</span>
                       <span className="font-mono text-green-700">{formatCurrency(Number(paidAmount) || 0)}</span>
                     </div>
                     <div className="flex justify-between text-xs font-semibold">
-                      <span className="text-slate-500">Remaining Balance:</span>
+                      <span className="text-slate-500">Balance Due:</span>
                       <span className={`font-mono ${
                         Math.max(0, calculatedTotals.netAmount - (Number(paidAmount) || 0)) > 0
                           ? "text-red-600"
@@ -1914,9 +1944,13 @@ export default function PurchasePage() {
               {/* Totals Summary */}
               <div className="flex justify-end pt-2">
                 <div className="w-80 space-y-2 border-t border-slate-200 pt-3 text-xs text-slate-600">
-                  <div className="flex justify-between">
-                    <span>Subtotal (Base):</span>
+                  <div className="flex justify-between font-semibold text-slate-700 border-b border-slate-100 pb-1.5">
+                    <span>SubTotal:</span>
                     <span className="font-mono">{formatCurrency(viewingPurchase.subtotal)}</span>
+                  </div>
+                  <div className="flex justify-between text-red-600">
+                    <span>Discount (–):</span>
+                    <span className="font-mono">–{formatCurrency(viewingPurchase.total_discount ?? 0)}</span>
                   </div>
                   <div className="flex justify-between text-amber-600">
                     <span>Total SGST:</span>
@@ -1927,15 +1961,15 @@ export default function PurchasePage() {
                     <span className="font-mono">+{formatCurrency(viewingPurchase.total_cgst ?? 0)}</span>
                   </div>
                   <div className="flex justify-between text-slate-500">
-                    <span>Freight / Expenses:</span>
+                    <span>Expenses (Freight):</span>
                     <span className="font-mono">+{formatCurrency(viewingPurchase.expenses)}</span>
                   </div>
-                  <div className="flex justify-between text-sm font-bold text-slate-900 border-t border-slate-100 pt-2">
-                    <span>Net Invoice Amount:</span>
+                  <div className="flex justify-between text-sm font-bold text-slate-900 border-t border-slate-200 pt-2">
+                    <span>Net Amount:</span>
                     <span className="font-mono text-purple-700">{formatCurrency(viewingPurchase.net_amount)}</span>
                   </div>
                   <div className="flex justify-between text-green-700 font-semibold">
-                    <span>Paid to Supplier:</span>
+                    <span>Paid:</span>
                     <span className="font-mono">{formatCurrency(viewingPurchase.paid_amount)}</span>
                   </div>
                   <div className="flex justify-between border-t border-dashed border-slate-200 pt-2">
