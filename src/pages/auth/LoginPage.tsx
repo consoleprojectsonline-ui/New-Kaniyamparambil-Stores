@@ -160,7 +160,11 @@ export default function LoginPage() {
       });
 
       if (authError) {
-        setError(authError.message);
+        if (authError.message.toLowerCase().includes("confirm") || authError.message.toLowerCase().includes("verification")) {
+          setError("Email confirmation is required. Please check your inbox or disable 'Confirm email' in Supabase (Authentication -> Providers -> Email).");
+        } else {
+          setError(authError.message);
+        }
         setLoading(false);
         return;
       }
