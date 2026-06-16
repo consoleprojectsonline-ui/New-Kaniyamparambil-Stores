@@ -1,12 +1,22 @@
--- Create a table for wholesale purchase invoices
+-- Create a table for wholesale purchase invoices (full schema with SGST/CGST)
 create table if not exists public.purchases (
-  bill_no text primary key,
+  invoice_no    text primary key,
+  serial_no     text,                                  -- internal serial / reference number
   supplier_name text not null,
-  purchase_date date not null,
-  amount numeric not null,
-  tax_amount numeric default 0 not null,
-  payment_status text default 'Pending' not null,
-  created_at timestamp with time zone default timezone('utc'::text, now()) not null
+  purchase_type text not null default 'Local Purchase',
+  branch_godown text not null default 'Shop (Main Showroom)',
+  entry_date    date not null,
+  invoice_date  date not null,
+  vehicle_no    text,
+  items         jsonb not null default '[]',            -- array of PurchaseItem { code, name, hsn_code, qty, unit, rate, disc, sgst, cgst, s_rate, mrp }
+  expenses      numeric not null default 0,
+  subtotal      numeric not null default 0,             -- base value before tax/discount
+  total_sgst    numeric not null default 0,             -- aggregate SGST across all items
+  total_cgst    numeric not null default 0,             -- aggregate CGST across all items
+  net_amount    numeric not null default 0,             -- final payable = subtotal - discount + sgst + cgst + expenses
+  paid_amount   numeric not null default 0,
+  payment_status text not null default 'Pending',       -- 'Paid' | 'Partial' | 'Pending'
+  created_at    timestamp with time zone default timezone('utc'::text, now()) not null
 );
 
 -- Enable Row Level Security (RLS)
