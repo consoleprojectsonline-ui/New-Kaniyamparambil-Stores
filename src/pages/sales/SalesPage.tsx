@@ -14,12 +14,10 @@ export interface SaleItem {
   hsn_code: string;
   qty: number;
   unit: string;
-  rate: number;
-  amount: number;       // qty × rate (auto)
-  disc_pct: number;     // discount %
-  remarks: string;
-  tp_points: number;    // loyalty / TP points
-  barcode: string;
+  rate: number;         // purchase/cost rate (reference only, pre-filled, read-only)
+  amount: number;       // qty × mrp (auto — selling value before disc/GST)
+  disc_pct: number;     // discount % on MRP
+  mrp: number;          // selling price per unit (customer pays this)
   sgst: number;         // SGST %
   cgst: number;         // CGST %
 }
@@ -87,7 +85,7 @@ const SEED_SALESMEN = ["Manager", "Sunil", "Reena", "Ajith", "Priya"];
 
 function blankItem(): SaleItem {
   return { code: "", name: "", hsn_code: "", qty: 1, unit: "Nos", rate: 0,
-    amount: 0, disc_pct: 0, remarks: "", tp_points: 0, barcode: "", sgst: 9, cgst: 9 };
+    amount: 0, disc_pct: 0, mrp: 0, sgst: 9, cgst: 9 };
 }
 
 function normalizeSale(raw: Record<string, unknown>): SaleRecord {
@@ -102,9 +100,7 @@ function normalizeSale(raw: Record<string, unknown>): SaleRecord {
       rate: Number(it.rate ?? 0),
       amount: Number(it.amount ?? 0),
       disc_pct: Number(it.disc_pct ?? 0),
-      remarks: String(it.remarks ?? ""),
-      tp_points: Number(it.tp_points ?? 0),
-      barcode: String(it.barcode ?? ""),
+      mrp: Number(it.mrp ?? 0),
       sgst: Number(it.sgst ?? 0),
       cgst: Number(it.cgst ?? 0),
     }));
@@ -374,9 +370,9 @@ export default function SalesPage() {
     setGridItems(gridItems.map((item, idx) => {
       if (idx !== i) return item;
       const updated = { ...item, [key]: val };
-      // Auto-calc amount when qty or rate changes
-      if (key === "qty" || key === "rate") {
-        updated.amount = Number(updated.qty) * Number(updated.rate);
+      // Amount is always qty × mrp
+      if (key === "qty" || key === "mrp") {
+        updated.amount = Number(updated.qty) * Number(updated.mrp);
       }
       return updated;
     }));
@@ -385,14 +381,16 @@ export default function SalesPage() {
   const handleProductSelect = (i: number, prod: InventoryItem) => {
     // Look up latest purchase data for this item code
     const purchaseData = purchaseItemMap.get(prod.code);
+    const mrpVal = purchaseData?.mrp ?? 0;
     setGridItems(gridItems.map((item, idx) => idx !== i ? item : {
       ...item,
       code:     prod.code,
       name:     prod.name,
       hsn_code: purchaseData?.hsn_code || prod.hsn_code || "",
       unit:     purchaseData?.unit     || prod.uom       || "Nos",
-      rate:     purchaseData?.rate     ?? 0,
-      amount:   (item.qty) * (purchaseData?.rate ?? 0),
+      rate:     purchaseData?.rate     ?? 0,   // cost/purchase price — reference
+      mrp:      mrpVal,                         // selling price
+      amount:   item.qty * mrpVal,              // qty × mrp
       sgst:     purchaseData?.sgst     ?? 9,
       cgst:     purchaseData?.cgst     ?? 9,
     }));
@@ -402,10 +400,10 @@ export default function SalesPage() {
   const calc = useMemo(() => {
     let sub = 0, totalGst = 0;
     gridItems.forEach((item) => {
-      const lineAmt = item.qty * item.rate;
-      const discAmt = lineAmt * ((item.disc_pct || 0) / 100);
-      const taxable = Math.max(0, lineAmt - discAmt);
-      sub += taxable;
+      const mrpAmt  = item.qty * item.mrp;                          // qty × MRP = selling value
+      const discAmt = mrpAmt * ((item.disc_pct || 0) / 100);       // discount on MRP
+      const taxable = Math.max(0, mrpAmt - discAmt);               // taxable = MRP - discount
+      sub      += taxable;
       totalGst += taxable * (((item.sgst ?? 0) + (item.cgst ?? 0)) / 100);
     });
     const discNum   = Number(discount)   || 0;
@@ -561,19 +559,19 @@ export default function SalesPage() {
     const win = window.open("", "_blank");
     if (!win) { alert("Allow popups to print."); return; }
     const rows = rec.items.map((i) => {
-      const lineAmt = i.qty * i.rate;
-      const discAmt = lineAmt * ((i.disc_pct || 0) / 100);
-      const taxable = Math.max(0, lineAmt - discAmt);
+      const mrpAmt  = i.qty * i.mrp;
+      const discAmt = mrpAmt * ((i.disc_pct || 0) / 100);
+      const taxable = Math.max(0, mrpAmt - discAmt);
       const gstAmt  = taxable * (((i.sgst ?? 0) + (i.cgst ?? 0)) / 100);
       return `<tr>
         <td>${i.code || "—"}</td><td>${i.name}</td>
         <td style="text-align:center">${i.qty}</td><td style="text-align:center">${i.unit}</td>
-        <td style="text-align:right">₹${i.rate.toFixed(2)}</td>
-        <td style="text-align:right">₹${lineAmt.toFixed(2)}</td>
+        <td style="text-align:right">₹${i.mrp.toFixed(2)}</td>
+        <td style="text-align:right">₹${mrpAmt.toFixed(2)}</td>
         <td style="text-align:center">${i.disc_pct ?? 0}%</td>
         <td style="text-align:right">₹${gstAmt.toFixed(2)}</td>
         <td style="text-align:right">₹${(taxable + gstAmt).toFixed(2)}</td>
-        <td>${i.remarks || "—"}</td>
+        <td style="text-align:right">${i.rate ? "₹" + i.rate.toFixed(2) : "—"}</td>
       </tr>`;
     }).join("");
     win.document.write(`<html><head><title>Bill - ${rec.bill_no}</title>
@@ -594,8 +592,8 @@ export default function SalesPage() {
     <div><div><strong>Salesman:</strong> ${rec.salesman || "—"}</div>
     <div><strong>Branch/Godown:</strong> ${rec.branch_godown}</div>
     <div><strong>Payment Mode:</strong> ${rec.payment_mode}</div></div></div>
-    <table><thead><tr><th>Code</th><th>Item</th><th>Qty</th><th>Unit</th><th>Rate</th>
-    <th>Amount</th><th>Disc%</th><th>GST</th><th>Total</th><th>Remarks</th></tr></thead>
+    <table><thead><tr><th>Code</th><th>Item</th><th>Qty</th><th>Unit</th><th>MRP</th>
+    <th>Amount</th><th>Disc%</th><th>GST</th><th>Total</th><th>Cost Rate</th></tr></thead>
     <tbody>${rows}</tbody></table>
     <div class="tp"><table>
     <tr><td>SubTotal:</td><td style="text-align:right">₹${rec.subtotal.toFixed(2)}</td></tr>
@@ -941,15 +939,13 @@ export default function SalesPage() {
                         <th className="p-2 w-[200px]">Code / Item Name</th>
                         <th className="p-2 w-[55px] text-center">Qty</th>
                         <th className="p-2 w-[70px] text-center">Unit</th>
-                        <th className="p-2 w-[80px] text-right">Rate (₹)</th>
+                        <th className="p-2 w-[80px] text-right">MRP (₹) *</th>
                         <th className="p-2 w-[85px] text-right">Amount (₹)</th>
                         <th className="p-2 w-[60px] text-center">Dis%</th>
                         <th className="p-2 w-[55px] text-center">SGST%</th>
                         <th className="p-2 w-[55px] text-center">CGST%</th>
                         <th className="p-2 w-[80px] text-center">HSN Code</th>
-                        <th className="p-2 w-[80px] text-center">TP Points</th>
-                        <th className="p-2 w-[90px] text-center">Barcode</th>
-                        <th className="p-2 w-[100px]">Remarks</th>
+                        <th className="p-2 w-[75px] text-right text-slate-400">Cost Rate</th>
                         <th className="p-2 w-[36px] text-center">Del</th>
                       </tr>
                     </thead>
@@ -974,15 +970,15 @@ export default function SalesPage() {
                               {UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
                             </select>
                           </td>
-                          {/* Rate */}
+                          {/* MRP — primary selling price, drives all calculations */}
                           <td className="p-1.5">
-                            <input type="number" min="0" value={item.rate || ""}
-                              onChange={(e) => updateGridRow(idx, "rate", parseFloat(e.target.value) || 0)}
-                              className="w-full text-right border border-slate-300 rounded p-1 text-xs font-mono" placeholder="0.00" required />
+                            <input type="number" min="0" value={item.mrp || ""}
+                              onChange={(e) => updateGridRow(idx, "mrp", parseFloat(e.target.value) || 0)}
+                              className="w-full text-right border border-green-400 rounded p-1 text-xs font-mono font-semibold focus:ring-2 focus:ring-green-500/20 focus:border-green-600" placeholder="0.00" required />
                           </td>
-                          {/* Amount (auto) */}
+                          {/* Amount = qty × MRP (auto, read-only) */}
                           <td className="p-1.5">
-                            <input readOnly value={(item.qty * item.rate).toFixed(2)} tabIndex={-1}
+                            <input readOnly value={(item.qty * item.mrp).toFixed(2)} tabIndex={-1}
                               className="w-full text-right border border-slate-200 rounded p-1 text-xs font-mono bg-slate-50 text-slate-600 cursor-not-allowed" />
                           </td>
                           {/* Disc% */}
@@ -1009,23 +1005,11 @@ export default function SalesPage() {
                               onChange={(e) => updateGridRow(idx, "hsn_code", e.target.value)}
                               className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono" placeholder="HSN" />
                           </td>
-                          {/* TP Points */}
+                          {/* Cost Rate — purchase price reference, read-only */}
                           <td className="p-1.5">
-                            <input type="number" min="0" value={item.tp_points || ""}
-                              onChange={(e) => updateGridRow(idx, "tp_points", parseFloat(e.target.value) || 0)}
-                              className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono" placeholder="0" />
-                          </td>
-                          {/* Barcode */}
-                          <td className="p-1.5">
-                            <input type="text" value={item.barcode}
-                              onChange={(e) => updateGridRow(idx, "barcode", e.target.value)}
-                              className="w-full border border-slate-300 rounded p-1 text-xs font-mono" placeholder="Barcode" />
-                          </td>
-                          {/* Remarks */}
-                          <td className="p-1.5">
-                            <input type="text" value={item.remarks}
-                              onChange={(e) => updateGridRow(idx, "remarks", e.target.value)}
-                              className="w-full border border-slate-300 rounded p-1 text-xs" placeholder="Remarks" />
+                            <input readOnly value={item.rate ? item.rate.toFixed(2) : "—"} tabIndex={-1}
+                              title="Purchase cost rate (reference only)"
+                              className="w-full text-right border border-slate-100 rounded p-1 text-xs font-mono bg-slate-50 text-slate-400 cursor-not-allowed" />
                           </td>
                           {/* Delete row */}
                           <td className="p-1.5 text-center">
@@ -1091,7 +1075,7 @@ export default function SalesPage() {
                   <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-4 space-y-2 text-xs">
                     <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-400 pb-1 border-b border-slate-100">Bill Summary</h4>
                     <div className="flex justify-between text-slate-600 font-semibold border-b border-slate-100 pb-1.5">
-                      <span>Subtot. (Taxable Base):</span>
+                      <span>Subtot. (qty × MRP − Disc):</span>
                       <span className="font-mono">{formatCurrency(calc.subtotal)}</span>
                     </div>
                     <div className="flex justify-between text-slate-500">
@@ -1207,21 +1191,20 @@ export default function SalesPage() {
                         <th className="p-2">Name</th>
                         <th className="p-2 text-center">Qty</th>
                         <th className="p-2 text-center">Unit</th>
-                        <th className="p-2 text-right">Rate</th>
-                        <th className="p-2 text-right">Amount</th>
+                        <th className="p-2 text-right">MRP (₹)</th>
+                        <th className="p-2 text-right">Amount (₹)</th>
                         <th className="p-2 text-center">Dis%</th>
                         <th className="p-2 text-center">SGST%</th>
                         <th className="p-2 text-center">CGST%</th>
                         <th className="p-2 text-center">HSN</th>
-                        <th className="p-2 text-center">TP Pts</th>
-                        <th className="p-2">Remarks</th>
+                        <th className="p-2 text-right text-slate-400">Cost Rate</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {viewingSale.items.map((item, i) => {
-                        const lineAmt = item.qty * item.rate;
-                        const discAmt = lineAmt * ((item.disc_pct || 0) / 100);
-                        const taxable = Math.max(0, lineAmt - discAmt);
+                        const mrpAmt  = item.qty * item.mrp;
+                        const discAmt = mrpAmt * ((item.disc_pct || 0) / 100);
+                        const taxable = Math.max(0, mrpAmt - discAmt);
                         const gst = taxable * (((item.sgst ?? 0) + (item.cgst ?? 0)) / 100);
                         return (
                           <tr key={i} className="hover:bg-slate-50/30">
@@ -1229,14 +1212,13 @@ export default function SalesPage() {
                             <td className="p-2">{item.name}</td>
                             <td className="p-2 text-center font-mono">{item.qty}</td>
                             <td className="p-2 text-center">{item.unit}</td>
-                            <td className="p-2 text-right font-mono">{formatCurrency(item.rate)}</td>
-                            <td className="p-2 text-right font-mono">{formatCurrency(lineAmt)}</td>
+                            <td className="p-2 text-right font-mono font-semibold">{formatCurrency(item.mrp)}</td>
+                            <td className="p-2 text-right font-mono">{formatCurrency(mrpAmt)}</td>
                             <td className="p-2 text-center text-red-500">{item.disc_pct ?? 0}%</td>
                             <td className="p-2 text-center text-amber-600">{item.sgst ?? 0}%</td>
                             <td className="p-2 text-center text-amber-600">{item.cgst ?? 0}%</td>
                             <td className="p-2 text-center font-mono text-slate-500">{item.hsn_code || "—"}</td>
-                            <td className="p-2 text-center">{item.tp_points || 0}</td>
-                            <td className="p-2 text-slate-500">{item.remarks || "—"}</td>
+                            <td className="p-2 text-right font-mono text-slate-400">{item.rate ? formatCurrency(item.rate) : "—"}</td>
                           </tr>
                         );
                       })}

@@ -382,6 +382,7 @@ export default function PurchasePage() {
             {
               code: "ITM-001",
               name: "Premium Steel Conduit Pipe 1/2\"",
+              hsn_code: "",
               qty: 50,
               unit: "Mtr",
               rate: 2500,
