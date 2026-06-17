@@ -14,6 +14,7 @@ import {
   Printer,
   X,
   Edit,
+  FileText,
 } from "lucide-react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
@@ -126,11 +127,13 @@ const QUOTATION_FRAME_STYLE: Partial<CSSStyleDeclaration> = {
   top: "0",
   left: "-20000px",
   width: "794px",
-  height: "1200px",
+  height: "auto",
+  minHeight: "400px",
   opacity: "0",
   pointerEvents: "none",
   border: "0",
   background: "transparent",
+  overflow: "visible",
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -548,7 +551,310 @@ function buildQuotationHtml(rec: QuotationRecord, options: QuotationDocOptions =
   </html>`;
 }
 
-async function waitForQuotationFrame(html: string): Promise<HTMLIFrameElement> {
+// ─── Quotation Statement (account-style register) ─────────────────────────────
+
+type QuotationReportMode = "full" | "date" | "month" | "range" | "current";
+
+type QuotationStatementMeta = {
+  reportTitle: string;
+  periodLabel: string;
+  reportType: string;
+  statusFilter: string;
+  searchQuery: string;
+  generatedOn: string;
+  totalQuotations: number;
+  totalNet: number;
+  totalGst: number;
+  approvedCount: number;
+};
+
+type QuotationStatementDocOptions = {
+  helperText?: string;
+  renderMode?: "print" | "pdf";
+};
+
+function quotationDocDate(rec: QuotationRecord): string {
+  return rec.quotation_date.slice(0, 10);
+}
+
+function filterQuotationsByDate(list: QuotationRecord[], date: string): QuotationRecord[] {
+  return list.filter((q) => quotationDocDate(q) === date);
+}
+
+function filterQuotationsByMonth(list: QuotationRecord[], monthYm: string): QuotationRecord[] {
+  return list.filter((q) => quotationDocDate(q).slice(0, 7) === monthYm);
+}
+
+function filterQuotationsByRange(list: QuotationRecord[], from: string, to: string): QuotationRecord[] {
+  return list.filter((q) => {
+    const d = quotationDocDate(q);
+    return d >= from && d <= to;
+  });
+}
+
+function formatMonthLabel(monthYm: string): string {
+  const [year, month] = monthYm.split("-");
+  const d = new Date(Number(year), Number(month) - 1, 1);
+  if (Number.isNaN(d.getTime())) return monthYm;
+  return new Intl.DateTimeFormat("en-GB", { month: "long", year: "numeric" }).format(d);
+}
+
+function buildQuotationStatementMeta(
+  list: QuotationRecord[],
+  reportType: string,
+  periodLabel: string,
+  statusFilter: string,
+  searchQuery: string,
+): QuotationStatementMeta {
+  return {
+    reportTitle: "QUOTATION STATEMENT / REGISTER",
+    periodLabel,
+    reportType,
+    statusFilter,
+    searchQuery,
+    generatedOn: formatDocDate(new Date().toISOString()),
+    totalQuotations: list.length,
+    totalNet: list.reduce((sum, q) => sum + q.net_amount, 0),
+    totalGst: list.reduce((sum, q) => sum + q.total_gst, 0),
+    approvedCount: list.filter((q) => q.status === "Approved").length,
+  };
+}
+
+function buildQuotationStatementHtml(
+  list: QuotationRecord[],
+  meta: QuotationStatementMeta,
+  options: QuotationStatementDocOptions = {},
+): string {
+  const store = QUOTATION_STATIC_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+  const companyName = store.storeNameLines.join(" ");
+
+  const rowMarkup = list.map((rec, index) => `
+    <tr>
+      <td class="col-index">${index + 1}</td>
+      <td class="col-date">${escapeHtml(formatDocDate(rec.quotation_date))}</td>
+      <td class="col-qno">${escapeHtml(rec.quotation_no)}</td>
+      <td class="col-serial">${escapeHtml(rec.serial_no)}</td>
+      <td class="col-customer">${escapeHtml(rec.customer_name)}</td>
+      <td class="col-rate">${escapeHtml(rec.rate_type)}</td>
+      <td class="col-items align-center">${rec.items.length}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(rec.subtotal))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(rec.total_gst))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(rec.net_amount))}</td>
+      <td class="col-valid">${escapeHtml(formatDocDate(rec.valid_till))}</td>
+      <td class="col-status">${escapeHtml(rec.status)}</td>
+    </tr>
+  `).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>${escapeHtml(meta.reportTitle)}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "7.5px" : "11px"};
+          line-height: 1.28;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .statement-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .toolbar-actions { display: flex; gap: 8px; }
+        .toolbar-btn {
+          border: 1px solid #ccc;
+          border-radius: 4px;
+          padding: 8px 14px;
+          font-family: inherit;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          background: #fff;
+        }
+        .toolbar-btn.primary { background: #0d9488; color: #fff; border-color: #0d9488; }
+        .quotation-statement-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "13px" : "16px"};
+          font-weight: 700;
+          color: #0d9488;
+          letter-spacing: 0.05em;
+          padding: ${isPdfMode ? "7px 8px" : "10px"};
+          border-bottom: 1px solid #000;
+        }
+        .period-banner {
+          text-align: center;
+          font-weight: 700;
+          padding: ${isPdfMode ? "5px 8px" : "8px 12px"};
+          border-bottom: 1px solid #000;
+          background: #ccfbf1;
+          font-size: ${isPdfMode ? "9px" : "12px"};
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+        }
+        .meta-grid > div:last-child { border-right: none; }
+        .meta-label { font-weight: 700; margin-bottom: 2px; font-size: ${isPdfMode ? "7.5px" : "10px"}; text-transform: uppercase; }
+        .meta-line { margin-bottom: 1px; }
+        .statement-table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        .statement-table th,
+        .statement-table td {
+          border: 1px solid #000;
+          padding: ${isPdfMode ? "2px 3px" : "4px 5px"};
+          vertical-align: top;
+        }
+        .statement-table thead th {
+          background: #ccfbf1;
+          font-weight: 700;
+          text-align: center;
+        }
+        .col-index { width: 20px; text-align: center; }
+        .col-date { width: 52px; text-align: center; white-space: nowrap; }
+        .col-qno { width: 62px; font-family: monospace; }
+        .col-serial { width: 56px; font-family: monospace; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .col-customer { min-width: 80px; }
+        .col-rate { width: 44px; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .col-items { width: 28px; }
+        .col-amt { width: 48px; white-space: nowrap; }
+        .col-valid { width: 52px; text-align: center; white-space: nowrap; }
+        .col-status { width: 40px; text-align: center; }
+        .align-right { text-align: right; }
+        .align-center { text-align: center; }
+        .summary-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr 1fr;
+          border-top: 1px solid #000;
+        }
+        .summary-box {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+          font-weight: 600;
+        }
+        .summary-box:last-child { border-right: none; }
+        .summary-box b { display: block; font-size: ${isPdfMode ? "9px" : "12px"}; margin-top: 2px; }
+        .footer-note {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          color: #444;
+        }
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          text-align: right;
+          font-weight: 700;
+          font-size: ${isPdfMode ? "8px" : "11px"};
+        }
+        @page { size: A4 landscape; margin: 8mm; }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .statement-toolbar { display: none; }
+          .quotation-statement-sheet { width: 100%; border: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="statement-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText || "Use Print / Save as PDF from your browser.")}</p>
+        <div class="toolbar-actions">
+          <button class="toolbar-btn" onclick="window.close()">Close</button>
+          <button class="toolbar-btn primary" onclick="window.print()">Print / Save PDF</button>
+        </div>
+      </div>
+
+      <div class="quotation-statement-sheet">
+        <div class="doc-title">${escapeHtml(meta.reportTitle)}</div>
+        <div class="period-banner">Statement Period: ${escapeHtml(meta.periodLabel)}</div>
+
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">${escapeHtml(companyName)}</div>
+            <div class="meta-line">${escapeHtml(store.location)}</div>
+            <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+            <div class="meta-line"><b>Phone:</b> ${escapeHtml(store.phone)}</div>
+          </div>
+          <div>
+            <div class="meta-label">Report Details</div>
+            <div class="meta-line"><b>Type:</b> ${escapeHtml(meta.reportType)}</div>
+            <div class="meta-line"><b>Status Filter:</b> ${escapeHtml(meta.statusFilter)}</div>
+            <div class="meta-line"><b>Search:</b> ${escapeHtml(meta.searchQuery || "—")}</div>
+          </div>
+          <div>
+            <div class="meta-label">Generated</div>
+            <div class="meta-line"><b>Date:</b> ${escapeHtml(meta.generatedOn)}</div>
+            <div class="meta-line"><b>Quotations:</b> ${meta.totalQuotations}</div>
+          </div>
+        </div>
+
+        <table class="statement-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Date</th>
+              <th>Quotation No</th>
+              <th>Serial</th>
+              <th>Customer</th>
+              <th>Rate Type</th>
+              <th>Items</th>
+              <th>Subtotal</th>
+              <th>GST</th>
+              <th>Net Amt</th>
+              <th>Valid Till</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${rowMarkup || `<tr><td colspan="12" style="text-align:center;padding:12px;">No quotations for this statement period.</td></tr>`}</tbody>
+        </table>
+
+        <div class="summary-grid">
+          <div class="summary-box">Total Quotations<b>${meta.totalQuotations}</b></div>
+          <div class="summary-box">Total Net Value<b>${escapeHtml(formatCurrency(meta.totalNet))}</b></div>
+          <div class="summary-box">Total GST<b>${escapeHtml(formatCurrency(meta.totalGst))}</b></div>
+          <div class="summary-box">Approved<b>${meta.approvedCount}</b></div>
+        </div>
+
+        <div class="footer-note">
+          Quotation statement generated from saved quotation records. Amounts include taxable value and GST per quotation. This is not a tax invoice.
+        </div>
+
+        <div class="signatory">
+          <div>${escapeHtml(store.signatureCompany)}</div>
+          <div>${escapeHtml(store.signatureRole)}</div>
+        </div>
+      </div>
+    </body>
+  </html>`;
+}
+
+async function waitForQuotationFrame(html: string, sheetSelector = ".quote-sheet"): Promise<HTMLIFrameElement> {
   const iframe = document.createElement("iframe");
   Object.assign(iframe.style, QUOTATION_FRAME_STYLE);
   iframe.setAttribute("aria-hidden", "true");
@@ -570,8 +876,66 @@ async function waitForQuotationFrame(html: string): Promise<HTMLIFrameElement> {
   });
   const fontSet = iframe.contentDocument?.fonts;
   if (fontSet?.ready) { try { await fontSet.ready; } catch { /* fallback fonts */ } }
+
+  const sheet = iframe.contentDocument?.querySelector(sheetSelector);
+  if (sheet instanceof HTMLElement) {
+    iframe.style.height = `${sheet.scrollHeight + 40}px`;
+  }
+
   await new Promise((resolve) => window.setTimeout(resolve, 120));
   return iframe;
+}
+
+async function exportQuotationPdf(html: string, filename: string, sheetSelector = ".quote-sheet", singlePage = true): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForQuotationFrame(html, sheetSelector);
+    const sheet = iframe.contentDocument?.querySelector(sheetSelector);
+    if (!(sheet instanceof HTMLElement)) throw new Error("Unable to prepare the quotation layout for PDF export.");
+    const canvas = await html2canvas(sheet, { scale: 2, useCORS: true, backgroundColor: "#ffffff" });
+    const pdf = new jsPDF({ orientation: singlePage ? "portrait" : "portrait", unit: "pt", format: "a4" });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const margin = 12;
+
+    if (singlePage) {
+      const maxWidth = pageWidth - margin * 2;
+      const maxHeight = pageHeight - margin * 2;
+      const scale = Math.min(maxWidth / canvas.width, maxHeight / canvas.height);
+      pdf.addImage(canvas.toDataURL("image/png"), "PNG", margin, margin, canvas.width * scale, canvas.height * scale, undefined, "FAST");
+    } else {
+      const imgWidth = pageWidth - margin * 2;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+      const imgData = canvas.toDataURL("image/png");
+      let heightLeft = imgHeight;
+      let position = margin;
+      pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+      heightLeft -= pageHeight - margin * 2;
+      while (heightLeft > 0) {
+        pdf.addPage();
+        position = margin - (imgHeight - heightLeft);
+        pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+        heightLeft -= pageHeight - margin * 2;
+      }
+    }
+
+    pdf.save(filename);
+  } finally {
+    iframe?.remove();
+  }
+}
+
+async function printQuotationHtml(html: string, sheetSelector = ".quote-sheet"): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForQuotationFrame(html, sheetSelector);
+    const printWindow = iframe.contentWindow;
+    if (!printWindow) throw new Error("Unable to open the print dialog.");
+    printWindow.focus();
+    printWindow.print();
+  } finally {
+    window.setTimeout(() => iframe?.remove(), 1200);
+  }
 }
 
 interface InventoryItem {
@@ -665,6 +1029,14 @@ export default function QuotationPage() {
   const [dbStatus, setDbStatus] = useState<"connected" | "local">("connected");
   const [editingQuotation, setEditingQuotation] = useState<QuotationRecord | null>(null);
   const [viewingQuotation, setViewingQuotation] = useState<QuotationRecord | null>(null);
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
+  const [reportMode, setReportMode] = useState<QuotationReportMode>("full");
+  const [reportDate, setReportDate] = useState(todayIso());
+  const [reportMonth, setReportMonth] = useState(() => todayIso().slice(0, 7));
+  const [reportFrom, setReportFrom] = useState(todayIso());
+  const [reportTo, setReportTo] = useState(todayIso());
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [reportBusy, setReportBusy] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
@@ -1010,39 +1382,22 @@ export default function QuotationPage() {
   };
 
   const handlePrintQuotation = async (rec: QuotationRecord) => {
-    let iframe: HTMLIFrameElement | null = null;
     try {
-      iframe = await waitForQuotationFrame(buildQuotationHtml(rec, { renderMode: "print" }));
-      const printWindow = iframe.contentWindow;
-      if (!printWindow) throw new Error("Unable to open the print dialog.");
-      printWindow.focus();
-      printWindow.print();
+      await printQuotationHtml(buildQuotationHtml(rec, { renderMode: "pdf", helperText: "Quotation print preview." }));
     } catch (err) {
       alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
-    } finally {
-      window.setTimeout(() => iframe?.remove(), 1200);
     }
   };
 
   const handleDownloadQuotation = async (rec: QuotationRecord) => {
-    let iframe: HTMLIFrameElement | null = null;
     try {
-      iframe = await waitForQuotationFrame(buildQuotationHtml(rec, { renderMode: "pdf" }));
-      const quoteRoot = iframe.contentDocument?.querySelector(".quote-sheet");
-      if (!(quoteRoot instanceof HTMLElement)) throw new Error("Unable to prepare quotation layout for PDF export.");
-      const canvas = await html2canvas(quoteRoot, { scale: 2, useCORS: true, backgroundColor: "#ffffff" });
-      const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 12;
-      const maxWidth = pageWidth - margin * 2;
-      const maxHeight = pageHeight - margin * 2;
-      const scale = Math.min(maxWidth / canvas.width, maxHeight / canvas.height);
-      pdf.addImage(canvas.toDataURL("image/png"), "PNG", margin, margin, canvas.width * scale, canvas.height * scale, undefined, "FAST");
-      pdf.save(`quotation_${rec.quotation_no}.pdf`);
+      await exportQuotationPdf(
+        buildQuotationHtml(rec, { renderMode: "pdf" }),
+        `quotation_${rec.quotation_no}.pdf`,
+      );
     } catch (err) {
       alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
-    } finally { iframe?.remove(); }
+    }
   };
 
   const filteredQuotations = useMemo(() => quotations.filter((q) => {
@@ -1068,6 +1423,124 @@ export default function QuotationPage() {
     return "bg-amber-100 text-amber-800 border border-amber-200";
   };
 
+  const resolveQuotationStatementReport = (): {
+    records: QuotationRecord[];
+    reportType: string;
+    periodLabel: string;
+    filenameSuffix: string;
+  } | null => {
+    const applyStatus = (list: QuotationRecord[]) =>
+      statusFilter === "All" ? list : list.filter((q) => q.status === statusFilter);
+
+    switch (reportMode) {
+      case "full":
+        return {
+          records: applyStatus([...quotations]),
+          reportType: "Complete Quotation Register",
+          periodLabel: "All Quotations (Full Register)",
+          filenameSuffix: `full_${todayIso()}`,
+        };
+      case "current":
+        return {
+          records: [...filteredQuotations],
+          reportType: "Filtered Table View",
+          periodLabel: `Current filters — Status: ${statusFilter}, Search: ${searchQuery.trim() || "—"}`,
+          filenameSuffix: `filtered_${todayIso()}`,
+        };
+      case "date": {
+        const dated = applyStatus(filterQuotationsByDate(quotations, reportDate));
+        return {
+          records: dated,
+          reportType: "Daily Quotation Statement",
+          periodLabel: formatDocDate(reportDate),
+          filenameSuffix: `date_${reportDate}`,
+        };
+      }
+      case "month": {
+        const monthly = applyStatus(filterQuotationsByMonth(quotations, reportMonth));
+        return {
+          records: monthly,
+          reportType: "Monthly Quotation Statement",
+          periodLabel: formatMonthLabel(reportMonth),
+          filenameSuffix: `month_${reportMonth}`,
+        };
+      }
+      case "range": {
+        if (reportFrom > reportTo) {
+          setReportError("From date cannot be after To date.");
+          return null;
+        }
+        const ranged = applyStatus(filterQuotationsByRange(quotations, reportFrom, reportTo));
+        return {
+          records: ranged,
+          reportType: "Date Range Quotation Statement",
+          periodLabel: `${formatDocDate(reportFrom)} to ${formatDocDate(reportTo)}`,
+          filenameSuffix: `${reportFrom}_to_${reportTo}`,
+        };
+      }
+      default:
+        return null;
+    }
+  };
+
+  const buildQuotationStatementDocument = () => {
+    const report = resolveQuotationStatementReport();
+    if (!report) return null;
+    if (report.records.length === 0) {
+      setReportError("No quotations match the selected statement period.");
+      return null;
+    }
+    setReportError(null);
+    return buildQuotationStatementHtml(
+      report.records,
+      buildQuotationStatementMeta(
+        report.records,
+        report.reportType,
+        report.periodLabel,
+        statusFilter,
+        searchQuery.trim(),
+      ),
+      { renderMode: "pdf", helperText: "Generating quotation statement PDF..." },
+    );
+  };
+
+  const handlePrintStatement = async () => {
+    setReportBusy(true);
+    const report = resolveQuotationStatementReport();
+    if (!report) { setReportBusy(false); return; }
+    const html = buildQuotationStatementDocument();
+    if (!html) { setReportBusy(false); return; }
+    try {
+      await printQuotationHtml(html, ".quotation-statement-sheet");
+      setIsReportModalOpen(false);
+    } catch (err) {
+      setReportError(err instanceof Error ? err.message : "Print failed.");
+    } finally {
+      setReportBusy(false);
+    }
+  };
+
+  const handleDownloadStatement = async () => {
+    setReportBusy(true);
+    const report = resolveQuotationStatementReport();
+    if (!report) { setReportBusy(false); return; }
+    const html = buildQuotationStatementDocument();
+    if (!html) { setReportBusy(false); return; }
+    try {
+      await exportQuotationPdf(
+        html,
+        `quotation_statement_${report.filenameSuffix}.pdf`,
+        ".quotation-statement-sheet",
+        false,
+      );
+      setIsReportModalOpen(false);
+    } catch (err) {
+      setReportError(err instanceof Error ? err.message : "PDF download failed.");
+    } finally {
+      setReportBusy(false);
+    }
+  };
+
   return (
     <div className="p-6 space-y-6">
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
@@ -1080,10 +1553,18 @@ export default function QuotationPage() {
             Create GST quotations, track status, and print or download PDF copies.
           </p>
         </div>
-        <button type="button" onClick={() => { resetForm(); generateQuotationNo(); setIsFormOpen(true); }}
-          className="btn-primary bg-teal-600 hover:bg-teal-700 active:bg-teal-800 flex items-center gap-1.5 shadow-sm">
-          <Plus className="w-4 h-4" /> New Quotation
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" onClick={() => { setReportError(null); setIsReportModalOpen(true); }}
+            disabled={loading}
+            className="btn-secondary px-3 py-2 text-xs flex items-center gap-1.5">
+            <FileText className="w-3.5 h-3.5" />
+            Quotation Statement
+          </button>
+          <button type="button" onClick={() => { resetForm(); generateQuotationNo(); setIsFormOpen(true); }}
+            className="btn-primary bg-teal-600 hover:bg-teal-700 active:bg-teal-800 flex items-center gap-1.5 shadow-sm">
+            <Plus className="w-4 h-4" /> New Quotation
+          </button>
+        </div>
       </div>
 
       {dbStatus === "local" && (
@@ -1559,6 +2040,112 @@ export default function QuotationPage() {
               <button type="button" onClick={() => setViewingQuotation(null)}
                 className="btn-primary bg-teal-600 hover:bg-teal-700 px-6 py-2 font-bold text-white rounded text-xs">
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Quotation Statement Modal ── */}
+      {isReportModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px]">
+          <div className="absolute inset-0" onClick={() => setIsReportModalOpen(false)} />
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-lg w-full z-10 flex flex-col font-sans animate-in fade-in zoom-in-95 duration-150">
+            <div className="bg-teal-700 px-5 py-4 text-white rounded-t-xl flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-bold tracking-tight flex items-center gap-2">
+                  <FileText className="w-4 h-4" />
+                  Download Quotation Statement
+                </h2>
+                <p className="text-[10px] text-teal-100 mt-0.5">Account-style PDF with full quotation details</p>
+              </div>
+              <button type="button" onClick={() => setIsReportModalOpen(false)}
+                className="text-teal-100 hover:text-white p-1.5 rounded-lg hover:bg-white/10">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {reportError && (
+                <div className="bg-red-50 border border-red-200 text-red-800 text-xs px-3 py-2 rounded-md flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                  <span>{reportError}</span>
+                </div>
+              )}
+
+              <div>
+                <label className="form-label text-xs font-semibold text-slate-700 mb-2 block">Statement Type</label>
+                <div className="space-y-2">
+                  {([
+                    ["full", "Full Register", "All quotations in the system"],
+                    ["date", "By Date", "Quotations created on a specific date"],
+                    ["month", "By Month", "Quotations in a calendar month"],
+                    ["range", "Date Range", "Quotations between two dates"],
+                    ["current", "Current Table Filter", "Uses search & status filters from the list"],
+                  ] as const).map(([mode, title, desc]) => (
+                    <label key={mode}
+                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                        reportMode === mode ? "border-teal-600 bg-teal-50" : "border-slate-200 hover:bg-slate-50"
+                      }`}>
+                      <input type="radio" name="quotationReportMode" value={mode} checked={reportMode === mode}
+                        onChange={() => { setReportMode(mode); setReportError(null); }}
+                        className="mt-0.5" />
+                      <span>
+                        <span className="text-xs font-bold text-slate-800 block">{title}</span>
+                        <span className="text-[10px] text-slate-500">{desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {reportMode === "date" && (
+                <div>
+                  <label className="form-label text-xs">Quotation Date</label>
+                  <input type="date" value={reportDate} onChange={(e) => setReportDate(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "month" && (
+                <div>
+                  <label className="form-label text-xs">Month</label>
+                  <input type="month" value={reportMonth} onChange={(e) => setReportMonth(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "range" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="form-label text-xs">From Date</label>
+                    <input type="date" value={reportFrom} onChange={(e) => setReportFrom(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                  <div>
+                    <label className="form-label text-xs">To Date</label>
+                    <input type="date" value={reportTo} min={reportFrom} onChange={(e) => setReportTo(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Statement includes date, quotation no, serial, customer, rate type, item count, subtotal, GST, net amount, validity, and status — with period totals and signatory.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-200 bg-slate-50 rounded-b-xl">
+              <button type="button" onClick={() => setIsReportModalOpen(false)} className="btn-secondary px-4 text-xs">
+                Cancel
+              </button>
+              <button type="button" onClick={handlePrintStatement} disabled={reportBusy}
+                className="btn-secondary px-4 text-xs flex items-center gap-1.5 disabled:opacity-50">
+                <Printer className="w-3.5 h-3.5" /> Print
+              </button>
+              <button type="button" onClick={handleDownloadStatement} disabled={reportBusy}
+                className="btn-primary bg-teal-600 hover:bg-teal-700 px-4 text-xs flex items-center gap-1.5 disabled:opacity-50">
+                <Download className="w-3.5 h-3.5" /> Download PDF
               </button>
             </div>
           </div>

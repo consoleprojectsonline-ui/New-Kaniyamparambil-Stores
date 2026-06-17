@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Receipt, Plus, Search, Filter, Trash2, AlertTriangle, Check,
-  Database, Calendar, Eye, Download, Printer, X, Edit, User, Truck,
+  Database, Calendar, Eye, Download, Printer, X, Edit, User, Truck, FileText,
 } from "lucide-react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
@@ -891,6 +891,416 @@ async function waitForInvoiceFrame(html: string): Promise<HTMLIFrameElement> {
   return iframe;
 }
 
+// ─── Sales Statement (account-style register) ────────────────────────────────
+
+type SalesReportMode = "full" | "date" | "month" | "range" | "current";
+
+type SalesStatementMeta = {
+  reportTitle: string;
+  periodLabel: string;
+  reportType: string;
+  statusFilter: string;
+  searchQuery: string;
+  generatedOn: string;
+  totalBills: number;
+  totalSales: number;
+  totalCollected: number;
+  totalOutstanding: number;
+};
+
+type SalesStatementDocOptions = {
+  helperText?: string;
+  renderMode?: "print" | "pdf";
+};
+
+function todayIso(): string {
+  return new Date().toISOString().split("T")[0];
+}
+
+function saleBillDate(sale: SaleRecord): string | null {
+  if (!sale.bill_date) return null;
+  return sale.bill_date.slice(0, 10);
+}
+
+function filterSalesByDate(salesList: SaleRecord[], date: string): SaleRecord[] {
+  return salesList.filter((sale) => saleBillDate(sale) === date);
+}
+
+function filterSalesByMonth(salesList: SaleRecord[], monthYm: string): SaleRecord[] {
+  return salesList.filter((sale) => saleBillDate(sale)?.slice(0, 7) === monthYm);
+}
+
+function filterSalesByRange(salesList: SaleRecord[], from: string, to: string): SaleRecord[] {
+  return salesList.filter((sale) => {
+    const d = saleBillDate(sale);
+    if (!d) return false;
+    return d >= from && d <= to;
+  });
+}
+
+function formatMonthLabel(monthYm: string): string {
+  const [year, month] = monthYm.split("-");
+  const d = new Date(Number(year), Number(month) - 1, 1);
+  if (Number.isNaN(d.getTime())) return monthYm;
+  return new Intl.DateTimeFormat("en-GB", { month: "long", year: "numeric" }).format(d);
+}
+
+function formatStatementGeneratedOn(): string {
+  return formatInvoiceDate(new Date().toISOString());
+}
+
+function buildSalesStatementMeta(
+  salesList: SaleRecord[],
+  reportType: string,
+  periodLabel: string,
+  statusFilter: string,
+  searchQuery: string,
+): SalesStatementMeta {
+  return {
+    reportTitle: "SALES STATEMENT / BILLING REGISTER",
+    periodLabel,
+    reportType,
+    statusFilter,
+    searchQuery,
+    generatedOn: formatStatementGeneratedOn(),
+    totalBills: salesList.length,
+    totalSales: salesList.reduce((sum, s) => sum + s.grand_total, 0),
+    totalCollected: salesList.reduce((sum, s) => sum + s.payment_amount, 0),
+    totalOutstanding: salesList.reduce((sum, s) => sum + s.balance, 0),
+  };
+}
+
+function buildSalesStatementHtml(
+  salesList: SaleRecord[],
+  meta: SalesStatementMeta,
+  options: SalesStatementDocOptions = {},
+): string {
+  const store = INVOICE_STATIC_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+  const companyName = store.storeNameLines.join(" ");
+
+  const rowMarkup = salesList.map((sale, index) => `
+    <tr>
+      <td class="col-index">${index + 1}</td>
+      <td class="col-date">${escapeHtml(saleBillDate(sale) ? formatInvoiceDate(saleBillDate(sale)!) : "—")}</td>
+      <td class="col-bill">${escapeHtml(sale.bill_no)}</td>
+      <td class="col-customer">${escapeHtml(sale.customer_name)}</td>
+      <td class="col-salesman">${escapeHtml(sale.salesman || "—")}</td>
+      <td class="col-type">${escapeHtml(sale.form_type)}</td>
+      <td class="col-items align-center">${sale.items.length}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(sale.subtotal))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(sale.total_gst))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(sale.grand_total))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(sale.payment_amount))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(sale.balance))}</td>
+      <td class="col-status">${escapeHtml(sale.payment_status)}</td>
+    </tr>
+  `).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>${escapeHtml(meta.reportTitle)}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "7.5px" : "11px"};
+          line-height: 1.28;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .statement-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .toolbar-actions { display: flex; gap: 8px; }
+        .toolbar-btn {
+          border: 1px solid #ccc;
+          border-radius: 4px;
+          padding: 8px 14px;
+          font-family: inherit;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          background: #fff;
+        }
+        .toolbar-btn.primary { background: #16a34a; color: #fff; border-color: #16a34a; }
+        .sales-statement-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "13px" : "16px"};
+          font-weight: 700;
+          color: #16a34a;
+          letter-spacing: 0.05em;
+          padding: ${isPdfMode ? "7px 8px" : "10px"};
+          border-bottom: 1px solid #000;
+        }
+        .period-banner {
+          text-align: center;
+          font-weight: 700;
+          padding: ${isPdfMode ? "5px 8px" : "8px 12px"};
+          border-bottom: 1px solid #000;
+          background: #dcfce7;
+          font-size: ${isPdfMode ? "9px" : "12px"};
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+        }
+        .meta-grid > div:last-child { border-right: none; }
+        .meta-label { font-weight: 700; margin-bottom: 2px; font-size: ${isPdfMode ? "7.5px" : "10px"}; text-transform: uppercase; }
+        .meta-line { margin-bottom: 1px; }
+        .statement-table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        .statement-table th,
+        .statement-table td {
+          border: 1px solid #000;
+          padding: ${isPdfMode ? "2px 3px" : "4px 5px"};
+          vertical-align: top;
+        }
+        .statement-table thead th {
+          background: #dcfce7;
+          font-weight: 700;
+          text-align: center;
+        }
+        .col-index { width: 20px; text-align: center; }
+        .col-date { width: 52px; text-align: center; white-space: nowrap; }
+        .col-bill { width: 62px; font-family: monospace; }
+        .col-customer { min-width: 80px; }
+        .col-salesman { width: 48px; }
+        .col-type { width: 52px; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .col-items { width: 28px; }
+        .col-amt { width: 52px; white-space: nowrap; }
+        .col-status { width: 40px; text-align: center; }
+        .align-right { text-align: right; }
+        .align-center { text-align: center; }
+        .summary-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr 1fr;
+          border-top: 1px solid #000;
+        }
+        .summary-box {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+          font-weight: 600;
+        }
+        .summary-box:last-child { border-right: none; }
+        .summary-box b { display: block; font-size: ${isPdfMode ? "9px" : "12px"}; margin-top: 2px; }
+        .footer-note {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          color: #444;
+        }
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          text-align: right;
+          font-weight: 700;
+          font-size: ${isPdfMode ? "8px" : "11px"};
+        }
+        @page { size: A4 landscape; margin: 8mm; }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .statement-toolbar { display: none; }
+          .sales-statement-sheet { width: 100%; border: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="statement-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText || "Use Print / Save as PDF from your browser.")}</p>
+        <div class="toolbar-actions">
+          <button class="toolbar-btn" onclick="window.close()">Close</button>
+          <button class="toolbar-btn primary" onclick="window.print()">Print / Save PDF</button>
+        </div>
+      </div>
+
+      <div class="sales-statement-sheet">
+        <div class="doc-title">${escapeHtml(meta.reportTitle)}</div>
+        <div class="period-banner">Statement Period: ${escapeHtml(meta.periodLabel)}</div>
+
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">${escapeHtml(companyName)}</div>
+            <div class="meta-line">${escapeHtml(store.location)}</div>
+            <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+            <div class="meta-line"><b>Phone:</b> ${escapeHtml(store.phone)}</div>
+          </div>
+          <div>
+            <div class="meta-label">Report Details</div>
+            <div class="meta-line"><b>Type:</b> ${escapeHtml(meta.reportType)}</div>
+            <div class="meta-line"><b>Status Filter:</b> ${escapeHtml(meta.statusFilter)}</div>
+            <div class="meta-line"><b>Search:</b> ${escapeHtml(meta.searchQuery || "—")}</div>
+          </div>
+          <div>
+            <div class="meta-label">Generated</div>
+            <div class="meta-line"><b>Date:</b> ${escapeHtml(meta.generatedOn)}</div>
+            <div class="meta-line"><b>Bills:</b> ${meta.totalBills}</div>
+          </div>
+        </div>
+
+        <table class="statement-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Bill Date</th>
+              <th>Bill No</th>
+              <th>Customer</th>
+              <th>Salesman</th>
+              <th>Form Type</th>
+              <th>Items</th>
+              <th>Subtotal</th>
+              <th>GST</th>
+              <th>Grand Total</th>
+              <th>Paid</th>
+              <th>Balance</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${rowMarkup || `<tr><td colspan="13" style="text-align:center;padding:12px;">No sales bills for this statement period.</td></tr>`}</tbody>
+        </table>
+
+        <div class="summary-grid">
+          <div class="summary-box">Total Bills<b>${meta.totalBills}</b></div>
+          <div class="summary-box">Total Sales<b>${escapeHtml(formatCurrency(meta.totalSales))}</b></div>
+          <div class="summary-box">Total Collected<b>${escapeHtml(formatCurrency(meta.totalCollected))}</b></div>
+          <div class="summary-box">Outstanding<b>${escapeHtml(formatCurrency(meta.totalOutstanding))}</b></div>
+        </div>
+
+        <div class="footer-note">
+          Sales statement generated from billing records. Amounts include taxable value, GST, and bill-level adjustments per saved invoice.
+        </div>
+
+        <div class="signatory">
+          <div>${escapeHtml(store.signatureCompany)}</div>
+          <div>${escapeHtml(store.signatureRole)}</div>
+        </div>
+      </div>
+    </body>
+  </html>`;
+}
+
+async function waitForSalesStatementFrame(html: string): Promise<HTMLIFrameElement> {
+  const iframe = document.createElement("iframe");
+  Object.assign(iframe.style, INVOICE_FRAME_STYLE);
+  iframe.setAttribute("aria-hidden", "true");
+  document.body.appendChild(iframe);
+
+  const frameDocument = iframe.contentDocument;
+  if (!frameDocument) {
+    iframe.remove();
+    throw new Error("Unable to prepare the sales statement document.");
+  }
+
+  frameDocument.open();
+  frameDocument.write(html);
+  frameDocument.close();
+
+  await new Promise<void>((resolve, reject) => {
+    const startedAt = Date.now();
+    const checkReady = () => {
+      const readyState = iframe.contentDocument?.readyState;
+      if (readyState === "interactive" || readyState === "complete") {
+        resolve();
+        return;
+      }
+      if (Date.now() - startedAt > 5000) {
+        reject(new Error("Sales statement preview took too long to load."));
+        return;
+      }
+      window.setTimeout(checkReady, 50);
+    };
+    checkReady();
+  });
+
+  const sheet = iframe.contentDocument?.querySelector(".sales-statement-sheet");
+  if (sheet instanceof HTMLElement) {
+    iframe.style.height = `${sheet.scrollHeight + 40}px`;
+  }
+
+  await new Promise((resolve) => window.setTimeout(resolve, 120));
+  return iframe;
+}
+
+async function exportSalesStatementPdf(html: string, filename: string): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForSalesStatementFrame(html);
+    const sheet = iframe.contentDocument?.querySelector(".sales-statement-sheet");
+    if (!(sheet instanceof HTMLElement)) {
+      throw new Error("Unable to prepare the sales statement layout for PDF export.");
+    }
+
+    const canvas = await html2canvas(sheet, {
+      scale: 2,
+      useCORS: true,
+      backgroundColor: "#ffffff",
+    });
+
+    const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const margin = 12;
+    const imgWidth = pageWidth - margin * 2;
+    const imgHeight = (canvas.height * imgWidth) / canvas.width;
+    const imgData = canvas.toDataURL("image/png");
+    let heightLeft = imgHeight;
+    let position = margin;
+
+    pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+    heightLeft -= pageHeight - margin * 2;
+
+    while (heightLeft > 0) {
+      pdf.addPage();
+      position = margin - (imgHeight - heightLeft);
+      pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+      heightLeft -= pageHeight - margin * 2;
+    }
+
+    pdf.save(filename);
+  } finally {
+    iframe?.remove();
+  }
+}
+
+async function printSalesStatementHtml(html: string): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForSalesStatementFrame(html);
+    const printWindow = iframe.contentWindow;
+    if (!printWindow) throw new Error("Unable to open the print dialog.");
+    printWindow.focus();
+    printWindow.print();
+  } finally {
+    window.setTimeout(() => iframe?.remove(), 1200);
+  }
+}
+
 function blankItem(): SaleItem {
   return { code: "", name: "", hsn_code: "", qty: 1, unit: "Nos", rate: 0,
     amount: 0, disc_pct: 0, mrp: 0, sgst: 9, cgst: 9, line_total: 0 };
@@ -1036,12 +1446,24 @@ export default function SalesPage() {
   const [dbStatus, setDbStatus] = useState<"connected" | "local">("connected");
   const [editingSale, setEditingSale] = useState<SaleRecord | null>(null);
   const [viewingSale, setViewingSale] = useState<SaleRecord | null>(null);
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
+  const [reportMode, setReportMode] = useState<SalesReportMode>("full");
+  const [reportDate, setReportDate] = useState(todayIso);
+  const [reportMonth, setReportMonth] = useState(() => todayIso().slice(0, 7));
+  const [reportFrom, setReportFrom] = useState(todayIso);
+  const [reportTo, setReportTo] = useState(todayIso);
+  const [reportError, setReportError] = useState<string | null>(null);
 
   // ── Purchase item lookup: code → latest PurchaseItem data ──
-  // Used to pre-fill rate, sgst, cgst, hsn_code, unit, s_rate, mrp when selecting a product
+  // Used to pre-fill unit, purchase cost, selling price, sgst, cgst, hsn from latest purchase bill.
   const [purchaseItemMap, setPurchaseItemMap] = useState<Map<string, {
-    rate: number; sgst: number; cgst: number;
-    hsn_code: string; unit: string; s_rate: number; mrp: number;
+    purchase_rate: number;
+    sgst: number;
+    cgst: number;
+    hsn_code: string;
+    unit: string;
+    s_rate: number;
+    mrp: number;
   }>>(new Map());
 
   // Search & filter
@@ -1100,7 +1522,6 @@ export default function SalesPage() {
 
   // ── Build purchase item lookup map ──
   // Scans all purchase bills, keeps the MOST RECENT values per item code.
-  // Priority: s_rate > rate for selling price; also pulls sgst, cgst, hsn_code, unit, mrp.
   const fetchPurchaseItemMap = useCallback(async () => {
     try {
       const { data, error } = await supabase
@@ -1122,30 +1543,50 @@ export default function SalesPage() {
     } catch { /* ignore */ }
 
     function buildMap(rows: Array<{ items: unknown[]; created_at?: string }>) {
-      // rows are already newest-first from Supabase ORDER BY
       const map = new Map<string, {
-        rate: number; sgst: number; cgst: number;
-        hsn_code: string; unit: string; s_rate: number; mrp: number;
+        purchase_rate: number;
+        sgst: number;
+        cgst: number;
+        hsn_code: string;
+        unit: string;
+        s_rate: number;
+        mrp: number;
       }>();
       for (const row of rows) {
         if (!Array.isArray(row.items)) continue;
         for (const it of row.items as Record<string, unknown>[]) {
           const code = String(it.code ?? "").trim();
-          if (!code || map.has(code)) continue; // keep first (= newest) occurrence
+          if (!code || map.has(code)) continue;
           map.set(code, {
-            rate:     Number(it.s_rate ?? it.rate ?? 0),   // prefer s_rate (selling price)
-            sgst:     Number(it.sgst ?? 9),
-            cgst:     Number(it.cgst ?? 9),
+            purchase_rate: Number(it.rate ?? 0),
+            sgst: Number(it.sgst ?? 9),
+            cgst: Number(it.cgst ?? 9),
             hsn_code: String(it.hsn_code ?? ""),
-            unit:     String(it.unit ?? "Nos"),
-            s_rate:   Number(it.s_rate ?? 0),
-            mrp:      Number(it.mrp ?? 0),
+            unit: String(it.unit ?? "Nos"),
+            s_rate: Number(it.s_rate ?? 0),
+            mrp: Number(it.mrp ?? 0),
           });
         }
       }
       setPurchaseItemMap(map);
     }
   }, []);
+
+  const resolveSellingUnitPrice = (purchaseData?: {
+    purchase_rate: number;
+    s_rate: number;
+    mrp: number;
+  }): number => {
+    if (!purchaseData) return 0;
+    if (purchaseData.s_rate > 0) return purchaseData.s_rate;
+    if (purchaseData.mrp > 0) return purchaseData.mrp;
+    return purchaseData.purchase_rate;
+  };
+
+  const unitOptionsForRow = (unit: string): string[] => {
+    if (!unit || UNITS.includes(unit)) return [...UNITS];
+    return [unit, ...UNITS];
+  };
 
   // ── Load sales ──
   const loadLocalSales = useCallback(() => {
@@ -1191,10 +1632,9 @@ export default function SalesPage() {
   };
 
   const updateGridRow = (i: number, key: keyof SaleItem, val: string | number) => {
-    setGridItems(gridItems.map((item, idx) => {
+    setGridItems((prev) => prev.map((item, idx) => {
       if (idx !== i) return item;
       const updated = { ...item, [key]: val };
-      // Recompute auto fields whenever any driver changes
       if (["qty", "mrp", "disc_pct", "sgst", "cgst"].includes(key)) {
         Object.assign(updated, computeLineAutos(updated));
       }
@@ -1203,20 +1643,25 @@ export default function SalesPage() {
   };
 
   const handleProductSelect = (i: number, prod: InventoryItem) => {
-    // Look up latest purchase data for this item code
     const purchaseData = purchaseItemMap.get(prod.code);
-    const mrpVal = purchaseData?.mrp ?? 0;
-    setGridItems(gridItems.map((item, idx) => idx !== i ? item : {
-      ...item,
-      code:     prod.code,
-      name:     prod.name,
-      hsn_code: purchaseData?.hsn_code || prod.hsn_code || "",
-      unit:     purchaseData?.unit     || prod.uom       || "Nos",
-      rate:     purchaseData?.rate     ?? 0,   // cost/purchase price — reference
-      mrp:      mrpVal,                         // selling price
-      amount:   item.qty * mrpVal,              // qty × mrp
-      sgst:     purchaseData?.sgst     ?? 9,
-      cgst:     purchaseData?.cgst     ?? 9,
+    const unitVal = purchaseData?.unit || prod.uom || "Nos";
+    const costRate = purchaseData?.purchase_rate ?? 0;
+    const sellingUnitPrice = resolveSellingUnitPrice(purchaseData);
+
+    setGridItems((prev) => prev.map((item, idx) => {
+      if (idx !== i) return item;
+      const updated: SaleItem = {
+        ...item,
+        code: prod.code,
+        name: prod.name,
+        hsn_code: purchaseData?.hsn_code || prod.hsn_code || "",
+        unit: unitVal,
+        rate: costRate,
+        mrp: sellingUnitPrice,
+        sgst: purchaseData?.sgst ?? 9,
+        cgst: purchaseData?.cgst ?? 9,
+      };
+      return { ...updated, ...computeLineAutos(updated) };
     }));
   };
 
@@ -1299,8 +1744,8 @@ export default function SalesPage() {
 
     const customerFinal = isCustomCustomer ? customCustomerText.trim() : customerName.trim();
     if (!customerFinal) { setFormError("Please select or enter a Customer."); return; }
-    if (gridItems.some((i) => !i.name.trim() || i.qty <= 0 || i.rate <= 0)) {
-      setFormError("All items must have a name, valid quantity, and rate."); return;
+    if (gridItems.some((i) => !i.name.trim() || i.qty <= 0 || i.mrp <= 0)) {
+      setFormError("All items must have a name, valid quantity, and unit selling price."); return;
     }
     const salesmanFinal = isCustomSalesman ? customSalesmanText.trim() : salesman;
     const paidNum = Number(paymentAmount) || 0;
@@ -1562,6 +2007,109 @@ export default function SalesPage() {
     Array.from(new Set([...SEED_CUSTOMERS, ...sales.map((s) => s.customer_name)])).filter(Boolean),
     [sales]);
 
+  const resolveSalesStatementReport = (): {
+    records: SaleRecord[];
+    reportType: string;
+    periodLabel: string;
+    filenameSuffix: string;
+  } | null => {
+    const applyStatus = (list: SaleRecord[]) =>
+      statusFilter === "All" ? list : list.filter((s) => s.payment_status === statusFilter);
+
+    switch (reportMode) {
+      case "full":
+        return {
+          records: applyStatus([...sales]),
+          reportType: "Complete Sales Register",
+          periodLabel: "All Bills (Full Register)",
+          filenameSuffix: `full_${todayIso()}`,
+        };
+      case "current":
+        return {
+          records: [...filteredSales],
+          reportType: "Filtered Table View",
+          periodLabel: `Current filters — Status: ${statusFilter}, Search: ${searchQuery.trim() || "—"}`,
+          filenameSuffix: `filtered_${todayIso()}`,
+        };
+      case "date": {
+        const dated = applyStatus(filterSalesByDate(sales, reportDate));
+        return {
+          records: dated,
+          reportType: "Daily Sales Statement",
+          periodLabel: formatInvoiceDate(reportDate),
+          filenameSuffix: `date_${reportDate}`,
+        };
+      }
+      case "month": {
+        const monthly = applyStatus(filterSalesByMonth(sales, reportMonth));
+        return {
+          records: monthly,
+          reportType: "Monthly Sales Statement",
+          periodLabel: formatMonthLabel(reportMonth),
+          filenameSuffix: `month_${reportMonth}`,
+        };
+      }
+      case "range": {
+        if (reportFrom > reportTo) {
+          setReportError("From date cannot be after To date.");
+          return null;
+        }
+        const ranged = applyStatus(filterSalesByRange(sales, reportFrom, reportTo));
+        return {
+          records: ranged,
+          reportType: "Date Range Sales Statement",
+          periodLabel: `${formatInvoiceDate(reportFrom)} to ${formatInvoiceDate(reportTo)}`,
+          filenameSuffix: `${reportFrom}_to_${reportTo}`,
+        };
+      }
+      default:
+        return null;
+    }
+  };
+
+  const buildSalesStatementDocument = () => {
+    const report = resolveSalesStatementReport();
+    if (!report) return null;
+    if (report.records.length === 0) {
+      setReportError("No sales bills match the selected statement period.");
+      return null;
+    }
+    setReportError(null);
+    return buildSalesStatementHtml(
+      report.records,
+      buildSalesStatementMeta(
+        report.records,
+        report.reportType,
+        report.periodLabel,
+        statusFilter,
+        searchQuery.trim(),
+      ),
+      { renderMode: "pdf", helperText: "Generating sales statement PDF..." },
+    );
+  };
+
+  const handleDownloadSalesStatement = async () => {
+    const report = resolveSalesStatementReport();
+    if (!report) return;
+    const html = buildSalesStatementDocument();
+    if (!html) return;
+    try {
+      await exportSalesStatementPdf(html, `sales_statement_${report.filenameSuffix}.pdf`);
+    } catch (err) {
+      alert(`Statement PDF failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
+  const handlePrintSalesStatement = async () => {
+    const html = buildSalesStatementDocument();
+    if (!html) return;
+    try {
+      await printSalesStatementHtml(html);
+    } catch (err) {
+      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
   // ─────────────────────────────────────────────────────────────────────────────
   // RENDER
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1579,10 +2127,20 @@ export default function SalesPage() {
             Generate customer bills, manage invoices, and track sales transactions.
           </p>
         </div>
-        <button onClick={() => { resetForm(); setIsFormOpen(true); }}
-          className="btn-primary bg-green-600 hover:bg-green-700 active:bg-green-800 flex items-center gap-1.5 shadow-sm">
-          <Plus className="w-4 h-4" /> New Sales Bill
-        </button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            onClick={() => { setReportError(null); setIsReportModalOpen(true); }}
+            className="btn-secondary flex items-center gap-1.5 text-xs font-semibold shadow-sm"
+          >
+            <FileText className="w-3.5 h-3.5" />
+            Sales Statement
+          </button>
+          <button onClick={() => { resetForm(); setIsFormOpen(true); }}
+            className="btn-primary bg-green-600 hover:bg-green-700 active:bg-green-800 flex items-center gap-1.5 shadow-sm">
+            <Plus className="w-4 h-4" /> New Sales Bill
+          </button>
+        </div>
       </div>
 
       {/* ── DB Status ── */}
@@ -1595,6 +2153,125 @@ export default function SalesPage() {
               The <code>sales</code> table is missing or has old columns. Run the SQL in{" "}
               <code>sql/04_sales.sql</code> in your Supabase Editor (use the DROP + CREATE block).
             </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Sales Statement Modal ── */}
+      {isReportModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px]">
+          <div className="absolute inset-0" onClick={() => setIsReportModalOpen(false)} />
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-lg w-full z-10 flex flex-col font-sans animate-in fade-in zoom-in-95 duration-150">
+            <div className="bg-green-700 px-5 py-4 text-white rounded-t-xl flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-bold tracking-tight flex items-center gap-2">
+                  <FileText className="w-4 h-4" />
+                  Download Sales Statement
+                </h2>
+                <p className="text-[10px] text-green-100 mt-0.5">Account-style billing register PDF</p>
+              </div>
+              <button type="button" onClick={() => setIsReportModalOpen(false)}
+                className="text-green-100 hover:text-white p-1.5 rounded-lg hover:bg-white/10">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {reportError && (
+                <div className="bg-red-50 border border-red-200 text-red-800 text-xs px-3 py-2 rounded-md flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                  <span>{reportError}</span>
+                </div>
+              )}
+
+              <div>
+                <label className="form-label text-xs font-semibold text-slate-700 mb-2 block">Statement Type</label>
+                <div className="space-y-2">
+                  {([
+                    ["full", "Full Sales Register", "All bills in the system"],
+                    ["date", "By Bill Date", "Bills on a specific date"],
+                    ["month", "By Month", "Bills in a calendar month"],
+                    ["range", "Date Range", "Bills between two dates"],
+                    ["current", "Current Table Filter", "Uses search & status filters from the list"],
+                  ] as const).map(([mode, title, desc]) => (
+                    <label key={mode}
+                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                        reportMode === mode ? "border-green-600 bg-green-50" : "border-slate-200 hover:bg-slate-50"
+                      }`}>
+                      <input type="radio" name="salesReportMode" value={mode} checked={reportMode === mode}
+                        onChange={() => { setReportMode(mode); setReportError(null); }}
+                        className="mt-0.5" />
+                      <span>
+                        <span className="text-xs font-bold text-slate-800 block">{title}</span>
+                        <span className="text-[10px] text-slate-500">{desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {reportMode === "date" && (
+                <div>
+                  <label className="form-label text-xs">Bill Date</label>
+                  <input type="date" value={reportDate} onChange={(e) => setReportDate(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "month" && (
+                <div>
+                  <label className="form-label text-xs">Month</label>
+                  <input type="month" value={reportMonth} onChange={(e) => setReportMonth(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "range" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="form-label text-xs">From Date</label>
+                    <input type="date" value={reportFrom} onChange={(e) => setReportFrom(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                  <div>
+                    <label className="form-label text-xs">To Date</label>
+                    <input type="date" value={reportTo} min={reportFrom} onChange={(e) => setReportTo(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                </div>
+              )}
+
+              {(reportMode === "full" || reportMode === "date" || reportMode === "month" || reportMode === "range") && (
+                <div>
+                  <label className="form-label text-xs">Optional Payment Status Filter</label>
+                  <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}
+                    className="input-enterprise bg-white cursor-pointer text-xs w-full">
+                    <option value="All">All Bills</option>
+                    <option value="Paid">Paid</option>
+                    <option value="Partial">Partial</option>
+                    <option value="Credit">Credit</option>
+                  </select>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Statement lists bill date, number, customer, salesman, totals, paid amount, balance, and status — with summary totals like an account statement.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-200 bg-slate-50 rounded-b-xl">
+              <button type="button" onClick={() => setIsReportModalOpen(false)} className="btn-secondary px-4 text-xs">
+                Cancel
+              </button>
+              <button type="button" onClick={handlePrintSalesStatement}
+                className="btn-secondary px-4 text-xs flex items-center gap-1.5">
+                <Printer className="w-3.5 h-3.5" /> Print
+              </button>
+              <button type="button" onClick={handleDownloadSalesStatement}
+                className="btn-primary bg-green-600 hover:bg-green-700 px-4 text-xs flex items-center gap-1.5">
+                <Download className="w-3.5 h-3.5" /> Download PDF
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1866,7 +2543,7 @@ export default function SalesPage() {
                         <th className="p-2 w-[200px]">Code / Item Name</th>
                         <th className="p-2 w-[55px] text-center">Qty</th>
                         <th className="p-2 w-[70px] text-center">Unit</th>
-                        <th className="p-2 w-[80px] text-right">MRP (₹) *</th>
+                        <th className="p-2 w-[80px] text-right">Unit Price (₹) *</th>
                         <th className="p-2 w-[85px] text-right">Amount (₹)</th>
                         <th className="p-2 w-[60px] text-center">Dis%</th>
                         <th className="p-2 w-[55px] text-center">SGST%</th>
@@ -1890,23 +2567,27 @@ export default function SalesPage() {
                               onChange={(e) => updateGridRow(idx, "qty", parseFloat(e.target.value) || 0)}
                               className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono" required />
                           </td>
-                          {/* Unit */}
+                          {/* Unit — auto-filled from latest purchase bill */}
                           <td className="p-1.5">
                             <select value={item.unit} onChange={(e) => updateGridRow(idx, "unit", e.target.value)}
-                              className="w-full text-center border border-slate-300 rounded p-1 text-xs bg-white cursor-pointer" required>
-                              {UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
+                              className="w-full text-center border border-slate-300 rounded p-1 text-xs bg-white cursor-pointer" required
+                              title={purchaseItemMap.has(item.code) ? "Unit from latest purchase entry" : "Select unit"}>
+                              {unitOptionsForRow(item.unit).map((u) => <option key={u} value={u}>{u}</option>)}
                             </select>
                           </td>
-                          {/* MRP — primary selling price, drives all calculations */}
+                          {/* Unit price per qty — from purchase MRP / S.Rate / purchase rate */}
                           <td className="p-1.5">
-                            <input type="number" min="0" value={item.mrp || ""}
+                            <input type="number" min="0" step="0.01" value={item.mrp || ""}
                               onChange={(e) => updateGridRow(idx, "mrp", parseFloat(e.target.value) || 0)}
-                              className="w-full text-right border border-green-400 rounded p-1 text-xs font-mono font-semibold focus:ring-2 focus:ring-green-500/20 focus:border-green-600" placeholder="0.00" required />
+                              className="w-full text-right border border-green-400 rounded p-1 text-xs font-mono font-semibold focus:ring-2 focus:ring-green-500/20 focus:border-green-600"
+                              placeholder="0.00" required
+                              title="Selling price for one unit (auto-filled from purchase)" />
                           </td>
-                          {/* Amount = qty × MRP (auto, read-only) */}
+                          {/* Amount = qty × unit price (auto) */}
                           <td className="p-1.5">
-                            <input readOnly value={(item.qty * item.mrp).toFixed(2)} tabIndex={-1}
-                              className="w-full text-right border border-slate-200 rounded p-1 text-xs font-mono bg-slate-50 text-slate-600 cursor-not-allowed" />
+                            <input readOnly value={item.amount.toFixed(2)} tabIndex={-1}
+                              className="w-full text-right border border-slate-200 rounded p-1 text-xs font-mono bg-slate-50 text-slate-600 cursor-not-allowed"
+                              title="Qty × unit price" />
                           </td>
                           {/* Disc% */}
                           <td className="p-1.5">

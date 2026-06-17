@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import {
   Boxes,
@@ -15,6 +16,7 @@ import {
   Download,
   Printer,
   Edit,
+  FileText,
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 
@@ -72,6 +74,656 @@ const PREDEFINED_SUBGROUPS = [
 
 const DEFAULT_UOMS = ["Nos", "Mtr", "Feet", "Sq. Feet", "Inch", "Kg", "Ltr"];
 
+const INVENTORY_STORE_DETAILS = {
+  storeName: "NEW KANIYAMPARAMBIL STORES",
+  location: "THOPRAMKUDY PO, THOPRAMKUDY, KERALA",
+  gstin: "32AWJPJ1371N1ZE",
+  phone: "9544363171",
+  email: "newkaniyamparambilstorestkdy@gmail.com",
+} as const;
+
+type InventoryDocOptions = {
+  autoPrint?: boolean;
+  helperText?: string;
+  renderMode?: "print" | "pdf";
+};
+
+const INVENTORY_FRAME_STYLE: Partial<CSSStyleDeclaration> = {
+  position: "fixed",
+  top: "0",
+  left: "-20000px",
+  width: "794px",
+  height: "auto",
+  minHeight: "400px",
+  opacity: "0",
+  pointerEvents: "none",
+  border: "0",
+  background: "transparent",
+  overflow: "visible",
+};
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatReportDate(value?: string): string {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(date).replace(/ /g, "-");
+}
+
+function todayIso(): string {
+  return new Date().toISOString().split("T")[0];
+}
+
+function itemRegisteredDate(item: InventoryItem): string | null {
+  if (!item.created_at) return null;
+  const d = new Date(item.created_at);
+  if (Number.isNaN(d.getTime())) return null;
+  const yr = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${yr}-${mo}-${day}`;
+}
+
+function filterItemsByDate(items: InventoryItem[], date: string): InventoryItem[] {
+  return items.filter((item) => itemRegisteredDate(item) === date);
+}
+
+function filterItemsByMonth(items: InventoryItem[], monthYm: string): InventoryItem[] {
+  return items.filter((item) => itemRegisteredDate(item)?.slice(0, 7) === monthYm);
+}
+
+function filterItemsByRange(items: InventoryItem[], from: string, to: string): InventoryItem[] {
+  return items.filter((item) => {
+    const d = itemRegisteredDate(item);
+    if (!d) return false;
+    return d >= from && d <= to;
+  });
+}
+
+function formatMonthLabel(monthYm: string): string {
+  const [year, month] = monthYm.split("-");
+  const d = new Date(Number(year), Number(month) - 1, 1);
+  if (Number.isNaN(d.getTime())) return monthYm;
+  return new Intl.DateTimeFormat("en-GB", { month: "long", year: "numeric" }).format(d);
+}
+
+type InventoryReportMode = "full" | "date" | "month" | "range" | "current";
+
+type InventoryStatementMeta = {
+  reportTitle: string;
+  periodLabel: string;
+  reportType: string;
+  groupFilter: string;
+  searchQuery: string;
+  generatedOn: string;
+  totalStock: number;
+  groupCount: number;
+};
+
+function buildInventoryStatementHtml(
+  items: InventoryItem[],
+  meta: InventoryStatementMeta,
+  options: InventoryDocOptions = {},
+): string {
+  const store = INVENTORY_STORE_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+
+  const rowMarkup = items.map((item, index) => `
+    <tr>
+      <td class="col-index">${index + 1}</td>
+      <td class="col-date">${escapeHtml(itemRegisteredDate(item) ? formatReportDate(itemRegisteredDate(item)!) : "—")}</td>
+      <td class="col-code">${escapeHtml(item.code)}</td>
+      <td class="col-name">${escapeHtml(item.name)}</td>
+      <td class="col-co">${escapeHtml(item.company_code || "—")}</td>
+      <td class="col-group">${escapeHtml(item.group)}</td>
+      <td class="col-sub">${escapeHtml(item.sub_group || "—")}</td>
+      <td class="col-brand">${escapeHtml(item.brand || "—")}</td>
+      <td class="col-type">${escapeHtml(item.type || "—")}</td>
+      <td class="col-hsn">${escapeHtml(item.hsn_code || "—")}</td>
+      <td class="col-uom">${escapeHtml(item.uom)}</td>
+      <td class="col-batch">${escapeHtml(item.enable_batch)}</td>
+      <td class="col-stock align-right">${escapeHtml(String(item.stock_qty ?? 0))}</td>
+    </tr>
+  `).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>${escapeHtml(meta.reportTitle)}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "7.5px" : "11px"};
+          line-height: 1.28;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .inventory-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .toolbar-actions { display: flex; gap: 8px; }
+        .toolbar-btn {
+          border: 1px solid #ccc;
+          border-radius: 4px;
+          padding: 8px 14px;
+          font-family: inherit;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          background: #fff;
+        }
+        .toolbar-btn.primary { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+        .inventory-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "13px" : "16px"};
+          font-weight: 700;
+          color: #1d4ed8;
+          letter-spacing: 0.05em;
+          padding: ${isPdfMode ? "7px 8px" : "10px"};
+          border-bottom: 1px solid #000;
+        }
+        .period-banner {
+          text-align: center;
+          font-weight: 700;
+          padding: ${isPdfMode ? "5px 8px" : "8px 12px"};
+          border-bottom: 1px solid #000;
+          background: #eff6ff;
+          font-size: ${isPdfMode ? "9px" : "12px"};
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+        }
+        .meta-grid > div:last-child { border-right: none; }
+        .meta-label { font-weight: 700; margin-bottom: 2px; font-size: ${isPdfMode ? "7.5px" : "10px"}; text-transform: uppercase; }
+        .meta-line { margin-bottom: 1px; }
+        .statement-table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        .statement-table th,
+        .statement-table td {
+          border: 1px solid #000;
+          padding: ${isPdfMode ? "2px 3px" : "4px 5px"};
+          vertical-align: top;
+        }
+        .statement-table thead th {
+          background: #dbeafe;
+          font-weight: 700;
+          text-align: center;
+        }
+        .col-index { width: 20px; text-align: center; }
+        .col-date { width: 52px; text-align: center; white-space: nowrap; }
+        .col-code { width: 44px; font-family: monospace; }
+        .col-name { min-width: 90px; }
+        .col-co { width: 44px; font-family: monospace; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .col-group, .col-sub, .col-brand { width: 48px; }
+        .col-type { width: 36px; text-align: center; }
+        .col-hsn { width: 46px; text-align: center; font-family: monospace; }
+        .col-uom { width: 30px; text-align: center; }
+        .col-batch { width: 28px; text-align: center; }
+        .col-stock { width: 36px; }
+        .align-right { text-align: right; }
+        .summary-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr;
+          border-top: 1px solid #000;
+        }
+        .summary-box {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+          font-weight: 600;
+        }
+        .summary-box:last-child { border-right: none; }
+        .summary-box b { display: block; font-size: ${isPdfMode ? "9px" : "12px"}; margin-top: 2px; }
+        .footer-note {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          color: #444;
+        }
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          text-align: right;
+          font-weight: 700;
+          font-size: ${isPdfMode ? "8px" : "11px"};
+        }
+        @page { size: A4 landscape; margin: 8mm; }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .inventory-toolbar { display: none; }
+          .inventory-sheet { width: 100%; border: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="inventory-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText || "Use Print / Save as PDF from your browser.")}</p>
+        <div class="toolbar-actions">
+          <button class="toolbar-btn" onclick="window.close()">Close</button>
+          <button class="toolbar-btn primary" onclick="window.print()">Print / Save PDF</button>
+        </div>
+      </div>
+
+      <div class="inventory-sheet">
+        <div class="doc-title">${escapeHtml(meta.reportTitle)}</div>
+        <div class="period-banner">Statement Period: ${escapeHtml(meta.periodLabel)}</div>
+
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">${escapeHtml(store.storeName)}</div>
+            <div class="meta-line">${escapeHtml(store.location)}</div>
+            <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+            <div class="meta-line"><b>Phone:</b> ${escapeHtml(store.phone)}</div>
+          </div>
+          <div>
+            <div class="meta-label">Report Details</div>
+            <div class="meta-line"><b>Type:</b> ${escapeHtml(meta.reportType)}</div>
+            <div class="meta-line"><b>Group Filter:</b> ${escapeHtml(meta.groupFilter)}</div>
+            <div class="meta-line"><b>Search:</b> ${escapeHtml(meta.searchQuery || "—")}</div>
+          </div>
+          <div>
+            <div class="meta-label">Generated</div>
+            <div class="meta-line"><b>Date:</b> ${escapeHtml(meta.generatedOn)}</div>
+            <div class="meta-line"><b>Items:</b> ${items.length}</div>
+            <div class="meta-line"><b>Categories:</b> ${meta.groupCount}</div>
+          </div>
+        </div>
+
+        <table class="statement-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Reg. Date</th>
+              <th>Code</th>
+              <th>Product Name</th>
+              <th>Co. Ref</th>
+              <th>Group</th>
+              <th>Sub-Group</th>
+              <th>Brand</th>
+              <th>Type</th>
+              <th>HSN</th>
+              <th>UOM</th>
+              <th>Batch</th>
+              <th>Stock</th>
+            </tr>
+          </thead>
+          <tbody>${rowMarkup || `<tr><td colspan="13" style="text-align:center;padding:12px;">No inventory records for this statement period.</td></tr>`}</tbody>
+        </table>
+
+        <div class="summary-grid">
+          <div class="summary-box">Total Items Listed<b>${items.length}</b></div>
+          <div class="summary-box">Total Stock Quantity<b>${meta.totalStock}</b></div>
+          <div class="summary-box">Product Groups<b>${meta.groupCount}</b></div>
+        </div>
+
+        <div class="footer-note">
+          This inventory statement is computer-generated and lists catalog items with registration dates, classifications, and stock quantities.
+          Items without a registration date are excluded from date/month/range statements.
+        </div>
+
+        <div class="signatory">
+          <div>${escapeHtml(store.storeName)}</div>
+          <div>Authorized Inventory Signatory</div>
+        </div>
+      </div>
+    </body>
+  </html>`;
+}
+
+function buildStatementMeta(
+  items: InventoryItem[],
+  reportType: string,
+  periodLabel: string,
+  groupFilter: string,
+  searchQuery: string,
+): InventoryStatementMeta {
+  const totalStock = items.reduce((sum, item) => sum + (item.stock_qty ?? 0), 0);
+  const groupCount = new Set(items.map((item) => item.group)).size;
+  return {
+    reportTitle: "INVENTORY STATEMENT / STOCK REGISTER",
+    periodLabel,
+    reportType,
+    groupFilter,
+    searchQuery,
+    generatedOn: formatReportDate(),
+    totalStock,
+    groupCount,
+  };
+}
+
+function buildInventoryItemHtml(item: InventoryItem, options: InventoryDocOptions = {}): string {
+  const store = INVENTORY_STORE_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+  const generatedOn = formatReportDate(item.created_at);
+
+  const specRows = [
+    { label: "Item Code", value: item.code },
+    { label: "Product Name / Print Description", value: item.name },
+    { label: "Company Code Reference", value: item.company_code || "—" },
+    { label: "Product Group Category", value: item.group },
+    { label: "Sub-Group Segment", value: item.sub_group || "—" },
+    { label: "Brand Name", value: item.brand || "—" },
+    { label: "Product Compliance Type", value: item.type },
+    { label: "HSN Code", value: item.hsn_code || "—" },
+    { label: "Unit of Measurement (UOM)", value: item.uom },
+    { label: "Batch Tracking Enabled", value: item.enable_batch === "Y" ? "Yes" : "No" },
+    { label: "Current Stock Qty", value: String(item.stock_qty ?? 0) },
+  ];
+
+  const rowMarkup = specRows.map((row) => `
+    <tr>
+      <td class="spec-label">${escapeHtml(row.label)}</td>
+      <td class="spec-value">${escapeHtml(row.value)}</td>
+    </tr>
+  `).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>Product Sheet ${escapeHtml(item.code)}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "9px" : "12px"};
+          line-height: 1.35;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .inventory-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .toolbar-actions { display: flex; gap: 8px; }
+        .toolbar-btn {
+          border: 1px solid #ccc;
+          border-radius: 4px;
+          padding: 8px 14px;
+          font-family: inherit;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          background: #fff;
+        }
+        .toolbar-btn.primary { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+        .inventory-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "13px" : "16px"};
+          font-weight: 700;
+          color: #1d4ed8;
+          letter-spacing: 0.05em;
+          padding: ${isPdfMode ? "7px 8px" : "10px"};
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          border-right: 1px solid #000;
+        }
+        .meta-grid > div:nth-child(2n) { border-right: none; }
+        .meta-label { font-weight: 700; margin-bottom: 2px; }
+        .meta-line { margin-bottom: 2px; }
+        .spec-table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        .spec-table td {
+          border: 1px solid #000;
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          vertical-align: top;
+        }
+        .spec-label {
+          width: 38%;
+          font-weight: 700;
+          background: #eff6ff;
+        }
+        .spec-value {
+          font-weight: 600;
+        }
+        .footer-note {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          font-size: ${isPdfMode ? "8px" : "10px"};
+          color: #444;
+        }
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "8px 8px 10px" : "12px 10px 16px"};
+          text-align: right;
+          font-weight: 700;
+        }
+        .signatory .role {
+          font-size: ${isPdfMode ? "8px" : "11px"};
+          font-weight: 600;
+          color: #333;
+        }
+        @page { size: A4; margin: 10mm; }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .inventory-toolbar { display: none; }
+          .inventory-sheet { width: 100%; border: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="inventory-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText || "Use Print / Save as PDF from your browser.")}</p>
+        <div class="toolbar-actions">
+          <button class="toolbar-btn" onclick="window.close()">Close</button>
+          <button class="toolbar-btn primary" onclick="window.print()">Print / Save PDF</button>
+        </div>
+      </div>
+
+      <div class="inventory-sheet">
+        <div class="doc-title">PRODUCT SPECIFICATION SHEET</div>
+
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">${escapeHtml(store.storeName)}</div>
+            <div class="meta-line">${escapeHtml(store.location)}</div>
+            <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+            <div class="meta-line"><b>Mobile:</b> ${escapeHtml(store.phone)}</div>
+          </div>
+          <div>
+            <div class="meta-label">Catalog Reference</div>
+            <div class="meta-line"><b>Item Code:</b> ${escapeHtml(item.code)}</div>
+            <div class="meta-line"><b>Generated On:</b> ${escapeHtml(generatedOn)}</div>
+            <div class="meta-line"><b>Report Type:</b> Single Product Sheet</div>
+          </div>
+        </div>
+
+        <table class="spec-table">${rowMarkup}</table>
+
+        <div class="footer-note">
+          This document is generated from the inventory catalog for internal reference and customer quotation support.
+        </div>
+
+        <div class="signatory">
+          <div>${escapeHtml(store.storeName)}</div>
+          <div class="role">Authorized Catalog Signatory</div>
+        </div>
+      </div>
+
+      <script>
+        ${options.autoPrint ? "window.addEventListener('load', () => { setTimeout(() => window.print(), 300); });" : ""}
+      </script>
+    </body>
+  </html>`;
+}
+
+async function waitForInventoryFrame(html: string): Promise<HTMLIFrameElement> {
+  const iframe = document.createElement("iframe");
+  Object.assign(iframe.style, INVENTORY_FRAME_STYLE);
+  iframe.setAttribute("aria-hidden", "true");
+  document.body.appendChild(iframe);
+
+  const frameDocument = iframe.contentDocument;
+  if (!frameDocument) {
+    iframe.remove();
+    throw new Error("Unable to prepare the inventory document.");
+  }
+
+  frameDocument.open();
+  frameDocument.write(html);
+  frameDocument.close();
+
+  await new Promise<void>((resolve, reject) => {
+    const startedAt = Date.now();
+    const checkReady = () => {
+      const readyState = iframe.contentDocument?.readyState;
+      if (readyState === "interactive" || readyState === "complete") {
+        resolve();
+        return;
+      }
+      if (Date.now() - startedAt > 5000) {
+        reject(new Error("Inventory preview took too long to load."));
+        return;
+      }
+      window.setTimeout(checkReady, 50);
+    };
+    checkReady();
+  });
+
+  const sheet = iframe.contentDocument?.querySelector(".inventory-sheet");
+  if (sheet instanceof HTMLElement) {
+    iframe.style.height = `${sheet.scrollHeight + 40}px`;
+  }
+
+  await new Promise((resolve) => window.setTimeout(resolve, 120));
+  return iframe;
+}
+
+async function exportInventoryPdf(html: string, filename: string, singlePage = false): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForInventoryFrame(html);
+    const sheet = iframe.contentDocument?.querySelector(".inventory-sheet");
+    if (!(sheet instanceof HTMLElement)) {
+      throw new Error("Unable to prepare the inventory layout for PDF export.");
+    }
+
+    const canvas = await html2canvas(sheet, {
+      scale: 2,
+      useCORS: true,
+      backgroundColor: "#ffffff",
+    });
+
+    const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const margin = 12;
+
+    if (singlePage) {
+      const maxWidth = pageWidth - margin * 2;
+      const maxHeight = pageHeight - margin * 2;
+      const scale = Math.min(maxWidth / canvas.width, maxHeight / canvas.height);
+      const renderWidth = canvas.width * scale;
+      const renderHeight = canvas.height * scale;
+      pdf.addImage(
+        canvas.toDataURL("image/png"),
+        "PNG",
+        margin,
+        margin,
+        renderWidth,
+        renderHeight,
+        undefined,
+        "FAST",
+      );
+    } else {
+      const imgWidth = pageWidth - margin * 2;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+      const imgData = canvas.toDataURL("image/png");
+      let heightLeft = imgHeight;
+      let position = margin;
+
+      pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+      heightLeft -= pageHeight - margin * 2;
+
+      while (heightLeft > 0) {
+        pdf.addPage();
+        position = margin - (imgHeight - heightLeft);
+        pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+        heightLeft -= pageHeight - margin * 2;
+      }
+    }
+
+    pdf.save(filename);
+  } finally {
+    iframe?.remove();
+  }
+}
+
+async function printInventoryHtml(html: string): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForInventoryFrame(html);
+    const printWindow = iframe.contentWindow;
+    if (!printWindow) throw new Error("Unable to open the print dialog.");
+    printWindow.focus();
+    printWindow.print();
+  } finally {
+    window.setTimeout(() => iframe?.remove(), 1200);
+  }
+}
+
 export default function InventoryPage() {
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -116,6 +768,13 @@ export default function InventoryPage() {
   const [isConfirmOpen, setIsConfirmOpen] = useState(false);
   const [confirmedItem, setConfirmedItem] = useState<{ name: string; code: string } | null>(null);
   const [viewingItem, setViewingItem] = useState<InventoryItem | null>(null);
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
+  const [reportMode, setReportMode] = useState<InventoryReportMode>("full");
+  const [reportDate, setReportDate] = useState(todayIso);
+  const [reportMonth, setReportMonth] = useState(() => todayIso().slice(0, 7));
+  const [reportFrom, setReportFrom] = useState(todayIso);
+  const [reportTo, setReportTo] = useState(todayIso);
+  const [reportError, setReportError] = useState<string | null>(null);
 
   const loadLocalItems = useCallback(() => {
     const local = localStorage.getItem("kaniyamparambil_inventory");
@@ -383,118 +1042,27 @@ export default function InventoryPage() {
     setConfirmedItem(null);
   };
 
-  const handlePrintItem = (item: InventoryItem) => {
-    const printWindow = window.open("", "_blank");
-    if (!printWindow) {
-      alert("Popup blocker is active. Please allow popups to print product specification sheets.");
-      return;
+  const handlePrintItem = async (item: InventoryItem) => {
+    try {
+      await printInventoryHtml(buildInventoryItemHtml(item, {
+        renderMode: "pdf",
+        helperText: "Product specification sheet preview.",
+      }));
+    } catch (err) {
+      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     }
-    printWindow.document.write(`
-      <html>
-        <head>
-          <title>Print Product Sheet - ${item.code}</title>
-          <style>
-            body { font-family: 'Inter', sans-serif; padding: 40px; color: #1e293b; background-color: #ffffff; }
-            .header { border-bottom: 2px solid #0f172a; padding-bottom: 12px; margin-bottom: 24px; }
-            .title { font-size: 20px; font-weight: 700; color: #0f172a; margin: 0; }
-            .subtitle { font-size: 12px; color: #64748b; margin-top: 4px; }
-            table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 13px; }
-            th, td { border: 1px solid #e2e8f0; padding: 10px 14px; text-align: left; }
-            th { background-color: #f8fafc; font-weight: 600; color: #475569; width: 35%; }
-            td { color: #0f172a; font-weight: 500; }
-          </style>
-        </head>
-        <body>
-          <div class="header">
-            <h1 class="title">New Kaniyamparambil Stores</h1>
-            <p class="subtitle">Product Specification & Catalog Report</p>
-          </div>
-          <table>
-            <tr><th>Item Code</th><td>${item.code}</td></tr>
-            <tr><th>Product Name / Print Description</th><td>${item.name}</td></tr>
-            <tr><th>Company Code Reference</th><td>${item.company_code || '—'}</td></tr>
-            <tr><th>Product Group Category</th><td>${item.group}</td></tr>
-            <tr><th>Sub-Group Segment</th><td>${item.sub_group || '—'}</td></tr>
-            <tr><th>Brand Name</th><td>${item.brand || '—'}</td></tr>
-            <tr><th>Product Compliance Type</th><td>${item.type}</td></tr>
-            <tr><th>HSN Code</th><td>${item.hsn_code || '—'}</td></tr>
-            <tr><th>Unit of Measurement (UOM)</th><td>${item.uom}</td></tr>
-            <tr><th>Batch Tracking Enabled</th><td>${item.enable_batch === 'Y' ? 'Yes' : 'No'}</td></tr>
-          </table>
-          <script>
-            setTimeout(function() {
-              window.focus();
-              window.print();
-              window.close();
-            }, 300);
-          </script>
-        </body>
-      </html>
-    `);
-    printWindow.document.close();
   };
 
-  const handleDownloadItem = (item: InventoryItem) => {
+  const handleDownloadItem = async (item: InventoryItem) => {
     try {
-      const doc = new jsPDF();
-      
-      // Page Header
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(18);
-      doc.setTextColor(15, 23, 42); // slate-900
-      doc.text("New Kaniyamparambil Stores", 14, 20);
-      
-      doc.setFont("Helvetica", "normal");
-      doc.setFontSize(10);
-      doc.setTextColor(100, 116, 139); // slate-500
-      doc.text("Product Specification & Catalog Report", 14, 26);
-      
-      // Divider line
-      doc.setDrawColor(226, 232, 240); // slate-200
-      doc.line(14, 30, 196, 30);
-      
-      // Document fields layout
-      let y = 42;
-      const rowHeight = 10;
-      
-      const fields = [
-        { label: "Item Code", value: item.code },
-        { label: "Product Name / Print Name", value: item.name },
-        { label: "Company Code Reference", value: item.company_code || "—" },
-        { label: "Product Group Category", value: item.group },
-        { label: "Sub-Group Segment", value: item.sub_group || "—" },
-        { label: "Brand Name", value: item.brand || "—" },
-        { label: "Product Compliance Type", value: item.type },
-        { label: "HSN Code", value: item.hsn_code || "—" },
-        { label: "Unit of Measurement (UOM)", value: item.uom },
-        { label: "Batch Tracking Enabled", value: item.enable_batch === "Y" ? "Yes" : "No" }
-      ];
-      
-      fields.forEach((f) => {
-        // Draw label block
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(10);
-        doc.setTextColor(71, 85, 105); // slate-600
-        doc.text(f.label, 14, y);
-        
-        // Draw value block
-        doc.setFont("Helvetica", "normal");
-        doc.setFontSize(10);
-        doc.setTextColor(15, 23, 42); // slate-900
-        
-        const splitValue = doc.splitTextToSize(String(f.value), 110);
-        doc.text(splitValue, 80, y);
-        
-        const linesCount = splitValue.length;
-        y += rowHeight + (linesCount - 1) * 4;
-        
-        // Horizontal cell divider
-        doc.setDrawColor(241, 245, 249); // slate-100
-        doc.line(14, y - 5, 196, y - 5);
-      });
-      
-      // Save PDF file
-      doc.save(`product_${item.code}.pdf`);
+      await exportInventoryPdf(
+        buildInventoryItemHtml(item, {
+          renderMode: "pdf",
+          helperText: "Generating product specification PDF...",
+        }),
+        `product_${item.code}.pdf`,
+        true,
+      );
     } catch (err) {
       console.error("Failed to download item PDF:", err);
       alert("Failed to download product specification PDF.");
@@ -547,6 +1115,109 @@ export default function InventoryPage() {
   const indexOfFirstItem = indexOfLastItem - itemsPerPage;
   const currentItems = filteredItems.slice(indexOfFirstItem, indexOfLastItem);
 
+  const resolveStatementReport = (): {
+    items: InventoryItem[];
+    reportType: string;
+    periodLabel: string;
+    filenameSuffix: string;
+  } | null => {
+    const applyGroup = (list: InventoryItem[]) =>
+      selectedGroup === "All" ? list : list.filter((item) => item.group === selectedGroup);
+
+    switch (reportMode) {
+      case "full":
+        return {
+          items: applyGroup([...items]),
+          reportType: "Complete Inventory Register",
+          periodLabel: "All Items (Full Catalog)",
+          filenameSuffix: `full_${todayIso()}`,
+        };
+      case "current":
+        return {
+          items: [...filteredItems],
+          reportType: "Filtered Table View",
+          periodLabel: `Current filters — Group: ${selectedGroup}, Search: ${searchQuery.trim() || "—"}`,
+          filenameSuffix: `filtered_${todayIso()}`,
+        };
+      case "date": {
+        const dated = applyGroup(filterItemsByDate(items, reportDate));
+        return {
+          items: dated,
+          reportType: "Daily Registration Statement",
+          periodLabel: formatReportDate(reportDate),
+          filenameSuffix: `date_${reportDate}`,
+        };
+      }
+      case "month": {
+        const monthly = applyGroup(filterItemsByMonth(items, reportMonth));
+        return {
+          items: monthly,
+          reportType: "Monthly Registration Statement",
+          periodLabel: formatMonthLabel(reportMonth),
+          filenameSuffix: `month_${reportMonth}`,
+        };
+      }
+      case "range": {
+        if (reportFrom > reportTo) {
+          setReportError("From date cannot be after To date.");
+          return null;
+        }
+        const ranged = applyGroup(filterItemsByRange(items, reportFrom, reportTo));
+        return {
+          items: ranged,
+          reportType: "Date Range Statement",
+          periodLabel: `${formatReportDate(reportFrom)} to ${formatReportDate(reportTo)}`,
+          filenameSuffix: `${reportFrom}_to_${reportTo}`,
+        };
+      }
+      default:
+        return null;
+    }
+  };
+
+  const buildStatementHtml = () => {
+    const report = resolveStatementReport();
+    if (!report) return null;
+    if (report.items.length === 0) {
+      setReportError("No inventory items match the selected statement period.");
+      return null;
+    }
+    setReportError(null);
+    return buildInventoryStatementHtml(
+      report.items,
+      buildStatementMeta(
+        report.items,
+        report.reportType,
+        report.periodLabel,
+        selectedGroup,
+        searchQuery.trim(),
+      ),
+      { renderMode: "pdf", helperText: "Generating inventory statement PDF..." },
+    );
+  };
+
+  const handleDownloadStatement = async () => {
+    const report = resolveStatementReport();
+    if (!report) return;
+    const html = buildStatementHtml();
+    if (!html) return;
+    try {
+      await exportInventoryPdf(html, `inventory_statement_${report.filenameSuffix}.pdf`, false);
+    } catch (err) {
+      alert(`Statement PDF failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
+  const handlePrintStatement = async () => {
+    const html = buildStatementHtml();
+    if (!html) return;
+    try {
+      await printInventoryHtml(html);
+    } catch (err) {
+      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
   return (
     <div className="p-6 space-y-6">
       {/* ── Page Header ── */}
@@ -561,18 +1232,28 @@ export default function InventoryPage() {
           </p>
         </div>
 
-        <button
-          onClick={() => {
-            if (!isFormOpen) {
-              resetForm();
-            }
-            setIsFormOpen(!isFormOpen);
-          }}
-          className="btn-primary flex items-center gap-1.5 shadow-sm"
-        >
-          <Plus className="w-4 h-4" />
-          {isFormOpen ? "Close Panel" : "Register Item"}
-        </button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            onClick={() => { setReportError(null); setIsReportModalOpen(true); }}
+            className="btn-secondary flex items-center gap-1.5 text-xs font-semibold shadow-sm"
+          >
+            <FileText className="w-3.5 h-3.5" />
+            Inventory Statement
+          </button>
+          <button
+            onClick={() => {
+              if (!isFormOpen) {
+                resetForm();
+              }
+              setIsFormOpen(!isFormOpen);
+            }}
+            className="btn-primary flex items-center gap-1.5 shadow-sm"
+          >
+            <Plus className="w-4 h-4" />
+            {isFormOpen ? "Close Panel" : "Register Item"}
+          </button>
+        </div>
       </div>
 
       {/* ── DB Status Notice ── */}
@@ -997,10 +1678,134 @@ export default function InventoryPage() {
               </button>
               <button
                 type="button"
+                onClick={() => viewingItem && handleDownloadItem(viewingItem)}
+                className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Download PDF
+              </button>
+              <button
+                type="button"
                 onClick={() => setViewingItem(null)}
                 className="btn-primary bg-slate-900 hover:bg-slate-800 active:bg-slate-950 px-6 py-2 font-bold shadow-sm text-white transition-colors rounded text-xs"
               >
                 Close View
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Inventory Statement Modal ── */}
+      {isReportModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px]">
+          <div className="absolute inset-0" onClick={() => setIsReportModalOpen(false)} />
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-lg w-full z-10 flex flex-col font-sans animate-in fade-in zoom-in-95 duration-150">
+            <div className="bg-slate-900 px-5 py-4 text-white rounded-t-xl flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-bold tracking-tight flex items-center gap-2">
+                  <FileText className="w-4 h-4" />
+                  Download Inventory Statement
+                </h2>
+                <p className="text-[10px] text-slate-300 mt-0.5">Account-style PDF with full item details</p>
+              </div>
+              <button type="button" onClick={() => setIsReportModalOpen(false)}
+                className="text-slate-300 hover:text-white p-1.5 rounded-lg hover:bg-white/10">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {reportError && (
+                <div className="bg-red-50 border border-red-200 text-red-800 text-xs px-3 py-2 rounded-md flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                  <span>{reportError}</span>
+                </div>
+              )}
+
+              <div>
+                <label className="form-label text-xs font-semibold text-slate-700 mb-2 block">Statement Type</label>
+                <div className="space-y-2">
+                  {([
+                    ["full", "Full Inventory", "All registered items in the catalog"],
+                    ["date", "By Date", "Items registered on a specific date"],
+                    ["month", "By Month", "Items registered in a calendar month"],
+                    ["range", "Date Range", "Items registered between two dates"],
+                    ["current", "Current Table Filter", "Uses search & group filters from the list"],
+                  ] as const).map(([mode, title, desc]) => (
+                    <label key={mode}
+                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                        reportMode === mode ? "border-primary bg-primary/5" : "border-slate-200 hover:bg-slate-50"
+                      }`}>
+                      <input type="radio" name="reportMode" value={mode} checked={reportMode === mode}
+                        onChange={() => { setReportMode(mode); setReportError(null); }}
+                        className="mt-0.5" />
+                      <span>
+                        <span className="text-xs font-bold text-slate-800 block">{title}</span>
+                        <span className="text-[10px] text-slate-500">{desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {reportMode === "date" && (
+                <div>
+                  <label className="form-label text-xs">Registration Date</label>
+                  <input type="date" value={reportDate} onChange={(e) => setReportDate(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "month" && (
+                <div>
+                  <label className="form-label text-xs">Month</label>
+                  <input type="month" value={reportMonth} onChange={(e) => setReportMonth(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "range" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="form-label text-xs">From Date</label>
+                    <input type="date" value={reportFrom} onChange={(e) => setReportFrom(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                  <div>
+                    <label className="form-label text-xs">To Date</label>
+                    <input type="date" value={reportTo} min={reportFrom} onChange={(e) => setReportTo(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                </div>
+              )}
+
+              {(reportMode === "full" || reportMode === "date" || reportMode === "month" || reportMode === "range") && (
+                <div>
+                  <label className="form-label text-xs">Optional Group Filter</label>
+                  <select value={selectedGroup} onChange={(e) => setSelectedGroup(e.target.value)}
+                    className="input-enterprise bg-white cursor-pointer text-xs w-full">
+                    {uniqueGroups.map((g) => <option key={g} value={g}>{g}</option>)}
+                  </select>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Statement includes registration date, code, name, company ref, group, sub-group, brand, type, HSN, UOM, batch, and stock — with totals like an account statement.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-200 bg-slate-50 rounded-b-xl">
+              <button type="button" onClick={() => setIsReportModalOpen(false)} className="btn-secondary px-4 text-xs">
+                Cancel
+              </button>
+              <button type="button" onClick={handlePrintStatement}
+                className="btn-secondary px-4 text-xs flex items-center gap-1.5">
+                <Printer className="w-3.5 h-3.5" /> Print
+              </button>
+              <button type="button" onClick={handleDownloadStatement}
+                className="btn-primary px-4 text-xs flex items-center gap-1.5">
+                <Download className="w-3.5 h-3.5" /> Download PDF
               </button>
             </div>
           </div>
@@ -1020,7 +1825,7 @@ export default function InventoryPage() {
           />
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap justify-end">
           <div className="flex items-center gap-1.5 text-xs font-semibold text-text-secondary">
             <Filter className="w-3.5 h-3.5" />
             <span>Filter Group:</span>

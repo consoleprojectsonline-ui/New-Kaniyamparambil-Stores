@@ -17,23 +17,32 @@ import {
   X,
   Edit,
   Calendar,
+  FileText,
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency } from "@/lib/utils";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 
-const STORE_NAME = "New Kaniyamparambil Stores";
+const DAYBOOK_STORE_DETAILS = {
+  storeName: "NEW KANIYAMPARAMBIL STORES",
+  location: "THOPRAMKUDY PO, THOPRAMKUDY, KERALA",
+  gstin: "32AWJPJ1371N1ZE",
+  phone: "9544363171",
+} as const;
+
 const DAYBOOK_FRAME_STYLE: Partial<CSSStyleDeclaration> = {
   position: "fixed",
   top: "0",
   left: "-20000px",
   width: "794px",
-  height: "1200px",
+  height: "auto",
+  minHeight: "400px",
   opacity: "0",
   pointerEvents: "none",
   border: "0",
   background: "transparent",
+  overflow: "visible",
 };
 
 const generateTxId = () => `tx-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
@@ -63,11 +72,76 @@ interface DayBookRow {
   description: string;
   type: EntryType;
   amount: number;
+  bill_total?: number;
   payment_mode: string;
   category: EntryCategory;
   source: EntrySource;
   reference_no?: string;
   editable: boolean;
+}
+
+function computeDayTotals(rows: DayBookRow[]) {
+  const totalIncome = rows
+    .filter((tx) => tx.type === "Income")
+    .reduce((sum, tx) => sum + tx.amount, 0);
+  const totalExpense = rows
+    .filter((tx) => tx.type === "Expense")
+    .reduce((sum, tx) => sum + tx.amount, 0);
+  const salesTotal = rows
+    .filter((tx) => tx.category === "Sales")
+    .reduce((sum, tx) => sum + (tx.bill_total ?? 0), 0);
+  const purchaseTotal = rows
+    .filter((tx) => tx.category === "Purchase")
+    .reduce((sum, tx) => sum + (tx.bill_total ?? 0), 0);
+  return {
+    totalIncome,
+    totalExpense,
+    netBalance: totalIncome - totalExpense,
+    salesTotal,
+    purchaseTotal,
+  };
+}
+
+function saleToDayBookRow(sale: Record<string, unknown>): DayBookRow {
+  const paymentAmount = Number(sale.payment_amount) || 0;
+  const grandTotal = Number(sale.grand_total) || 0;
+  const billDate = String(sale.bill_date ?? "").slice(0, 10);
+  const isCredit = sale.payment_status === "Credit" && paymentAmount <= 0;
+
+  return {
+    id: `sale-${sale.bill_no}`,
+    date: billDate,
+    description: `Sales · ${sale.bill_no} · ${sale.customer_name}${isCredit ? " (Credit)" : ""}`,
+    type: "Income",
+    amount: paymentAmount,
+    bill_total: grandTotal,
+    payment_mode: String(sale.payment_mode ?? "Cash"),
+    category: "Sales",
+    source: "sales",
+    reference_no: String(sale.bill_no ?? ""),
+    editable: false,
+  };
+}
+
+function purchaseToDayBookRow(purchase: Record<string, unknown>): DayBookRow {
+  const paidAmount = Number(purchase.paid_amount) || 0;
+  const netAmount = Number(purchase.net_amount) || 0;
+  const entryDate = String(purchase.entry_date ?? purchase.invoice_date ?? "").slice(0, 10);
+  const isPending = purchase.payment_status === "Pending" && paidAmount <= 0;
+
+  return {
+    id: `purchase-${purchase.invoice_no}`,
+    date: entryDate,
+    description: `Purchase · ${purchase.invoice_no} · ${purchase.supplier_name}${isPending ? " (Pending)" : ""}`,
+    type: "Expense",
+    amount: paidAmount,
+    bill_total: netAmount,
+    payment_mode: "Bank",
+    category: "Purchase",
+    source: "purchase",
+    reference_no: String(purchase.invoice_no ?? ""),
+    editable: false,
+  };
 }
 
 function todayIso(): string {
@@ -124,6 +198,31 @@ function formatDisplayDate(value: string): string {
   }).format(date);
 }
 
+function formatReportDate(value?: string): string {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(date).replace(/ /g, "-");
+}
+
+function monthEnd(monthYm: string): string {
+  const [year, month] = monthYm.split("-").map(Number);
+  const d = new Date(year, month, 0);
+  return `${year}-${String(month).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function formatMonthLabel(monthYm: string): string {
+  const [year, month] = monthYm.split("-");
+  const d = new Date(Number(year), Number(month) - 1, 1);
+  if (Number.isNaN(d.getTime())) return monthYm;
+  return new Intl.DateTimeFormat("en-GB", { month: "long", year: "numeric" }).format(d);
+}
+
+type DayBookReportMode = "day" | "month" | "range" | "current";
+
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -133,9 +232,18 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
+interface DayBookStatementMeta {
+  reportTitle: string;
+  periodLabel: string;
+  reportType: string;
+  typeFilter: string;
+  sourceFilter: string;
+  searchQuery: string;
+  generatedOn: string;
+}
+
 interface DayBookReportData {
-  date: string;
-  displayDate: string;
+  meta: DayBookStatementMeta;
   entries: DayBookRow[];
   totalIncome: number;
   totalExpense: number;
@@ -152,32 +260,37 @@ type DayBookDocOptions = {
 };
 
 function buildDayBookHtml(data: DayBookReportData, options: DayBookDocOptions = {}): string {
+  const store = DAYBOOK_STORE_DETAILS;
   const isPdfMode = options.renderMode === "pdf";
   const isVoucher = Boolean(options.voucher);
   const voucher = options.voucher;
+  const meta = data.meta;
 
   const rowMarkup = data.entries.map((entry, index) => `
     <tr>
       <td class="col-index">${index + 1}</td>
+      <td class="col-date">${escapeHtml(formatReportDate(entry.date))}</td>
       <td class="col-source">${escapeHtml(entry.category)}</td>
       <td class="col-desc">${escapeHtml(entry.description)}</td>
       <td class="col-ref">${escapeHtml(entry.reference_no || "—")}</td>
       <td class="col-mode">${escapeHtml(entry.payment_mode)}</td>
       <td class="col-receipt align-right">${entry.type === "Income" ? escapeHtml(formatCurrency(entry.amount)) : "—"}</td>
       <td class="col-payment align-right">${entry.type === "Expense" ? escapeHtml(formatCurrency(entry.amount)) : "—"}</td>
+      <td class="col-bill align-right">${entry.bill_total != null && entry.bill_total > 0 ? escapeHtml(formatCurrency(entry.bill_total)) : "—"}</td>
     </tr>
   `).join("");
 
   const voucherBody = voucher ? `
     <table class="voucher-table">
       <tr><td class="label">Voucher ID</td><td>${escapeHtml(voucher.id)}</td></tr>
-      <tr><td class="label">Date</td><td>${escapeHtml(voucher.date)}</td></tr>
+      <tr><td class="label">Date</td><td>${escapeHtml(formatReportDate(voucher.date))}</td></tr>
       <tr><td class="label">Source</td><td>${escapeHtml(voucher.category)}</td></tr>
       <tr><td class="label">Reference</td><td>${escapeHtml(voucher.reference_no || "—")}</td></tr>
       <tr><td class="label">Description</td><td>${escapeHtml(voucher.description)}</td></tr>
       <tr><td class="label">Type</td><td>${escapeHtml(voucher.type)}</td></tr>
       <tr><td class="label">Payment Mode</td><td>${escapeHtml(voucher.payment_mode)}</td></tr>
-      <tr><td class="label">Amount</td><td class="amount">${escapeHtml(formatCurrency(voucher.amount))}</td></tr>
+      <tr><td class="label">Cash Amount</td><td class="amount">${escapeHtml(formatCurrency(voucher.amount))}</td></tr>
+      ${voucher.bill_total != null && voucher.bill_total > 0 ? `<tr><td class="label">Bill Total</td><td class="amount">${escapeHtml(formatCurrency(voucher.bill_total))}</td></tr>` : ""}
     </table>
   ` : "";
 
@@ -185,7 +298,7 @@ function buildDayBookHtml(data: DayBookReportData, options: DayBookDocOptions = 
   <html lang="en">
     <head>
       <meta charset="UTF-8" />
-      <title>${isVoucher ? "Day Book Voucher" : "Day Book"} ${escapeHtml(data.date)}</title>
+      <title>${escapeHtml(isVoucher ? "Day Book Voucher" : meta.reportTitle)}</title>
       <style>
         * { box-sizing: border-box; }
         body {
@@ -193,8 +306,8 @@ function buildDayBookHtml(data: DayBookReportData, options: DayBookDocOptions = 
           background: ${isPdfMode ? "#fff" : "#f3f4f6"};
           font-family: Arial, Helvetica, sans-serif;
           color: #111;
-          font-size: ${isPdfMode ? "9px" : "12px"};
-          line-height: 1.35;
+          font-size: ${isPdfMode ? "7.5px" : "11px"};
+          line-height: 1.28;
           padding: ${isPdfMode ? "0" : "20px"};
         }
         .daybook-toolbar {
@@ -229,72 +342,81 @@ function buildDayBookHtml(data: DayBookReportData, options: DayBookDocOptions = 
         }
         .doc-title {
           text-align: center;
-          font-size: ${isPdfMode ? "14px" : "18px"};
+          font-size: ${isPdfMode ? "13px" : "16px"};
           font-weight: 700;
           color: #b45309;
-          letter-spacing: 0.06em;
-          padding: ${isPdfMode ? "8px" : "12px"};
+          letter-spacing: 0.05em;
+          padding: ${isPdfMode ? "7px 8px" : "10px"};
           border-bottom: 1px solid #000;
+        }
+        .period-banner {
+          text-align: center;
+          font-weight: 700;
+          padding: ${isPdfMode ? "5px 8px" : "8px 12px"};
+          border-bottom: 1px solid #000;
+          background: #fef3c7;
+          font-size: ${isPdfMode ? "9px" : "12px"};
         }
         .meta-grid {
           display: grid;
-          grid-template-columns: 1fr 1fr;
+          grid-template-columns: 1fr 1fr 1fr;
           border-bottom: 1px solid #000;
         }
-        .meta-grid div {
-          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+        .meta-grid > div {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
           border-right: 1px solid #000;
         }
-        .meta-grid div:nth-child(2n) { border-right: none; }
-        .meta-label { font-weight: 700; margin-bottom: 2px; }
-        .entries-table {
+        .meta-grid > div:last-child { border-right: none; }
+        .meta-label { font-weight: 700; margin-bottom: 2px; font-size: ${isPdfMode ? "7.5px" : "10px"}; text-transform: uppercase; }
+        .meta-line { margin-bottom: 1px; }
+        .statement-table {
           width: 100%;
           border-collapse: collapse;
         }
-        .entries-table th,
-        .entries-table td {
+        .statement-table th,
+        .statement-table td {
           border: 1px solid #000;
-          padding: ${isPdfMode ? "4px 5px" : "6px 8px"};
+          padding: ${isPdfMode ? "2px 3px" : "4px 5px"};
           vertical-align: top;
         }
-        .entries-table thead th {
+        .statement-table thead th {
           background: #fef3c7;
           font-weight: 700;
           text-align: center;
         }
-        .col-index { width: 28px; text-align: center; }
-        .col-source { width: 68px; text-align: center; }
-        .col-ref { width: 72px; text-align: center; }
-        .col-mode { width: 68px; text-align: center; }
-        .col-receipt, .col-payment { width: 82px; }
+        .col-index { width: 20px; text-align: center; }
+        .col-date { width: 52px; text-align: center; white-space: nowrap; }
+        .col-source { width: 48px; text-align: center; }
+        .col-ref { width: 56px; text-align: center; font-family: monospace; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .col-mode { width: 44px; text-align: center; }
+        .col-desc { min-width: 90px; }
+        .col-receipt, .col-payment, .col-bill { width: 52px; white-space: nowrap; }
         .align-right { text-align: right; }
         .summary-grid {
           display: grid;
-          grid-template-columns: 1fr 1fr;
+          grid-template-columns: 1fr 1fr 1fr 1fr;
           border-top: 1px solid #000;
         }
         .summary-box {
-          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
           border-right: 1px solid #000;
+          font-weight: 600;
         }
         .summary-box:last-child { border-right: none; }
-        .summary-row {
+        .summary-box b { display: block; font-size: ${isPdfMode ? "9px" : "12px"}; margin-top: 2px; }
+        .net-balance-row {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          font-weight: 700;
           display: flex;
           justify-content: space-between;
           gap: 12px;
-          margin-bottom: 4px;
-          font-weight: 600;
-        }
-        .summary-row.total {
-          margin-top: 6px;
-          padding-top: 6px;
-          border-top: 1px dashed #999;
-          font-size: ${isPdfMode ? "10px" : "13px"};
-          font-weight: 700;
+          background: #fffbeb;
         }
         .voucher-meta {
-          padding: ${isPdfMode ? "8px" : "12px"};
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
           border-bottom: 1px solid #000;
+          font-size: ${isPdfMode ? "8px" : "11px"};
         }
         .voucher-table {
           width: 100%;
@@ -302,7 +424,7 @@ function buildDayBookHtml(data: DayBookReportData, options: DayBookDocOptions = 
         }
         .voucher-table td {
           border: 1px solid #000;
-          padding: ${isPdfMode ? "6px 8px" : "8px 10px"};
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
         }
         .voucher-table .label {
           width: 34%;
@@ -311,15 +433,22 @@ function buildDayBookHtml(data: DayBookReportData, options: DayBookDocOptions = 
         }
         .voucher-table .amount {
           font-weight: 700;
-          font-size: ${isPdfMode ? "11px" : "14px"};
+          font-size: ${isPdfMode ? "10px" : "13px"};
         }
         .footer-note {
-          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
           border-top: 1px solid #000;
-          font-size: ${isPdfMode ? "8px" : "10px"};
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
           color: #444;
         }
-        @page { size: A4; margin: 10mm; }
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          text-align: right;
+          font-weight: 700;
+          font-size: ${isPdfMode ? "8px" : "11px"};
+        }
+        @page { size: A4 landscape; margin: 8mm; }
         @media print {
           body { background: #fff; padding: 0; }
           .daybook-toolbar { display: none; }
@@ -337,61 +466,94 @@ function buildDayBookHtml(data: DayBookReportData, options: DayBookDocOptions = 
       </div>
 
       <div class="daybook-sheet">
-        <div class="doc-title">${isVoucher ? "DAY BOOK VOUCHER" : "DAY BOOK / CASH BOOK"}</div>
-
-        <div class="meta-grid">
-          <div>
-            <div class="meta-label">${escapeHtml(STORE_NAME)}</div>
-            <div>Daily receipts, payments &amp; cash summary</div>
-          </div>
-          <div>
-            <div class="meta-label">Book Date</div>
-            <div>${escapeHtml(data.displayDate)}</div>
-            <div style="margin-top:4px"><b>Entries:</b> ${data.entries.length}</div>
-          </div>
-        </div>
-
+        <div class="doc-title">${escapeHtml(isVoucher ? "DAY BOOK VOUCHER" : meta.reportTitle)}</div>
         ${isVoucher ? `
-          <div class="voucher-meta">Single voucher copy — not a tax invoice</div>
+          <div class="period-banner">Voucher Date: ${escapeHtml(formatReportDate(voucher!.date))}</div>
+          <div class="meta-grid">
+            <div>
+              <div class="meta-label">${escapeHtml(store.storeName)}</div>
+              <div class="meta-line">${escapeHtml(store.location)}</div>
+              <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+              <div class="meta-line"><b>Phone:</b> ${escapeHtml(store.phone)}</div>
+            </div>
+            <div>
+              <div class="meta-label">Voucher Details</div>
+              <div class="meta-line"><b>Source:</b> ${escapeHtml(voucher!.category)}</div>
+              <div class="meta-line"><b>Ref:</b> ${escapeHtml(voucher!.reference_no || "—")}</div>
+              <div class="meta-line"><b>Mode:</b> ${escapeHtml(voucher!.payment_mode)}</div>
+            </div>
+            <div>
+              <div class="meta-label">Generated</div>
+              <div class="meta-line"><b>Date:</b> ${escapeHtml(meta.generatedOn)}</div>
+              <div class="meta-line"><b>Type:</b> ${escapeHtml(voucher!.type)}</div>
+            </div>
+          </div>
+          <div class="voucher-meta">Single voucher copy — internal cash book record, not a tax invoice</div>
           ${voucherBody}
         ` : `
-          <table class="entries-table">
+          <div class="period-banner">Statement Period: ${escapeHtml(meta.periodLabel)}</div>
+
+          <div class="meta-grid">
+            <div>
+              <div class="meta-label">${escapeHtml(store.storeName)}</div>
+              <div class="meta-line">${escapeHtml(store.location)}</div>
+              <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+              <div class="meta-line"><b>Phone:</b> ${escapeHtml(store.phone)}</div>
+            </div>
+            <div>
+              <div class="meta-label">Report Details</div>
+              <div class="meta-line"><b>Type:</b> ${escapeHtml(meta.reportType)}</div>
+              <div class="meta-line"><b>Type Filter:</b> ${escapeHtml(meta.typeFilter)}</div>
+              <div class="meta-line"><b>Source Filter:</b> ${escapeHtml(meta.sourceFilter)}</div>
+              <div class="meta-line"><b>Search:</b> ${escapeHtml(meta.searchQuery || "—")}</div>
+            </div>
+            <div>
+              <div class="meta-label">Generated</div>
+              <div class="meta-line"><b>Date:</b> ${escapeHtml(meta.generatedOn)}</div>
+              <div class="meta-line"><b>Entries:</b> ${data.entries.length}</div>
+            </div>
+          </div>
+
+          <table class="statement-table">
             <thead>
               <tr>
                 <th>#</th>
+                <th>Date</th>
                 <th>Source</th>
                 <th>Description</th>
                 <th>Ref</th>
                 <th>Mode</th>
-                <th>Receipts (₹)</th>
-                <th>Payments (₹)</th>
+                <th>Receipt (₹)</th>
+                <th>Payment (₹)</th>
+                <th>Bill Amt (₹)</th>
               </tr>
             </thead>
             <tbody>
-              ${rowMarkup || `<tr><td colspan="7" style="text-align:center;padding:16px">No entries for this date</td></tr>`}
+              ${rowMarkup || `<tr><td colspan="9" style="text-align:center;padding:12px;">No entries for this statement period.</td></tr>`}
             </tbody>
           </table>
 
           <div class="summary-grid">
-            <div class="summary-box">
-              <div class="summary-row"><span>Total Receipts</span><span>${escapeHtml(formatCurrency(data.totalIncome))}</span></div>
-              <div class="summary-row"><span>Sales (Day)</span><span>${escapeHtml(formatCurrency(data.salesTotal))}</span></div>
-            </div>
-            <div class="summary-box">
-              <div class="summary-row"><span>Total Payments</span><span>${escapeHtml(formatCurrency(data.totalExpense))}</span></div>
-              <div class="summary-row"><span>Purchases (Day)</span><span>${escapeHtml(formatCurrency(data.purchaseTotal))}</span></div>
-            </div>
+            <div class="summary-box">Total Receipts (Cash In)<b>${escapeHtml(formatCurrency(data.totalIncome))}</b></div>
+            <div class="summary-box">Total Payments (Cash Out)<b>${escapeHtml(formatCurrency(data.totalExpense))}</b></div>
+            <div class="summary-box">Sales Bills<b>${escapeHtml(formatCurrency(data.salesTotal))}</b></div>
+            <div class="summary-box">Purchase Bills<b>${escapeHtml(formatCurrency(data.purchaseTotal))}</b></div>
           </div>
-          <div class="summary-box" style="border-top:1px solid #000;border-right:none">
-            <div class="summary-row total">
-              <span>Closing Balance (Net)</span>
-              <span>${escapeHtml(formatCurrency(data.netBalance))}</span>
-            </div>
+          <div class="net-balance-row">
+            <span>Closing Balance (Net)</span>
+            <span>${escapeHtml(formatCurrency(data.netBalance))}</span>
           </div>
         `}
 
         <div class="footer-note">
-          Generated from Day Book · ${escapeHtml(new Date().toLocaleString("en-IN"))} · Internal cash book record only
+          ${isVoucher
+    ? "Computer-generated day book voucher. Receipts and payments reflect actual cash movement; bill amounts are shown for sales and purchase references."
+    : "Day book statement lists daily receipts, payments, and linked sales/purchase bill values. Cash columns show amounts actually received or paid."}
+        </div>
+
+        <div class="signatory">
+          <div>${escapeHtml(store.storeName)}</div>
+          <div>Authorized Cash Book Signatory</div>
         </div>
       </div>
 
@@ -434,6 +596,11 @@ async function waitForDayBookFrame(html: string): Promise<HTMLIFrameElement> {
     };
     checkReady();
   });
+
+  const sheet = iframe.contentDocument?.querySelector(".daybook-sheet");
+  if (sheet instanceof HTMLElement) {
+    iframe.style.height = `${sheet.scrollHeight + 40}px`;
+  }
 
   await new Promise((resolve) => window.setTimeout(resolve, 120));
   return iframe;
@@ -493,23 +660,39 @@ async function printDayBookHtml(html: string): Promise<void> {
   }
 }
 
-function buildReportData(
-  date: string,
+function buildDayBookStatementData(
   entries: DayBookRow[],
-  totals: {
-    totalIncome: number;
-    totalExpense: number;
-    netBalance: number;
-    salesTotal: number;
-    purchaseTotal: number;
-  },
+  meta: Pick<DayBookStatementMeta, "periodLabel" | "reportType"> & Partial<DayBookStatementMeta>,
+  totals?: ReturnType<typeof computeDayTotals>,
 ): DayBookReportData {
+  const computed = totals ?? computeDayTotals(entries);
   return {
-    date,
-    displayDate: formatDisplayDate(date),
+    meta: {
+      reportTitle: "DAY BOOK / CASH BOOK STATEMENT",
+      typeFilter: "All",
+      sourceFilter: "All",
+      searchQuery: "—",
+      generatedOn: formatReportDate(),
+      ...meta,
+    },
     entries,
-    ...totals,
+    ...computed,
   };
+}
+
+function mergeDayBookRows(
+  salesRows: DayBookRow[],
+  purchaseRows: DayBookRow[],
+  manualRows: DayBookRow[],
+): DayBookRow[] {
+  return [...salesRows, ...purchaseRows, ...manualRows].sort((a, b) => {
+    const dateDiff = a.date.localeCompare(b.date);
+    if (dateDiff !== 0) return dateDiff;
+    const categoryOrder = { Sales: 0, Purchase: 1, General: 2, Other: 3 };
+    const orderDiff = categoryOrder[a.category] - categoryOrder[b.category];
+    if (orderDiff !== 0) return orderDiff;
+    return a.description.localeCompare(b.description);
+  });
 }
 
 export default function DayBookPage() {
@@ -548,18 +731,33 @@ export default function DayBookPage() {
 
   const [viewingTransaction, setViewingTransaction] = useState<DayBookRow | null>(null);
 
-  const loadLocalManualEntries = useCallback((forDate: string) => {
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
+  const [reportMode, setReportMode] = useState<DayBookReportMode>("day");
+  const [reportDate, setReportDate] = useState(todayIso());
+  const [reportMonth, setReportMonth] = useState(todayIso().slice(0, 7));
+  const [reportFrom, setReportFrom] = useState(`${todayIso().slice(0, 7)}-01`);
+  const [reportTo, setReportTo] = useState(todayIso());
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [reportBusy, setReportBusy] = useState(false);
+
+  const loadLocalManualEntriesRange = useCallback((from: string, to: string) => {
     const local = localStorage.getItem(LOCAL_STORAGE_KEY);
     if (local) {
       try {
         const parsed = JSON.parse(local) as Record<string, unknown>[];
-        return parsed.map(normalizeManualRow).filter((entry) => entry.entry_date === forDate);
+        return parsed
+          .map(normalizeManualRow)
+          .filter((entry) => entry.entry_date >= from && entry.entry_date <= to);
       } catch {
         return [];
       }
     }
     return [];
   }, []);
+
+  const loadLocalManualEntries = useCallback((forDate: string) => {
+    return loadLocalManualEntriesRange(forDate, forDate);
+  }, [loadLocalManualEntriesRange]);
 
   const saveLocalManualEntries = useCallback((allEntries: ManualEntry[]) => {
     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(allEntries));
@@ -598,6 +796,41 @@ export default function DayBookPage() {
     return [];
   }, []);
 
+  const fetchManualEntriesRange = useCallback(async (from: string, to: string): Promise<ManualEntry[]> => {
+    const daybookResult = await supabase
+      .from("daybook_entries")
+      .select("*")
+      .gte("entry_date", from)
+      .lte("entry_date", to)
+      .eq("source", "manual")
+      .order("entry_date", { ascending: true });
+
+    if (!daybookResult.error && daybookResult.data) {
+      return daybookResult.data.map((row) => normalizeManualRow(row as Record<string, unknown>));
+    }
+
+    if (daybookResult.error && !isMissingTableError(daybookResult.error)) {
+      throw daybookResult.error;
+    }
+
+    const legacyResult = await supabase
+      .from("transactions")
+      .select("*")
+      .gte("date", from)
+      .lte("date", to)
+      .order("date", { ascending: true });
+
+    if (!legacyResult.error && legacyResult.data) {
+      return legacyResult.data.map((row) => normalizeManualRow(row as Record<string, unknown>));
+    }
+
+    if (legacyResult.error && !isMissingTableError(legacyResult.error)) {
+      throw legacyResult.error;
+    }
+
+    return [];
+  }, []);
+
   const fetchSalesRows = useCallback(async (forDate: string): Promise<DayBookRow[]> => {
     const { data, error } = await supabase
       .from("sales")
@@ -610,24 +843,23 @@ export default function DayBookPage() {
       return [];
     }
 
-    return (data ?? []).map((sale) => {
-      const paymentAmount = Number(sale.payment_amount) || 0;
-      const grandTotal = Number(sale.grand_total) || 0;
-      const creditNote = sale.payment_status === "Credit" && paymentAmount === 0;
+    return (data ?? []).map((sale) => saleToDayBookRow(sale as Record<string, unknown>));
+  }, []);
 
-      return {
-        id: `sale-${sale.bill_no}`,
-        date: sale.bill_date,
-        description: `Sales · ${sale.bill_no} · ${sale.customer_name}${creditNote ? " (Credit)" : ""}`,
-        type: "Income" as const,
-        amount: paymentAmount > 0 ? paymentAmount : grandTotal,
-        payment_mode: sale.payment_mode || "Cash",
-        category: "Sales" as const,
-        source: "sales" as const,
-        reference_no: sale.bill_no,
-        editable: false,
-      };
-    });
+  const fetchSalesRowsRange = useCallback(async (from: string, to: string): Promise<DayBookRow[]> => {
+    const { data, error } = await supabase
+      .from("sales")
+      .select("bill_no, bill_date, customer_name, payment_amount, grand_total, payment_mode, payment_status")
+      .gte("bill_date", from)
+      .lte("bill_date", to)
+      .order("bill_date", { ascending: true });
+
+    if (error) {
+      if (!isMissingTableError(error)) console.error("Day book sales range load error:", error);
+      return [];
+    }
+
+    return (data ?? []).map((sale) => saleToDayBookRow(sale as Record<string, unknown>));
   }, []);
 
   const fetchPurchaseRows = useCallback(async (forDate: string): Promise<DayBookRow[]> => {
@@ -642,25 +874,62 @@ export default function DayBookPage() {
       return [];
     }
 
-    return (data ?? []).map((purchase) => {
-      const paidAmount = Number(purchase.paid_amount) || 0;
-      const netAmount = Number(purchase.net_amount) || 0;
-      const pending = purchase.payment_status === "Pending" && paidAmount === 0;
-
-      return {
-        id: `purchase-${purchase.invoice_no}`,
-        date: purchase.entry_date,
-        description: `Purchase · ${purchase.invoice_no} · ${purchase.supplier_name}${pending ? " (Pending)" : ""}`,
-        type: "Expense" as const,
-        amount: paidAmount > 0 ? paidAmount : netAmount,
-        payment_mode: "Bank",
-        category: "Purchase" as const,
-        source: "purchase" as const,
-        reference_no: purchase.invoice_no,
-        editable: false,
-      };
-    });
+    return (data ?? []).map((purchase) => purchaseToDayBookRow(purchase as Record<string, unknown>));
   }, []);
+
+  const fetchPurchaseRowsRange = useCallback(async (from: string, to: string): Promise<DayBookRow[]> => {
+    const { data, error } = await supabase
+      .from("purchases")
+      .select("invoice_no, entry_date, supplier_name, paid_amount, net_amount, payment_status")
+      .gte("entry_date", from)
+      .lte("entry_date", to)
+      .order("entry_date", { ascending: true });
+
+    if (error) {
+      if (!isMissingTableError(error)) console.error("Day book purchases range load error:", error);
+      return [];
+    }
+
+    return (data ?? []).map((purchase) => purchaseToDayBookRow(purchase as Record<string, unknown>));
+  }, []);
+
+  const loadLocalSalesRowsRange = useCallback((from: string, to: string): DayBookRow[] => {
+    const local = localStorage.getItem("kaniyamparambil_sales_v2");
+    if (!local) return [];
+    try {
+      return (JSON.parse(local) as Record<string, unknown>[])
+        .filter((sale) => {
+          const billDate = String(sale.bill_date ?? "").slice(0, 10);
+          return billDate >= from && billDate <= to;
+        })
+        .map(saleToDayBookRow);
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const loadLocalSalesRows = useCallback((forDate: string): DayBookRow[] => {
+    return loadLocalSalesRowsRange(forDate, forDate);
+  }, [loadLocalSalesRowsRange]);
+
+  const loadLocalPurchaseRowsRange = useCallback((from: string, to: string): DayBookRow[] => {
+    const local = localStorage.getItem("kaniyamparambil_purchases");
+    if (!local) return [];
+    try {
+      return (JSON.parse(local) as Record<string, unknown>[])
+        .filter((purchase) => {
+          const entryDate = String(purchase.entry_date ?? purchase.invoice_date ?? "").slice(0, 10);
+          return entryDate >= from && entryDate <= to;
+        })
+        .map(purchaseToDayBookRow);
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const loadLocalPurchaseRows = useCallback((forDate: string): DayBookRow[] => {
+    return loadLocalPurchaseRowsRange(forDate, forDate);
+  }, [loadLocalPurchaseRowsRange]);
 
   const fetchDayBook = useCallback(async (forDate: string) => {
     try {
@@ -693,16 +962,11 @@ export default function DayBookPage() {
       }
 
       const [salesRows, purchaseRows] = usingLocal
-        ? [[], []]
+        ? [loadLocalSalesRows(forDate), loadLocalPurchaseRows(forDate)]
         : await Promise.all([fetchSalesRows(forDate), fetchPurchaseRows(forDate)]);
 
       const manualRows = manual.map(manualToDayBookRow);
-      const merged = [...salesRows, ...purchaseRows, ...manualRows].sort((a, b) => {
-        const categoryOrder = { Sales: 0, Purchase: 1, General: 2, Other: 3 };
-        const orderDiff = categoryOrder[a.category] - categoryOrder[b.category];
-        if (orderDiff !== 0) return orderDiff;
-        return a.description.localeCompare(b.description);
-      });
+      const merged = mergeDayBookRows(salesRows, purchaseRows, manualRows);
 
       setManualEntries(manual);
       setDayBookRows(merged);
@@ -711,11 +975,49 @@ export default function DayBookPage() {
       setDbStatus("local");
       const manual = loadLocalManualEntries(forDate);
       setManualEntries(manual);
-      setDayBookRows(manual.map(manualToDayBookRow));
+      setDayBookRows(mergeDayBookRows(
+        loadLocalSalesRows(forDate),
+        loadLocalPurchaseRows(forDate),
+        manual.map(manualToDayBookRow),
+      ));
     } finally {
       setLoading(false);
     }
-  }, [fetchManualEntries, fetchPurchaseRows, fetchSalesRows, loadLocalManualEntries]);
+  }, [fetchManualEntries, fetchPurchaseRows, fetchSalesRows, loadLocalManualEntries, loadLocalPurchaseRows, loadLocalSalesRows]);
+
+  const fetchDayBookRowsForPeriod = useCallback(async (from: string, to: string): Promise<DayBookRow[]> => {
+    if (dbStatus === "local") {
+      return mergeDayBookRows(
+        loadLocalSalesRowsRange(from, to),
+        loadLocalPurchaseRowsRange(from, to),
+        loadLocalManualEntriesRange(from, to).map(manualToDayBookRow),
+      );
+    }
+
+    try {
+      const [manual, salesRows, purchaseRows] = await Promise.all([
+        fetchManualEntriesRange(from, to),
+        fetchSalesRowsRange(from, to),
+        fetchPurchaseRowsRange(from, to),
+      ]);
+      return mergeDayBookRows(salesRows, purchaseRows, manual.map(manualToDayBookRow));
+    } catch (err) {
+      console.error("Day book range load error:", err);
+      return mergeDayBookRows(
+        loadLocalSalesRowsRange(from, to),
+        loadLocalPurchaseRowsRange(from, to),
+        loadLocalManualEntriesRange(from, to).map(manualToDayBookRow),
+      );
+    }
+  }, [
+    dbStatus,
+    fetchManualEntriesRange,
+    fetchPurchaseRowsRange,
+    fetchSalesRowsRange,
+    loadLocalManualEntriesRange,
+    loadLocalPurchaseRowsRange,
+    loadLocalSalesRowsRange,
+  ]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -913,70 +1215,151 @@ export default function DayBookPage() {
     return matchesSearch && matchesType && matchesSource;
   }), [dayBookRows, searchQuery, typeFilter, sourceFilter]);
 
-  const totalIncome = filteredTransactions
-    .filter((tx) => tx.type === "Income")
-    .reduce((sum, tx) => sum + tx.amount, 0);
-
-  const totalExpense = filteredTransactions
-    .filter((tx) => tx.type === "Expense")
-    .reduce((sum, tx) => sum + tx.amount, 0);
-
-  const netBalance = totalIncome - totalExpense;
-
-  const salesTotal = filteredTransactions
-    .filter((tx) => tx.category === "Sales")
-    .reduce((sum, tx) => sum + tx.amount, 0);
-
-  const purchaseTotal = filteredTransactions
-    .filter((tx) => tx.category === "Purchase")
-    .reduce((sum, tx) => sum + tx.amount, 0);
+  const { totalIncome, totalExpense, netBalance, salesTotal, purchaseTotal } = useMemo(
+    () => computeDayTotals(dayBookRows),
+    [dayBookRows],
+  );
 
   const totalPages = Math.ceil(filteredTransactions.length / itemsPerPage);
   const indexOfLastItem = currentPage * itemsPerPage;
   const indexOfFirstItem = indexOfLastItem - itemsPerPage;
   const currentTransactions = filteredTransactions.slice(indexOfFirstItem, indexOfLastItem);
 
-  const reportTotals = useMemo(() => ({
-    totalIncome,
-    totalExpense,
-    netBalance,
-    salesTotal,
-    purchaseTotal,
-  }), [totalIncome, totalExpense, netBalance, salesTotal, purchaseTotal]);
+  const openReportModal = () => {
+    setReportDate(selectedDate);
+    setReportMonth(selectedDate.slice(0, 7));
+    setReportFrom(`${selectedDate.slice(0, 7)}-01`);
+    setReportTo(selectedDate);
+    setReportError(null);
+    setIsReportModalOpen(true);
+  };
 
-  const getReportData = useCallback((entries: DayBookRow[]) =>
-    buildReportData(selectedDate, entries, reportTotals),
-  [selectedDate, reportTotals]);
+  const resolveStatementReport = useCallback(async () => {
+    if (reportMode === "current") {
+      return {
+        rows: filteredTransactions,
+        periodLabel: formatDisplayDate(selectedDate),
+        reportType: "Current Table Filter",
+        filenameSuffix: `${selectedDate}_filtered`,
+        typeFilter,
+        sourceFilter,
+        searchQuery: searchQuery || "—",
+      };
+    }
 
-  const handlePrintDayBook = async () => {
+    if (reportMode === "day") {
+      const rows = reportDate === selectedDate && !loading
+        ? dayBookRows
+        : await fetchDayBookRowsForPeriod(reportDate, reportDate);
+      return {
+        rows,
+        periodLabel: formatDisplayDate(reportDate),
+        reportType: "Daily Day Book Statement",
+        filenameSuffix: reportDate,
+        typeFilter: "All",
+        sourceFilter: "All",
+        searchQuery: "—",
+      };
+    }
+
+    if (reportMode === "month") {
+      const from = `${reportMonth}-01`;
+      const to = monthEnd(reportMonth);
+      const rows = await fetchDayBookRowsForPeriod(from, to);
+      return {
+        rows,
+        periodLabel: formatMonthLabel(reportMonth),
+        reportType: "Monthly Day Book Statement",
+        filenameSuffix: reportMonth,
+        typeFilter: "All",
+        sourceFilter: "All",
+        searchQuery: "—",
+      };
+    }
+
+    if (reportFrom > reportTo) {
+      throw new Error("From date must not be after To date.");
+    }
+
+    const rows = await fetchDayBookRowsForPeriod(reportFrom, reportTo);
+    return {
+      rows,
+      periodLabel: `${formatReportDate(reportFrom)} to ${formatReportDate(reportTo)}`,
+      reportType: "Date Range Day Book Statement",
+      filenameSuffix: `${reportFrom}_to_${reportTo}`,
+      typeFilter: "All",
+      sourceFilter: "All",
+      searchQuery: "—",
+    };
+  }, [
+    dayBookRows,
+    fetchDayBookRowsForPeriod,
+    filteredTransactions,
+    loading,
+    reportDate,
+    reportFrom,
+    reportMode,
+    reportMonth,
+    reportTo,
+    searchQuery,
+    selectedDate,
+    sourceFilter,
+    typeFilter,
+  ]);
+
+  const buildStatementHtml = useCallback((report: Awaited<ReturnType<typeof resolveStatementReport>>, renderMode: "print" | "pdf") => {
+    const totals = computeDayTotals(report.rows);
+    return buildDayBookHtml(buildDayBookStatementData(report.rows, {
+      periodLabel: report.periodLabel,
+      reportType: report.reportType,
+      typeFilter: report.typeFilter,
+      sourceFilter: report.sourceFilter,
+      searchQuery: report.searchQuery,
+    }, totals), {
+      renderMode,
+      helperText: "Day book statement preview. Use Print or Save as PDF.",
+    });
+  }, []);
+
+  const handlePrintStatement = async () => {
+    setReportError(null);
+    setReportBusy(true);
     try {
-      await printDayBookHtml(buildDayBookHtml(getReportData(filteredTransactions), {
-        helperText: "Day book print preview. Use Print or Save as PDF.",
-        renderMode: "print",
-      }));
+      const report = await resolveStatementReport();
+      await printDayBookHtml(buildStatementHtml(report, "pdf"));
+      setIsReportModalOpen(false);
     } catch (err) {
-      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+      setReportError(err instanceof Error ? err.message : "Print failed.");
+    } finally {
+      setReportBusy(false);
     }
   };
 
-  const handleDownloadDayBookPdf = async () => {
+  const handleDownloadStatement = async () => {
+    setReportError(null);
+    setReportBusy(true);
     try {
+      const report = await resolveStatementReport();
       await exportDayBookPdf(
-        buildDayBookHtml(getReportData(filteredTransactions), {
-          renderMode: "pdf",
-        }),
-        `daybook_${selectedDate}.pdf`,
+        buildStatementHtml(report, "pdf"),
+        `daybook_statement_${report.filenameSuffix}.pdf`,
       );
+      setIsReportModalOpen(false);
     } catch (err) {
-      alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+      setReportError(err instanceof Error ? err.message : "PDF download failed.");
+    } finally {
+      setReportBusy(false);
     }
   };
 
   const handlePrintTransaction = async (rec: DayBookRow) => {
     try {
-      await printDayBookHtml(buildDayBookHtml(getReportData([rec]), {
+      await printDayBookHtml(buildDayBookHtml(buildDayBookStatementData([rec], {
+        periodLabel: formatDisplayDate(rec.date),
+        reportType: "Day Book Voucher",
+      }, computeDayTotals([rec])), {
         helperText: "Voucher print preview.",
-        renderMode: "print",
+        renderMode: "pdf",
         voucher: rec,
       }));
     } catch (err) {
@@ -988,7 +1371,10 @@ export default function DayBookPage() {
     try {
       const ref = rec.reference_no || rec.id.slice(0, 12);
       await exportDayBookPdf(
-        buildDayBookHtml(getReportData([rec]), {
+        buildDayBookHtml(buildDayBookStatementData([rec], {
+          periodLabel: formatDisplayDate(rec.date),
+          reportType: "Day Book Voucher",
+        }, computeDayTotals([rec])), {
           renderMode: "pdf",
           voucher: rec,
         }),
@@ -1032,21 +1418,12 @@ export default function DayBookPage() {
           </button>
           <button
             type="button"
-            onClick={handlePrintDayBook}
+            onClick={openReportModal}
             disabled={loading}
             className="btn-secondary px-3 py-2 text-xs flex items-center gap-1.5"
           >
-            <Printer className="w-3.5 h-3.5" />
-            Print Day Book
-          </button>
-          <button
-            type="button"
-            onClick={handleDownloadDayBookPdf}
-            disabled={loading}
-            className="btn-secondary px-3 py-2 text-xs flex items-center gap-1.5"
-          >
-            <Download className="w-3.5 h-3.5" />
-            Download PDF
+            <FileText className="w-3.5 h-3.5" />
+            Day Book Statement
           </button>
           <button
             type="button"
@@ -1538,6 +1915,111 @@ export default function DayBookPage() {
                 className="btn-primary bg-slate-900 hover:bg-slate-800 active:bg-slate-950 px-6 py-2 font-bold shadow-sm text-white transition-colors rounded text-xs"
               >
                 Close View
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Day Book Statement Modal ── */}
+      {isReportModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px]">
+          <div className="absolute inset-0" onClick={() => setIsReportModalOpen(false)} />
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-lg w-full z-10 flex flex-col font-sans animate-in fade-in zoom-in-95 duration-150">
+            <div className="bg-amber-700 px-5 py-4 text-white rounded-t-xl flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-bold tracking-tight flex items-center gap-2">
+                  <FileText className="w-4 h-4" />
+                  Download Day Book Statement
+                </h2>
+                <p className="text-[10px] text-amber-100 mt-0.5">Account-style PDF with receipts, payments &amp; bill totals</p>
+              </div>
+              <button type="button" onClick={() => setIsReportModalOpen(false)}
+                className="text-amber-100 hover:text-white p-1.5 rounded-lg hover:bg-white/10">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {reportError && (
+                <div className="bg-red-50 border border-red-200 text-red-800 text-xs px-3 py-2 rounded-md flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                  <span>{reportError}</span>
+                </div>
+              )}
+
+              <div>
+                <label className="form-label text-xs font-semibold text-slate-700 mb-2 block">Statement Type</label>
+                <div className="space-y-2">
+                  {([
+                    ["day", "Selected Day", "All entries for a single calendar day"],
+                    ["month", "By Month", "All entries in a calendar month"],
+                    ["range", "Date Range", "Entries between two dates"],
+                    ["current", "Current Table Filter", "Uses search & filters from the list"],
+                  ] as const).map(([mode, title, desc]) => (
+                    <label key={mode}
+                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                        reportMode === mode ? "border-amber-600 bg-amber-50" : "border-slate-200 hover:bg-slate-50"
+                      }`}>
+                      <input type="radio" name="daybookReportMode" value={mode} checked={reportMode === mode}
+                        onChange={() => { setReportMode(mode); setReportError(null); }}
+                        className="mt-0.5" />
+                      <span>
+                        <span className="text-xs font-bold text-slate-800 block">{title}</span>
+                        <span className="text-[10px] text-slate-500">{desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {reportMode === "day" && (
+                <div>
+                  <label className="form-label text-xs">Book Date</label>
+                  <input type="date" value={reportDate} onChange={(e) => setReportDate(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "month" && (
+                <div>
+                  <label className="form-label text-xs">Month</label>
+                  <input type="month" value={reportMonth} onChange={(e) => setReportMonth(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "range" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="form-label text-xs">From Date</label>
+                    <input type="date" value={reportFrom} onChange={(e) => setReportFrom(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                  <div>
+                    <label className="form-label text-xs">To Date</label>
+                    <input type="date" value={reportTo} min={reportFrom} onChange={(e) => setReportTo(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Statement includes date, source, description, reference, payment mode, cash receipts/payments, and linked bill amounts for sales and purchases — with period totals and signatory.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-200 bg-slate-50 rounded-b-xl">
+              <button type="button" onClick={() => setIsReportModalOpen(false)} className="btn-secondary px-4 text-xs">
+                Cancel
+              </button>
+              <button type="button" onClick={handlePrintStatement} disabled={reportBusy}
+                className="btn-secondary px-4 text-xs flex items-center gap-1.5 disabled:opacity-50">
+                <Printer className="w-3.5 h-3.5" /> Print
+              </button>
+              <button type="button" onClick={handleDownloadStatement} disabled={reportBusy}
+                className="btn-primary bg-amber-600 hover:bg-amber-700 px-4 text-xs flex items-center gap-1.5 disabled:opacity-50">
+                <Download className="w-3.5 h-3.5" /> Download PDF
               </button>
             </div>
           </div>
