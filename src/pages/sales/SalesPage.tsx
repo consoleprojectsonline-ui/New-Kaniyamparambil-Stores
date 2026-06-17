@@ -3,8 +3,11 @@ import {
   Receipt, Plus, Search, Filter, Trash2, AlertTriangle, Check,
   Database, Calendar, Eye, Download, Printer, X, Edit, User, Truck,
 } from "lucide-react";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency } from "@/lib/utils";
+import upiQrUrl from "@/assets/upi-qr.png";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -20,6 +23,7 @@ export interface SaleItem {
   mrp: number;          // selling price per unit (customer pays this)
   sgst: number;         // SGST %
   cgst: number;         // CGST %
+  line_total: number;   // (qty×mrp − disc) + SGST amount + CGST amount (auto)
 }
 
 export interface SaleRecord {
@@ -83,9 +87,813 @@ const SEED_CUSTOMERS = [
 
 const SEED_SALESMEN = ["Manager", "Sunil", "Reena", "Ajith", "Priya"];
 
+// Manual invoice branding/details live here so they can be changed without touching the template.
+const INVOICE_STATIC_DETAILS = {
+  storeNameLines: ["NEW", "KANIYAMPARAMBIL", "STORES"],
+  phone: "9544363171",
+  email: "newkaniyamparambilstorestkdy@gmail.com",
+  gstin: "32AWJPJ1371N1ZE",
+  pan: "AWJPJ1371N",
+  badge: "Original for Recipient",
+  location: "THOPRAMKUDY PO, THOPRAMKUDY, KERALA",
+  customerAddress: "KERALA",
+  customerGstin: "—",
+  customerState: "Kerala",
+  customerCode: "32",
+  transportation: "Road",
+  vehicleNo: "—",
+  bankName: "bank details",
+  accountNo: "13330100068606",
+  ifsc: "FDRL0001333",
+  branch: "Thopramkudy Branch",
+  terms: "Certified that the particulars given above are true and correct.",
+  signatureScript: "jins joseph",
+  signatureRole: "Authorized Signatory",
+  signatureCompany: "FOR NEW KANIYAMPARAMBIL STORES",
+} as const;
+
+type InvoiceWindowOptions = {
+  autoPrint?: boolean;
+  helperText?: string;
+  renderMode?: "print" | "pdf";
+};
+
+const INVOICE_FRAME_STYLE: Partial<CSSStyleDeclaration> = {
+  position: "fixed",
+  top: "0",
+  left: "-20000px",
+  width: "794px",
+  height: "auto",
+  minHeight: "400px",
+  opacity: "0",
+  pointerEvents: "none",
+  border: "0",
+  background: "transparent",
+  overflow: "visible",
+};
+
+function resolveAssetUrl(relativeUrl: string): string {
+  if (typeof window === "undefined") return relativeUrl;
+  try {
+    return new URL(relativeUrl, window.location.origin).href;
+  } catch {
+    return relativeUrl;
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatInvoiceDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return escapeHtml(value || "—");
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(date).replace(/ /g, "-");
+}
+
+function formatInvoiceTime(value?: string): string {
+  const date = value ? new Date(value) : new Date();
+  const validDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  return new Intl.DateTimeFormat("en-IN", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(validDate);
+}
+
+function toWordsBelowThousand(num: number): string {
+  const ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"];
+  const teens = ["Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+
+  let n = Math.floor(num);
+  const parts: string[] = [];
+
+  if (n >= 100) {
+    parts.push(`${ones[Math.floor(n / 100)]} Hundred`);
+    n %= 100;
+  }
+  if (n >= 20) {
+    parts.push(tens[Math.floor(n / 10)]);
+    n %= 10;
+  } else if (n >= 10) {
+    parts.push(teens[n - 10]);
+    n = 0;
+  }
+  if (n > 0) parts.push(ones[n]);
+
+  return parts.filter(Boolean).join(" ");
+}
+
+function numberToWordsIndian(value: number): string {
+  const amount = Math.max(0, Math.round(value));
+  if (amount === 0) return "Rupees Zero Only";
+
+  const units = [
+    { value: 10000000, label: "Crore" },
+    { value: 100000, label: "Lakh" },
+    { value: 1000, label: "Thousand" },
+  ];
+
+  let remaining = amount;
+  const words: string[] = [];
+
+  units.forEach(({ value: unitValue, label }) => {
+    if (remaining >= unitValue) {
+      const unitCount = Math.floor(remaining / unitValue);
+      words.push(`${toWordsBelowThousand(unitCount)} ${label}`);
+      remaining %= unitValue;
+    }
+  });
+
+  if (remaining > 0) words.push(toWordsBelowThousand(remaining));
+
+  return `Rupees ${words.join(" ").replace(/\s+/g, " ").trim()} Only`;
+}
+
+function getSaleItemSummary(item: SaleItem) {
+  const quantity = Number(item.qty) || 0;
+  const rate = Number(item.mrp) || 0;
+  const amount = quantity * rate;
+  const discountPercent = Number(item.disc_pct) || 0;
+  const discountAmount = amount * (discountPercent / 100);
+  const taxableValue = Math.max(0, amount - discountAmount);
+  const cgstRate = Number(item.cgst) || 0;
+  const sgstRate = Number(item.sgst) || 0;
+  const cgstAmount = taxableValue * (cgstRate / 100);
+  const sgstAmount = taxableValue * (sgstRate / 100);
+  const total = taxableValue + cgstAmount + sgstAmount;
+
+  return {
+    quantity,
+    rate,
+    amount,
+    discountPercent,
+    discountAmount,
+    taxableValue,
+    cgstRate,
+    sgstRate,
+    cgstAmount,
+    sgstAmount,
+    total,
+  };
+}
+
+function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): string {
+  const store = INVOICE_STATIC_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+  const createdOn = rec.created_at ?? rec.bill_date;
+  const invoiceTitle = rec.form_type.toUpperCase();
+  const companyName = store.storeNameLines.join(" ");
+  const billedAddress = rec.ship_to || store.customerAddress;
+  const shippedAddress = rec.ship_to || billedAddress;
+  const customerGstin = store.customerGstin.includes("â") ? "-" : store.customerGstin;
+  const vehicleNo = store.vehicleNo.includes("â") ? "-" : store.vehicleNo;
+  const placeOfSupply = `${store.customerCode}-${store.customerState.toUpperCase()}`;
+  const lineSummaries = rec.items.map(getSaleItemSummary);
+  const totalQuantity = lineSummaries.reduce((sum, item) => sum + item.quantity, 0);
+  const totalAmount = lineSummaries.reduce((sum, item) => sum + item.amount, 0);
+  const totalLineDiscount = lineSummaries.reduce((sum, item) => sum + item.discountAmount, 0);
+  const totalTaxable = lineSummaries.reduce((sum, item) => sum + item.taxableValue, 0);
+  const totalCgst = lineSummaries.reduce((sum, item) => sum + item.cgstAmount, 0);
+  const totalSgst = lineSummaries.reduce((sum, item) => sum + item.sgstAmount, 0);
+  const cgstRate = totalTaxable > 0 ? (totalCgst / totalTaxable) * 100 : 0;
+  const sgstRate = totalTaxable > 0 ? (totalSgst / totalTaxable) * 100 : 0;
+  const amountInWords = numberToWordsIndian(rec.grand_total).replace(/^Rupees /, "INR ");
+
+  const rowMarkup = rec.items.map((item, index) => {
+    const summary = lineSummaries[index];
+    const itemExtras = isPdfMode
+      ? [
+          item.code ? `Code: ${escapeHtml(item.code)}` : "",
+          summary.discountPercent > 0
+            ? `Disc: ${summary.discountPercent.toFixed(0)}%`
+            : "",
+        ].filter(Boolean).join(" | ")
+      : [
+          item.code ? `Code: ${escapeHtml(item.code)}` : "",
+          summary.discountPercent > 0
+            ? `Disc: ${summary.discountPercent.toFixed(0)}% (${formatCurrency(summary.discountAmount)})`
+            : "",
+          `CGST ${summary.cgstRate.toFixed(1)}%: ${formatCurrency(summary.cgstAmount)}`,
+          `SGST ${summary.sgstRate.toFixed(1)}%: ${formatCurrency(summary.sgstAmount)}`,
+          `Line Total: ${formatCurrency(summary.total)}`,
+        ].filter(Boolean).join(" | ");
+
+    return `<tr>
+      <td class="col-index">${index + 1}</td>
+      <td class="col-item">
+        <strong>${escapeHtml(item.name || "Unnamed Item")}</strong>
+        ${itemExtras ? `<span class="item-meta">${itemExtras}</span>` : ""}
+      </td>
+      <td class="col-hsn">${escapeHtml(item.hsn_code || "—")}</td>
+      <td class="col-rate align-right">${formatCurrency(summary.rate)}</td>
+      <td class="col-qty align-center">${summary.quantity.toFixed(2)} ${escapeHtml(item.unit || "Nos")}</td>
+      <td class="col-taxable align-right">${formatCurrency(summary.taxableValue)}</td>
+    </tr>`;
+  }).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>Invoice ${escapeHtml(rec.bill_no)}</title>
+      <style>
+        * { box-sizing: border-box; }
+
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "8.5px" : "12px"};
+          line-height: ${isPdfMode ? "1.25" : "1.35"};
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+
+        .invoice-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .toolbar-actions { display: flex; gap: 8px; }
+
+        .toolbar-btn {
+          border: 1px solid #ccc;
+          border-radius: 4px;
+          padding: 8px 14px;
+          font-family: inherit;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          background: #fff;
+        }
+
+        .toolbar-btn.primary { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+
+        .invoice-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "13px" : "16px"};
+          font-weight: 700;
+          color: #1d4ed8;
+          letter-spacing: 0.04em;
+          padding: ${isPdfMode ? "6px 8px" : "10px"};
+          border-bottom: 1px solid #000;
+        }
+
+        .layout-table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+
+        .layout-table > tbody > tr > td,
+        .layout-table > tr > td {
+          border: 1px solid #000;
+          vertical-align: top;
+          padding: ${isPdfMode ? "3px 6px" : "8px 10px"};
+        }
+
+        .company-cell { width: 68%; }
+        .meta-cell { width: 32%; padding: 0 !important; }
+
+        .company-row {
+          display: flex;
+          align-items: flex-start;
+          gap: ${isPdfMode ? "8px" : "12px"};
+        }
+
+        .store-logo {
+          width: ${isPdfMode ? "34px" : "44px"};
+          height: ${isPdfMode ? "34px" : "44px"};
+          flex-shrink: 0;
+        }
+
+        .store-logo svg {
+          width: 100%;
+          height: 100%;
+          stroke: #111;
+          fill: none;
+          stroke-width: 1.6;
+        }
+
+        .company-name {
+          font-size: ${isPdfMode ? "11px" : "14px"};
+          font-weight: 700;
+          margin-bottom: 3px;
+        }
+
+        .company-line { margin-bottom: 2px; }
+        .company-line b { font-weight: 700; }
+
+        .meta-inner {
+          width: 100%;
+          border-collapse: collapse;
+        }
+
+        .meta-inner td {
+          border-bottom: 1px solid #000;
+          padding: ${isPdfMode ? "4px 7px" : "6px 10px"};
+          font-size: inherit;
+        }
+
+        .meta-inner tr:last-child td { border-bottom: none; }
+        .meta-inner .meta-label { font-weight: 600; white-space: nowrap; }
+        .meta-inner .meta-value { font-weight: 700; text-align: right; }
+
+        .section-label { font-weight: 700; margin-bottom: 3px; }
+        .customer-name { font-weight: 700; margin-bottom: 4px; }
+        .half { width: 50%; }
+
+        .items-table {
+          width: 100%;
+          border-collapse: collapse;
+          border-top: 1px solid #000;
+        }
+
+        .items-table th,
+        .items-table td {
+          border: 1px solid #000;
+          padding: ${isPdfMode ? "2px 4px" : "6px 8px"};
+          vertical-align: top;
+        }
+
+        .items-table thead th {
+          background: #f3f4f6;
+          font-weight: 700;
+          text-align: center;
+        }
+
+        .col-index { width: 24px; text-align: center; }
+        .col-hsn { width: 58px; text-align: center; }
+        .col-rate { width: 72px; }
+        .col-qty { width: 68px; }
+        .col-taxable { width: 82px; }
+
+        .col-item strong {
+          display: block;
+          font-weight: 700;
+        }
+
+        .item-meta {
+          display: block;
+          margin-top: 1px;
+          color: #444;
+          font-size: ${isPdfMode ? "7px" : "10px"};
+          line-height: 1.2;
+        }
+
+        .align-right { text-align: right; }
+        .align-center { text-align: center; }
+
+        .totals-left {
+          width: 55%;
+          font-weight: 600;
+          vertical-align: middle !important;
+        }
+
+        .totals-right {
+          width: 45%;
+          padding: 0 !important;
+        }
+
+        .summary-mini {
+          width: 100%;
+          border-collapse: collapse;
+        }
+
+        .summary-mini td {
+          border-bottom: 1px solid #000;
+          padding: ${isPdfMode ? "2px 6px" : "5px 10px"};
+        }
+
+        .summary-mini tr:last-child td { border-bottom: none; }
+
+        .summary-mini .sum-label {
+          font-weight: 600;
+          text-align: left;
+        }
+
+        .summary-mini .sum-value {
+          font-weight: 700;
+          text-align: right;
+          white-space: nowrap;
+        }
+
+        .summary-mini .total-row td {
+          font-size: ${isPdfMode ? "10px" : "13px"};
+          font-weight: 700;
+          background: #f9fafb;
+        }
+
+        .words-row {
+          border-top: 1px solid #000;
+          border-bottom: 1px solid #000;
+          padding: ${isPdfMode ? "3px 6px" : "8px 10px"};
+          font-weight: 600;
+        }
+
+        .words-row b { font-weight: 700; }
+
+        .upi-cell { text-align: center; vertical-align: middle; }
+
+        .upi-qr {
+          display: inline-block;
+          margin-top: 2px;
+          width: ${isPdfMode ? "56px" : "96px"};
+          height: ${isPdfMode ? "56px" : "96px"};
+          border: 1px solid #000;
+          object-fit: contain;
+          background: #fff;
+        }
+
+        .invoice-footer {
+          page-break-inside: avoid;
+        }
+
+        .notes-block,
+        .terms-block {
+          min-height: ${isPdfMode ? "0" : "72px"};
+        }
+
+        .terms-block ol {
+          margin: ${isPdfMode ? "2px 0 0" : "4px 0 0"};
+          padding-left: ${isPdfMode ? "14px" : "16px"};
+        }
+
+        .terms-block li { margin-bottom: ${isPdfMode ? "0" : "2px"}; }
+
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "4px 6px 5px" : "12px 10px 16px"};
+          text-align: right;
+          font-weight: 700;
+          page-break-inside: avoid;
+        }
+
+        .signatory .script {
+          font-family: "Brush Script MT", "Segoe Script", cursive;
+          font-size: ${isPdfMode ? "15px" : "32px"};
+          font-weight: 400;
+          color: #1d4ed8;
+          line-height: 1;
+          margin-bottom: ${isPdfMode ? "1px" : "4px"};
+        }
+
+        .signatory .role {
+          font-size: ${isPdfMode ? "7.5px" : "11px"};
+          font-weight: 600;
+          color: #333;
+        }
+
+        .invoice-fit-wrap {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          overflow: hidden;
+        }
+
+        @page { size: A4; margin: 8mm; }
+
+        @media print {
+          body { background: #fff; padding: 0; margin: 0; }
+          .invoice-toolbar { display: none; }
+          .invoice-fit-wrap { width: 100%; overflow: visible; }
+          .invoice-sheet { width: 100%; border: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="invoice-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText || "Use Print / Save as PDF from your browser to export this invoice.")}</p>
+        <div class="toolbar-actions">
+          <button class="toolbar-btn" onclick="window.close()">Close</button>
+          <button class="toolbar-btn primary" onclick="window.print()">Print / Save PDF</button>
+        </div>
+      </div>
+
+      <div class="invoice-fit-wrap">
+      <div class="invoice-sheet">
+        <div class="doc-title">${escapeHtml(invoiceTitle)}</div>
+
+        <table class="layout-table">
+          <tr>
+            <td class="company-cell">
+              <div class="company-row">
+                <div class="store-logo">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="9" cy="20" r="1.6"></circle>
+                    <circle cx="17" cy="20" r="1.6"></circle>
+                    <path d="M3 4h2l2.1 10.4a1 1 0 0 0 1 .8h9.7a1 1 0 0 0 1-.8L21 7H7"></path>
+                  </svg>
+                </div>
+                <div>
+                  <div class="company-name">${escapeHtml(companyName)}</div>
+                  <div class="company-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+                  <div class="company-line"><b>PAN:</b> ${escapeHtml(store.pan)}</div>
+                  <div class="company-line">${escapeHtml(store.location)}</div>
+                  <div class="company-line">Mobile: ${escapeHtml(store.phone)}</div>
+                  <div class="company-line">Email: ${escapeHtml(store.email)}</div>
+                </div>
+              </div>
+            </td>
+            <td class="meta-cell">
+              <table class="meta-inner">
+                <tr>
+                  <td class="meta-label">Invoice #</td>
+                  <td class="meta-value">${escapeHtml(rec.bill_no)}</td>
+                </tr>
+                <tr>
+                  <td class="meta-label">Place of Supply:</td>
+                  <td class="meta-value">${escapeHtml(placeOfSupply)}</td>
+                </tr>
+                <tr>
+                  <td class="meta-label">Invoice Date:</td>
+                  <td class="meta-value">${formatInvoiceDate(rec.bill_date)}</td>
+                </tr>
+                <tr>
+                  <td class="meta-label">Time of Supply:</td>
+                  <td class="meta-value">${formatInvoiceTime(createdOn)}</td>
+                </tr>
+                <tr>
+                  <td class="meta-label">Payment Mode:</td>
+                  <td class="meta-value">${escapeHtml(rec.payment_mode || "Cash")}</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+
+        <table class="layout-table">
+          <tr>
+            <td class="half">
+              <div class="section-label">Customer Details:</div>
+              <div class="customer-name">${escapeHtml(rec.customer_name || "Walk-in Customer")}</div>
+              <div class="section-label">Billing address:</div>
+              <div>${escapeHtml(billedAddress)}</div>
+              <div>Ph: ${escapeHtml(rec.customer_phone || "—")}</div>
+              <div>GSTIN/UID: ${escapeHtml(customerGstin)}</div>
+              <div>State: ${escapeHtml(store.customerState)} (${escapeHtml(store.customerCode)})</div>
+            </td>
+            <td class="half">
+              <div class="section-label">Shipping address:</div>
+              <div>${escapeHtml(shippedAddress)}</div>
+              <div style="margin-top:6px">Transportation: ${escapeHtml(store.transportation)}</div>
+              <div>Vehicle No: ${escapeHtml(vehicleNo)}</div>
+              <div>Branch/Godown: ${escapeHtml(rec.branch_godown || "—")}</div>
+              <div>Salesman: ${escapeHtml(rec.salesman || "—")}</div>
+            </td>
+          </tr>
+        </table>
+
+        <table class="items-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Item</th>
+              <th>HSN/SAC</th>
+              <th>Rate/ Item</th>
+              <th>Qty</th>
+              <th>Taxable Value</th>
+            </tr>
+          </thead>
+          <tbody>${rowMarkup}</tbody>
+        </table>
+
+        <table class="layout-table">
+          <tr>
+            <td class="totals-left">
+              Total Items / Qty : ${rec.items.length} / ${totalQuantity.toFixed(2)}
+            </td>
+            <td class="totals-right">
+              <table class="summary-mini">
+                <tr>
+                  <td class="sum-label">Amount</td>
+                  <td class="sum-value">${formatCurrency(totalAmount)}</td>
+                </tr>
+                <tr>
+                  <td class="sum-label">Discount</td>
+                  <td class="sum-value">${formatCurrency(totalLineDiscount)}</td>
+                </tr>
+                <tr>
+                  <td class="sum-label">Taxable Amount</td>
+                  <td class="sum-value">${formatCurrency(totalTaxable)}</td>
+                </tr>
+                <tr>
+                  <td class="sum-label">CGST ${cgstRate.toFixed(1)}%</td>
+                  <td class="sum-value">${formatCurrency(totalCgst)}</td>
+                </tr>
+                <tr>
+                  <td class="sum-label">SGST ${sgstRate.toFixed(1)}%</td>
+                  <td class="sum-value">${formatCurrency(totalSgst)}</td>
+                </tr>
+                <tr>
+                  <td class="sum-label">Sub Total</td>
+                  <td class="sum-value">${formatCurrency(rec.subtotal)}</td>
+                </tr>
+                ${rec.f_cess > 0 ? `<tr><td class="sum-label">F.Cess</td><td class="sum-value">${formatCurrency(rec.f_cess)}</td></tr>` : ""}
+                ${rec.commission > 0 ? `<tr><td class="sum-label">Commission</td><td class="sum-value">${formatCurrency(rec.commission)}</td></tr>` : ""}
+                ${rec.postage > 0 ? `<tr><td class="sum-label">Postage</td><td class="sum-value">${formatCurrency(rec.postage)}</td></tr>` : ""}
+                ${rec.discount > 0 ? `<tr><td class="sum-label">Bill Discount</td><td class="sum-value">${formatCurrency(rec.discount)}</td></tr>` : ""}
+                ${rec.round_off !== 0 ? `<tr><td class="sum-label">Round Off</td><td class="sum-value">${formatCurrency(rec.round_off)}</td></tr>` : ""}
+                <tr class="total-row">
+                  <td class="sum-label">Total</td>
+                  <td class="sum-value">${formatCurrency(rec.grand_total)}</td>
+                </tr>
+                <tr>
+                  <td class="sum-label">Paid Amount</td>
+                  <td class="sum-value">${formatCurrency(rec.payment_amount)}</td>
+                </tr>
+                <tr>
+                  <td class="sum-label">Balance</td>
+                  <td class="sum-value">${formatCurrency(rec.balance)}</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+
+        <div class="words-row">
+          Total amount (in words): <b>${escapeHtml(amountInWords)}</b>
+        </div>
+
+        <div class="invoice-footer">
+        <table class="layout-table">
+          <tr>
+            <td class="half">
+              <div class="section-label">Bank Details</div>
+              <div>Bank: ${escapeHtml(store.bankName)}</div>
+              <div>Account #: ${escapeHtml(store.accountNo)}</div>
+              <div>IFSC: ${escapeHtml(store.ifsc)}</div>
+              <div>Branch: ${escapeHtml(store.branch)}</div>
+            </td>
+            <td class="half upi-cell">
+              <div class="section-label">Pay using UPI:</div>
+              <img class="upi-qr" src="${resolveAssetUrl(upiQrUrl)}" alt="UPI QR Code" />
+            </td>
+          </tr>
+        </table>
+
+        <table class="layout-table">
+          <tr>
+            <td class="half notes-block">
+              <div class="section-label">Notes:</div>
+              <div>Thank you for your business.</div>
+              <div>Payment Status: ${escapeHtml(rec.payment_status || "—")}</div>
+              <div>Rate Type: ${escapeHtml(rec.rate_tp || "—")}</div>
+            </td>
+            <td class="half terms-block">
+              <div class="section-label">Terms and Conditions:</div>
+              <ol>
+                <li>Goods once sold will not be taken back or exchanged.</li>
+                <li>We are not manufacturers; warranty if any is from the brand/company.</li>
+                <li>Subject to local jurisdiction.</li>
+                <li>${escapeHtml(store.terms)}</li>
+              </ol>
+            </td>
+          </tr>
+        </table>
+
+        <div class="signatory">
+          <div class="script">${escapeHtml(store.signatureScript)}</div>
+          <div>${escapeHtml(store.signatureCompany)}</div>
+          <div class="role">${escapeHtml(store.signatureRole)}</div>
+        </div>
+        </div>
+      </div>
+      </div>
+
+      <script>
+        function fitInvoiceToSinglePage() {
+          const wrap = document.querySelector(".invoice-fit-wrap");
+          const sheet = document.querySelector(".invoice-sheet");
+          if (!(wrap instanceof HTMLElement) || !(sheet instanceof HTMLElement)) return;
+
+          wrap.style.transform = "none";
+          wrap.style.height = "auto";
+
+          const pageHeightPx = 1080;
+          const contentHeight = sheet.offsetHeight;
+          if (contentHeight <= pageHeightPx) return;
+
+          const scale = pageHeightPx / contentHeight;
+          wrap.style.transform = "scale(" + scale + ")";
+          wrap.style.transformOrigin = "top center";
+          wrap.style.height = Math.ceil(contentHeight * scale) + "px";
+        }
+
+        window.addEventListener("load", () => {
+          fitInvoiceToSinglePage();
+          ${options.autoPrint ? "setTimeout(() => window.print(), 300);" : ""}
+        });
+      </script>
+    </body>
+  </html>`;
+}
+
+async function waitForInvoiceFrame(html: string): Promise<HTMLIFrameElement> {
+  const iframe = document.createElement("iframe");
+  Object.assign(iframe.style, INVOICE_FRAME_STYLE);
+  iframe.setAttribute("aria-hidden", "true");
+  document.body.appendChild(iframe);
+
+  const frameDocument = iframe.contentDocument;
+  if (!frameDocument) {
+    iframe.remove();
+    throw new Error("Unable to prepare the invoice document.");
+  }
+
+  frameDocument.open();
+  frameDocument.write(html);
+  frameDocument.close();
+
+  const startedAt = Date.now();
+  await new Promise<void>((resolve, reject) => {
+    const checkReady = () => {
+      const readyState = iframe.contentDocument?.readyState;
+      if (readyState === "interactive" || readyState === "complete") {
+        resolve();
+        return;
+      }
+      if (Date.now() - startedAt > 5000) {
+        reject(new Error("Invoice preview took too long to load."));
+        return;
+      }
+      window.setTimeout(checkReady, 50);
+    };
+
+    checkReady();
+  });
+
+  const fontSet = iframe.contentDocument?.fonts;
+  if (fontSet?.ready) {
+    try {
+      await fontSet.ready;
+    } catch {
+      // Continue even if web fonts fail; printing/PDF should still work with fallback fonts.
+    }
+  }
+
+  const images = iframe.contentDocument?.querySelectorAll("img") ?? [];
+  await Promise.all(
+    Array.from(images).map(
+      (img) =>
+        new Promise<void>((resolve) => {
+          if (img.complete) {
+            resolve();
+            return;
+          }
+          img.addEventListener("load", () => resolve(), { once: true });
+          img.addEventListener("error", () => resolve(), { once: true });
+        }),
+    ),
+  );
+
+  await new Promise((resolve) => window.setTimeout(resolve, 120));
+
+  const frameWindow = iframe.contentWindow as (Window & { fitInvoiceToSinglePage?: () => void }) | null;
+  frameWindow?.fitInvoiceToSinglePage?.();
+
+  const fitWrap = iframe.contentDocument?.querySelector(".invoice-fit-wrap");
+  if (fitWrap instanceof HTMLElement) {
+    iframe.style.height = `${fitWrap.scrollHeight + 40}px`;
+  } else {
+    const sheet = iframe.contentDocument?.querySelector(".invoice-sheet");
+    if (sheet instanceof HTMLElement) {
+      iframe.style.height = `${sheet.scrollHeight + 40}px`;
+    }
+  }
+
+  await new Promise((resolve) => window.setTimeout(resolve, 80));
+  return iframe;
+}
+
 function blankItem(): SaleItem {
   return { code: "", name: "", hsn_code: "", qty: 1, unit: "Nos", rate: 0,
-    amount: 0, disc_pct: 0, mrp: 0, sgst: 9, cgst: 9 };
+    amount: 0, disc_pct: 0, mrp: 0, sgst: 9, cgst: 9, line_total: 0 };
 }
 
 function normalizeSale(raw: Record<string, unknown>): SaleRecord {
@@ -103,6 +911,7 @@ function normalizeSale(raw: Record<string, unknown>): SaleRecord {
       mrp: Number(it.mrp ?? 0),
       sgst: Number(it.sgst ?? 0),
       cgst: Number(it.cgst ?? 0),
+      line_total: Number(it.line_total ?? 0),
     }));
   }
   return {
@@ -366,13 +1175,28 @@ export default function SalesPage() {
   const addGridRow = () => setGridItems((prev) => [...prev, blankItem()]);
   const removeGridRow = (i: number) => { if (gridItems.length > 1) setGridItems(gridItems.filter((_, idx) => idx !== i)); };
 
+  // ── Helper: compute auto fields for a row ──
+  // amount   = qty × mrp
+  // line_total = amount − (amount × disc%) + SGST + CGST
+  const computeLineAutos = (item: SaleItem): Partial<SaleItem> => {
+    const mrpAmt   = Number(item.qty)  * Number(item.mrp);
+    const discAmt  = mrpAmt * ((Number(item.disc_pct) || 0) / 100);
+    const taxable  = Math.max(0, mrpAmt - discAmt);
+    const sgstAmt  = taxable * ((Number(item.sgst) || 0) / 100);
+    const cgstAmt  = taxable * ((Number(item.cgst) || 0) / 100);
+    return {
+      amount:     Math.round(mrpAmt   * 100) / 100,
+      line_total: Math.round((taxable + sgstAmt + cgstAmt) * 100) / 100,
+    };
+  };
+
   const updateGridRow = (i: number, key: keyof SaleItem, val: string | number) => {
     setGridItems(gridItems.map((item, idx) => {
       if (idx !== i) return item;
       const updated = { ...item, [key]: val };
-      // Amount is always qty × mrp
-      if (key === "qty" || key === "mrp") {
-        updated.amount = Number(updated.qty) * Number(updated.mrp);
+      // Recompute auto fields whenever any driver changes
+      if (["qty", "mrp", "disc_pct", "sgst", "cgst"].includes(key)) {
+        Object.assign(updated, computeLineAutos(updated));
       }
       return updated;
     }));
@@ -554,8 +1378,27 @@ export default function SalesPage() {
     }
   };
 
+  const openInvoiceDocument = (rec: SaleRecord, options: InvoiceWindowOptions) => {
+    const win = window.open("", "_blank", "noopener,noreferrer");
+    if (!win) {
+      alert("Allow popups to open the invoice preview.");
+      return;
+    }
+
+    win.document.write(buildInvoiceHtml(rec, options));
+    win.document.close();
+  };
+
   // ── Print ──
   const handlePrint = (rec: SaleRecord) => {
+    openInvoiceDocument(rec, {
+      autoPrint: true,
+      renderMode: "pdf",
+      helperText: "Premium A4 invoice preview. Print directly or switch the destination to Save as PDF.",
+    });
+    return;
+
+    /*
     const win = window.open("", "_blank");
     if (!win) { alert("Allow popups to print."); return; }
     const rows = rec.items.map((i) => {
@@ -610,17 +1453,101 @@ export default function SalesPage() {
     <script>setTimeout(()=>{window.focus();window.print();window.close();},300);</script>
     </body></html>`);
     win.document.close();
+    */
   };
 
   // ── Download ──
   const handleDownload = (rec: SaleRecord) => {
+    openInvoiceDocument(rec, {
+      autoPrint: true,
+      renderMode: "pdf",
+      helperText: "Choose Save as PDF in the print dialog to download this enterprise invoice layout.",
+    });
+    return;
+
+    /*
     const blob = new Blob([JSON.stringify(rec, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a"); a.href = url; a.download = `bill_${rec.bill_no}.json`;
     document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    */
   };
 
   // ── Filtered & paginated list ──
+  const handlePrintInvoice = async (rec: SaleRecord) => {
+    let iframe: HTMLIFrameElement | null = null;
+    try {
+      iframe = await waitForInvoiceFrame(buildInvoiceHtml(rec, {
+        helperText: "Premium A4 invoice preview. Print directly or switch the destination to Save as PDF.",
+        renderMode: "pdf",
+      }));
+
+      const printWindow = iframe.contentWindow;
+      if (!printWindow) throw new Error("Unable to open the print dialog.");
+
+      printWindow.focus();
+      printWindow.print();
+    } catch (err) {
+      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      window.setTimeout(() => iframe?.remove(), 1200);
+    }
+  };
+
+  const handleDownloadInvoice = async (rec: SaleRecord) => {
+    let iframe: HTMLIFrameElement | null = null;
+    try {
+      iframe = await waitForInvoiceFrame(buildInvoiceHtml(rec, {
+        helperText: "Generating tax invoice PDF...",
+        renderMode: "pdf",
+      }));
+
+      const invoiceRoot = iframe.contentDocument?.querySelector(".invoice-fit-wrap")
+        ?? iframe.contentDocument?.querySelector(".invoice-sheet");
+      if (!(invoiceRoot instanceof HTMLElement)) {
+        throw new Error("Unable to prepare the invoice layout for PDF export.");
+      }
+
+      const canvas = await html2canvas(invoiceRoot, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: "#ffffff",
+      });
+
+      const pdf = new jsPDF({
+        orientation: "portrait",
+        unit: "pt",
+        format: "a4",
+      });
+
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 12;
+      const maxWidth = pageWidth - margin * 2;
+      const maxHeight = pageHeight - margin * 2;
+      const scale = Math.min(maxWidth / canvas.width, maxHeight / canvas.height);
+      const renderWidth = canvas.width * scale;
+      const renderHeight = canvas.height * scale;
+
+      pdf.addImage(
+        canvas.toDataURL("image/png"),
+        "PNG",
+        margin,
+        margin,
+        renderWidth,
+        renderHeight,
+        undefined,
+        "FAST",
+      );
+
+      pdf.save(`tax_invoice_${rec.bill_no}.pdf`);
+    } catch (err) {
+      alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      iframe?.remove();
+    }
+  };
+
   const filteredSales = useMemo(() => sales.filter((s) => {
     const q = searchQuery.toLowerCase();
     const matchQ = s.bill_no.toLowerCase().includes(q) || s.customer_name.toLowerCase().includes(q);
@@ -741,8 +1668,8 @@ export default function SalesPage() {
                       {[
                         { icon: Eye, title: "View", fn: () => setViewingSale(rec) },
                         { icon: Edit, title: "Edit", fn: () => handleStartEdit(rec) },
-                        { icon: Printer, title: "Print", fn: () => handlePrint(rec) },
-                        { icon: Download, title: "Download", fn: () => handleDownload(rec) },
+                        { icon: Printer, title: "Print", fn: () => handlePrintInvoice(rec) },
+                        { icon: Download, title: "Download", fn: () => handleDownloadInvoice(rec) },
                       ].map(({ icon: Icon, title, fn }) => (
                         <button key={title} type="button" onClick={fn} title={title}
                           className="text-slate-500 hover:text-slate-900 hover:bg-slate-100 p-1.5 rounded transition-all">
@@ -1274,7 +2201,7 @@ export default function SalesPage() {
 
             {/* Footer */}
             <div className="flex items-center justify-end gap-3 border-t border-slate-200 bg-slate-50 p-4 rounded-b-xl sticky bottom-0">
-              <button type="button" onClick={() => handlePrint(viewingSale)}
+              <button type="button" onClick={() => handlePrintInvoice(viewingSale)}
                 className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 rounded flex items-center gap-1.5">
                 <Printer className="w-3.5 h-3.5" /> Print Bill
               </button>

@@ -16,6 +16,14 @@ import { useAuthStore } from "@/stores/authStore";
 import { formatCurrency, formatNumber } from "@/lib/utils";
 import { supabase } from "@/lib/supabase";
 
+function isMissingTableError(error: { code?: string; message?: string }): boolean {
+  const message = (error.message ?? "").toLowerCase();
+  if (error.code === "PGRST205" || error.code === "42P01") return true;
+  if (message.includes("could not find the table")) return true;
+  if (message.includes("column") && message.includes("does not exist")) return false;
+  return message.includes("relation") && message.includes("does not exist");
+}
+
 export default function DashboardPage() {
   const { user } = useAuthStore();
   const ownerName = user?.user_metadata?.owner_name || "Manager";
@@ -24,7 +32,7 @@ export default function DashboardPage() {
   const [data, setData] = useState({
     todaySales: 0,
     monthlyRevenue: 0,
-    outstandingAmount: 0,
+    totalSellers: 0,
     totalCustomers: 0,
   });
   const [loading, setLoading] = useState(true);
@@ -36,19 +44,18 @@ export default function DashboardPage() {
         setLoading(true);
         let todaySalesSum = 0;
         let monthlyRevenueSum = 0;
-        let outstandingSum = 0;
+        let sellersCount = 0;
         let customersCount = 0;
         const missingTables: string[] = [];
 
-        // 1. Fetch Sales and calculate today's sales, monthly revenue, outstanding amount
+        // 1. Fetch Sales and calculate today's sales, monthly revenue, total sellers
         try {
           const { data: salesData, error: salesError } = await supabase
             .from("sales")
-            .select("total_amount, created_at, outstanding_amount");
+            .select("grand_total, created_at, salesman");
 
           if (salesError) {
-            // PGRST116 or 42P01 means table does not exist
-            if (salesError.code === "PGRST116" || salesError.message.includes("relation") || salesError.message.includes("does not exist")) {
+            if (isMissingTableError(salesError)) {
               missingTables.push("sales");
             } else {
               console.error("Error fetching sales:", salesError);
@@ -61,10 +68,11 @@ export default function DashboardPage() {
             startOfMonth.setDate(1);
             startOfMonth.setHours(0, 0, 0, 0);
 
-            salesData.forEach((sale: { created_at: string; total_amount: number | string; outstanding_amount: number | string }) => {
+            const uniqueSellers = new Set<string>();
+
+            salesData.forEach((sale: { created_at: string; grand_total: number | string; salesman?: string | null }) => {
               const saleDate = new Date(sale.created_at);
-              const amount = Number(sale.total_amount) || 0;
-              const outstanding = Number(sale.outstanding_amount) || 0;
+              const amount = Number(sale.grand_total) || 0;
 
               if (saleDate >= today) {
                 todaySalesSum += amount;
@@ -72,8 +80,12 @@ export default function DashboardPage() {
               if (saleDate >= startOfMonth) {
                 monthlyRevenueSum += amount;
               }
-              outstandingSum += outstanding;
+
+              const seller = sale.salesman?.trim();
+              if (seller) uniqueSellers.add(seller);
             });
+
+            sellersCount = uniqueSellers.size;
           }
         } catch (err) {
           console.error("Sales fetch execution failed:", err);
@@ -86,7 +98,7 @@ export default function DashboardPage() {
             .select("*", { count: "exact", head: true });
 
           if (custError) {
-            if (custError.code === "PGRST116" || custError.message.includes("relation") || custError.message.includes("does not exist")) {
+            if (isMissingTableError(custError)) {
               missingTables.push("customers");
             } else {
               console.error("Error fetching customers:", custError);
@@ -111,7 +123,7 @@ export default function DashboardPage() {
         setData({
           todaySales: todaySalesSum,
           monthlyRevenue: monthlyRevenueSum,
-          outstandingAmount: outstandingSum,
+          totalSellers: sellersCount,
           totalCustomers: customersCount,
         });
       } catch (globalErr) {
@@ -149,15 +161,15 @@ export default function DashboardPage() {
       borderLeft: "4px solid #0F4C81",
     },
     {
-      title: "Outstanding Amount",
-      value: formatCurrency(data.outstandingAmount),
-      trend: data.outstandingAmount > 0 ? "-3.1%" : "0.0%",
-      isPositive: false,
-      sparklineColor: "#dc2626",
-      sparkData: data.outstandingAmount > 0 ? [450, 440, 435, 430, 435, 428, 422, 425, 418, 420] : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-      accentColor: "#dc2626",
-      bgGradient: "linear-gradient(135deg, #fff7f7 0%, #fee2e2 100%)",
-      borderLeft: "4px solid #dc2626",
+      title: "Total Sellers",
+      value: formatNumber(data.totalSellers),
+      trend: data.totalSellers > 0 ? "+4.6%" : "0.0%",
+      isPositive: true,
+      sparklineColor: "#7c3aed",
+      sparkData: data.totalSellers > 0 ? [2, 2, 3, 3, 4, 4, 5, 5, 6, 6] : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      accentColor: "#7c3aed",
+      bgGradient: "linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%)",
+      borderLeft: "4px solid #7c3aed",
     },
     {
       title: "Total Customers",
