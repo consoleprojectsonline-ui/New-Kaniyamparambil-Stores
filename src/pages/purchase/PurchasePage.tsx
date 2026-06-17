@@ -15,7 +15,10 @@ import {
   X,
   Edit,
   Truck,
+  FileText,
 } from "lucide-react";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency } from "@/lib/utils";
 
@@ -164,6 +167,717 @@ function normalizePurchase(raw: Record<string, unknown>): PurchaseRecord {
     payment_status: String(raw.payment_status ?? "Pending"),
     created_at: raw.created_at ? String(raw.created_at) : undefined,
   };
+}
+
+const PURCHASE_STORE_DETAILS = {
+  storeName: "NEW KANIYAMPARAMBIL STORES",
+  location: "THOPRAMKUDY PO, THOPRAMKUDY, KERALA",
+  gstin: "32AWJPJ1371N1ZE",
+  phone: "9544363171",
+  signatureCompany: "FOR NEW KANIYAMPARAMBIL STORES",
+  signatureRole: "Authorized Purchase Signatory",
+} as const;
+
+const PURCHASE_FRAME_STYLE: Partial<CSSStyleDeclaration> = {
+  position: "fixed",
+  top: "0",
+  left: "-20000px",
+  width: "794px",
+  height: "auto",
+  minHeight: "400px",
+  opacity: "0",
+  pointerEvents: "none",
+  border: "0",
+  background: "transparent",
+  overflow: "visible",
+};
+
+function todayIso(): string {
+  return new Date().toISOString().split("T")[0];
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatDocDate(value: string): string {
+  const date = new Date(`${value.slice(0, 10)}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return escapeHtml(value || "—");
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(date).replace(/ /g, "-");
+}
+
+function formatMonthLabel(monthYm: string): string {
+  const [year, month] = monthYm.split("-");
+  const d = new Date(Number(year), Number(month) - 1, 1);
+  if (Number.isNaN(d.getTime())) return monthYm;
+  return new Intl.DateTimeFormat("en-GB", { month: "long", year: "numeric" }).format(d);
+}
+
+function getPurchaseItemLineSummary(item: PurchaseItem) {
+  const taxable = Math.max(0, item.qty * item.rate - (item.disc || 0));
+  const sgstAmt = taxable * ((item.sgst ?? 0) / 100);
+  const cgstAmt = taxable * ((item.cgst ?? 0) / 100);
+  return {
+    taxable,
+    sgstAmt,
+    cgstAmt,
+    lineTotal: taxable + sgstAmt + cgstAmt,
+  };
+}
+
+type PurchaseDocOptions = {
+  autoPrint?: boolean;
+  helperText?: string;
+  renderMode?: "print" | "pdf";
+};
+
+function buildPurchaseHtml(rec: PurchaseRecord, options: PurchaseDocOptions = {}): string {
+  const store = PURCHASE_STORE_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+  const balanceDue = Math.max(0, rec.net_amount - rec.paid_amount);
+
+  const rowMarkup = rec.items.map((item, index) => {
+    const s = getPurchaseItemLineSummary(item);
+    return `<tr>
+      <td class="col-index">${index + 1}</td>
+      <td class="col-code">${escapeHtml(item.code || "—")}</td>
+      <td class="col-name">${escapeHtml(item.name || "—")}</td>
+      <td class="col-hsn">${escapeHtml(item.hsn_code || "—")}</td>
+      <td class="col-qty align-center">${item.qty.toFixed(2)} ${escapeHtml(item.unit || "Nos")}</td>
+      <td class="col-rate align-right">${escapeHtml(formatCurrency(item.rate))}</td>
+      <td class="col-disc align-right">${escapeHtml(formatCurrency(item.disc || 0))}</td>
+      <td class="col-gst align-center">${item.sgst ?? 0}% / ${item.cgst ?? 0}%</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(s.lineTotal))}</td>
+    </tr>`;
+  }).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>Purchase Bill ${escapeHtml(rec.invoice_no)}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "8px" : "12px"};
+          line-height: 1.35;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .purchase-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .toolbar-actions { display: flex; gap: 8px; }
+        .toolbar-btn {
+          border: 1px solid #ccc;
+          border-radius: 4px;
+          padding: 8px 14px;
+          font-family: inherit;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          background: #fff;
+        }
+        .toolbar-btn.primary { background: #7c3aed; color: #fff; border-color: #7c3aed; }
+        .purchase-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "13px" : "16px"};
+          font-weight: 700;
+          color: #7c3aed;
+          letter-spacing: 0.05em;
+          padding: ${isPdfMode ? "7px 8px" : "10px"};
+          border-bottom: 1px solid #000;
+        }
+        .doc-subtitle {
+          text-align: center;
+          font-size: ${isPdfMode ? "8px" : "10px"};
+          color: #555;
+          padding: ${isPdfMode ? "4px 8px" : "6px 10px"};
+          border-bottom: 1px solid #000;
+          background: #f5f3ff;
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+        }
+        .meta-grid > div:last-child { border-right: none; }
+        .meta-label { font-weight: 700; margin-bottom: 2px; font-size: ${isPdfMode ? "7.5px" : "10px"}; text-transform: uppercase; }
+        .meta-line { margin-bottom: 1px; }
+        .items-table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        .items-table th,
+        .items-table td {
+          border: 1px solid #000;
+          padding: ${isPdfMode ? "3px 4px" : "5px 6px"};
+          vertical-align: top;
+        }
+        .items-table thead th {
+          background: #ede9fe;
+          font-weight: 700;
+          text-align: center;
+        }
+        .col-index { width: 22px; text-align: center; }
+        .col-code { width: 48px; font-family: monospace; }
+        .col-name { min-width: 90px; }
+        .col-hsn { width: 44px; text-align: center; }
+        .col-qty { width: 52px; }
+        .col-rate, .col-disc, .col-amt { width: 52px; white-space: nowrap; }
+        .col-gst { width: 44px; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .align-right { text-align: right; }
+        .align-center { text-align: center; }
+        .totals-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          border-top: 1px solid #000;
+        }
+        .totals-box {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+        }
+        .totals-box:last-child { border-right: none; }
+        .total-row {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 3px;
+          font-weight: 600;
+        }
+        .total-row.grand {
+          margin-top: 4px;
+          padding-top: 4px;
+          border-top: 1px dashed #999;
+          font-size: ${isPdfMode ? "10px" : "13px"};
+          font-weight: 700;
+        }
+        .footer-note {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          color: #444;
+        }
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          text-align: right;
+          font-weight: 700;
+          font-size: ${isPdfMode ? "8px" : "11px"};
+        }
+        @page { size: A4 portrait; margin: 10mm; }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .purchase-toolbar { display: none; }
+          .purchase-sheet { width: 100%; border: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="purchase-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText || "Use Print / Save as PDF from your browser.")}</p>
+        <div class="toolbar-actions">
+          <button class="toolbar-btn" onclick="window.close()">Close</button>
+          <button class="toolbar-btn primary" onclick="window.print()">Print / Save PDF</button>
+        </div>
+      </div>
+
+      <div class="purchase-sheet">
+        <div class="doc-title">PURCHASE BILL / STOCK INFLOW VOUCHER</div>
+        <div class="doc-subtitle">Procurement &amp; warehouse stock inflow record</div>
+
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">${escapeHtml(store.storeName)}</div>
+            <div class="meta-line">${escapeHtml(store.location)}</div>
+            <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+            <div class="meta-line"><b>Phone:</b> ${escapeHtml(store.phone)}</div>
+          </div>
+          <div>
+            <div class="meta-label">Supplier Details</div>
+            <div class="meta-line"><b>Supplier:</b> ${escapeHtml(rec.supplier_name)}</div>
+            <div class="meta-line"><b>Type:</b> ${escapeHtml(rec.purchase_type)}</div>
+            <div class="meta-line"><b>Godown:</b> ${escapeHtml(rec.branch_godown)}</div>
+            <div class="meta-line"><b>Vehicle:</b> ${escapeHtml(rec.vehicle_no || "—")}</div>
+          </div>
+          <div>
+            <div class="meta-label">Bill Details</div>
+            <div class="meta-line"><b>Invoice No:</b> ${escapeHtml(rec.invoice_no)}</div>
+            <div class="meta-line"><b>Serial:</b> ${escapeHtml(rec.serial_no || "—")}</div>
+            <div class="meta-line"><b>Invoice Date:</b> ${escapeHtml(formatDocDate(rec.invoice_date))}</div>
+            <div class="meta-line"><b>Entry Date:</b> ${escapeHtml(formatDocDate(rec.entry_date))}</div>
+          </div>
+        </div>
+
+        <table class="items-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Code</th>
+              <th>Item</th>
+              <th>HSN</th>
+              <th>Qty</th>
+              <th>Rate</th>
+              <th>Disc</th>
+              <th>SGST/CGST</th>
+              <th>Line Total</th>
+            </tr>
+          </thead>
+          <tbody>${rowMarkup || `<tr><td colspan="9" style="text-align:center;padding:12px;">No line items</td></tr>`}</tbody>
+        </table>
+
+        <div class="totals-grid">
+          <div class="totals-box">
+            <div class="total-row"><span>Subtotal (Base)</span><span>${escapeHtml(formatCurrency(rec.subtotal))}</span></div>
+            <div class="total-row"><span>Discount (–)</span><span>${escapeHtml(formatCurrency(rec.total_discount ?? 0))}</span></div>
+            <div class="total-row"><span>Total SGST</span><span>${escapeHtml(formatCurrency(rec.total_sgst ?? 0))}</span></div>
+            <div class="total-row"><span>Total CGST</span><span>${escapeHtml(formatCurrency(rec.total_cgst ?? 0))}</span></div>
+          </div>
+          <div class="totals-box">
+            <div class="total-row"><span>Expenses (Freight)</span><span>${escapeHtml(formatCurrency(rec.expenses))}</span></div>
+            <div class="total-row grand"><span>Net Amount</span><span>${escapeHtml(formatCurrency(rec.net_amount))}</span></div>
+            <div class="total-row"><span>Paid</span><span>${escapeHtml(formatCurrency(rec.paid_amount))}</span></div>
+            <div class="total-row"><span>Balance Due</span><span>${escapeHtml(formatCurrency(balanceDue))}</span></div>
+            <div class="total-row"><span>Status</span><span>${escapeHtml(rec.payment_status)}</span></div>
+          </div>
+        </div>
+
+        <div class="footer-note">
+          Purchase bill generated from procurement records. Stock inflow is recorded per saved purchase bill line items.
+        </div>
+
+        <div class="signatory">
+          <div>${escapeHtml(store.signatureCompany)}</div>
+          <div>${escapeHtml(store.signatureRole)}</div>
+        </div>
+      </div>
+      <script>${options.autoPrint ? "window.addEventListener('load', () => { setTimeout(() => window.print(), 250); });" : ""}</script>
+    </body>
+  </html>`;
+}
+
+// ─── Purchase Statement (account-style register) ────────────────────────────
+
+type PurchaseReportMode = "full" | "date" | "month" | "range" | "current";
+
+type PurchaseStatementMeta = {
+  reportTitle: string;
+  periodLabel: string;
+  reportType: string;
+  statusFilter: string;
+  searchQuery: string;
+  generatedOn: string;
+  totalBills: number;
+  totalNet: number;
+  totalPaid: number;
+  totalOutstanding: number;
+};
+
+type PurchaseStatementDocOptions = {
+  helperText?: string;
+  renderMode?: "print" | "pdf";
+};
+
+function purchaseEntryDate(rec: PurchaseRecord): string {
+  return (rec.entry_date || rec.invoice_date || "").slice(0, 10);
+}
+
+function filterPurchasesByDate(list: PurchaseRecord[], date: string): PurchaseRecord[] {
+  return list.filter((p) => purchaseEntryDate(p) === date);
+}
+
+function filterPurchasesByMonth(list: PurchaseRecord[], monthYm: string): PurchaseRecord[] {
+  return list.filter((p) => purchaseEntryDate(p).slice(0, 7) === monthYm);
+}
+
+function filterPurchasesByRange(list: PurchaseRecord[], from: string, to: string): PurchaseRecord[] {
+  return list.filter((p) => {
+    const d = purchaseEntryDate(p);
+    return d >= from && d <= to;
+  });
+}
+
+function buildPurchaseStatementMeta(
+  list: PurchaseRecord[],
+  reportType: string,
+  periodLabel: string,
+  statusFilter: string,
+  searchQuery: string,
+): PurchaseStatementMeta {
+  return {
+    reportTitle: "PURCHASE STATEMENT / PROCUREMENT REGISTER",
+    periodLabel,
+    reportType,
+    statusFilter,
+    searchQuery,
+    generatedOn: formatDocDate(todayIso()),
+    totalBills: list.length,
+    totalNet: list.reduce((sum, p) => sum + p.net_amount, 0),
+    totalPaid: list.reduce((sum, p) => sum + p.paid_amount, 0),
+    totalOutstanding: list.reduce((sum, p) => sum + Math.max(0, p.net_amount - p.paid_amount), 0),
+  };
+}
+
+function buildPurchaseStatementHtml(
+  list: PurchaseRecord[],
+  meta: PurchaseStatementMeta,
+  options: PurchaseStatementDocOptions = {},
+): string {
+  const store = PURCHASE_STORE_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+
+  const rowMarkup = list.map((rec, index) => {
+    const balance = Math.max(0, rec.net_amount - rec.paid_amount);
+    const totalGst = (rec.total_sgst ?? 0) + (rec.total_cgst ?? 0);
+    return `<tr>
+      <td class="col-index">${index + 1}</td>
+      <td class="col-date">${escapeHtml(formatDocDate(rec.entry_date))}</td>
+      <td class="col-inv">${escapeHtml(rec.invoice_no)}</td>
+      <td class="col-serial">${escapeHtml(rec.serial_no || "—")}</td>
+      <td class="col-supplier">${escapeHtml(rec.supplier_name)}</td>
+      <td class="col-godown">${escapeHtml(rec.branch_godown)}</td>
+      <td class="col-items align-center">${rec.items.length}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(rec.subtotal))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(totalGst))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(rec.net_amount))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(rec.paid_amount))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(balance))}</td>
+      <td class="col-status">${escapeHtml(rec.payment_status)}</td>
+    </tr>`;
+  }).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>${escapeHtml(meta.reportTitle)}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "7.5px" : "11px"};
+          line-height: 1.28;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .statement-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .toolbar-actions { display: flex; gap: 8px; }
+        .toolbar-btn {
+          border: 1px solid #ccc;
+          border-radius: 4px;
+          padding: 8px 14px;
+          font-family: inherit;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          background: #fff;
+        }
+        .toolbar-btn.primary { background: #7c3aed; color: #fff; border-color: #7c3aed; }
+        .purchase-statement-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "13px" : "16px"};
+          font-weight: 700;
+          color: #7c3aed;
+          letter-spacing: 0.05em;
+          padding: ${isPdfMode ? "7px 8px" : "10px"};
+          border-bottom: 1px solid #000;
+        }
+        .period-banner {
+          text-align: center;
+          font-weight: 700;
+          padding: ${isPdfMode ? "5px 8px" : "8px 12px"};
+          border-bottom: 1px solid #000;
+          background: #ede9fe;
+          font-size: ${isPdfMode ? "9px" : "12px"};
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+        }
+        .meta-grid > div:last-child { border-right: none; }
+        .meta-label { font-weight: 700; margin-bottom: 2px; font-size: ${isPdfMode ? "7.5px" : "10px"}; text-transform: uppercase; }
+        .meta-line { margin-bottom: 1px; }
+        .statement-table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        .statement-table th,
+        .statement-table td {
+          border: 1px solid #000;
+          padding: ${isPdfMode ? "2px 3px" : "4px 5px"};
+          vertical-align: top;
+        }
+        .statement-table thead th {
+          background: #ede9fe;
+          font-weight: 700;
+          text-align: center;
+        }
+        .col-index { width: 20px; text-align: center; }
+        .col-date { width: 52px; text-align: center; white-space: nowrap; }
+        .col-inv { width: 56px; font-family: monospace; }
+        .col-serial { width: 48px; font-family: monospace; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .col-supplier { min-width: 80px; }
+        .col-godown { width: 56px; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .col-items { width: 28px; }
+        .col-amt { width: 48px; white-space: nowrap; }
+        .col-status { width: 40px; text-align: center; }
+        .align-right { text-align: right; }
+        .align-center { text-align: center; }
+        .summary-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr 1fr;
+          border-top: 1px solid #000;
+        }
+        .summary-box {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+          font-weight: 600;
+        }
+        .summary-box:last-child { border-right: none; }
+        .summary-box b { display: block; font-size: ${isPdfMode ? "9px" : "12px"}; margin-top: 2px; }
+        .footer-note {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          color: #444;
+        }
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          text-align: right;
+          font-weight: 700;
+          font-size: ${isPdfMode ? "8px" : "11px"};
+        }
+        @page { size: A4 landscape; margin: 8mm; }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .statement-toolbar { display: none; }
+          .purchase-statement-sheet { width: 100%; border: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="statement-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText || "Use Print / Save as PDF from your browser.")}</p>
+        <div class="toolbar-actions">
+          <button class="toolbar-btn" onclick="window.close()">Close</button>
+          <button class="toolbar-btn primary" onclick="window.print()">Print / Save PDF</button>
+        </div>
+      </div>
+
+      <div class="purchase-statement-sheet">
+        <div class="doc-title">${escapeHtml(meta.reportTitle)}</div>
+        <div class="period-banner">Statement Period: ${escapeHtml(meta.periodLabel)}</div>
+
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">${escapeHtml(store.storeName)}</div>
+            <div class="meta-line">${escapeHtml(store.location)}</div>
+            <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+            <div class="meta-line"><b>Phone:</b> ${escapeHtml(store.phone)}</div>
+          </div>
+          <div>
+            <div class="meta-label">Report Details</div>
+            <div class="meta-line"><b>Type:</b> ${escapeHtml(meta.reportType)}</div>
+            <div class="meta-line"><b>Status Filter:</b> ${escapeHtml(meta.statusFilter)}</div>
+            <div class="meta-line"><b>Search:</b> ${escapeHtml(meta.searchQuery || "—")}</div>
+          </div>
+          <div>
+            <div class="meta-label">Generated</div>
+            <div class="meta-line"><b>Date:</b> ${escapeHtml(meta.generatedOn)}</div>
+            <div class="meta-line"><b>Bills:</b> ${meta.totalBills}</div>
+          </div>
+        </div>
+
+        <table class="statement-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Entry Date</th>
+              <th>Invoice No</th>
+              <th>Serial</th>
+              <th>Supplier</th>
+              <th>Godown</th>
+              <th>Items</th>
+              <th>Subtotal</th>
+              <th>GST</th>
+              <th>Net Amt</th>
+              <th>Paid</th>
+              <th>Balance</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${rowMarkup || `<tr><td colspan="13" style="text-align:center;padding:12px;">No purchase bills for this statement period.</td></tr>`}</tbody>
+        </table>
+
+        <div class="summary-grid">
+          <div class="summary-box">Total Bills<b>${meta.totalBills}</b></div>
+          <div class="summary-box">Total Net Value<b>${escapeHtml(formatCurrency(meta.totalNet))}</b></div>
+          <div class="summary-box">Total Paid<b>${escapeHtml(formatCurrency(meta.totalPaid))}</b></div>
+          <div class="summary-box">Outstanding<b>${escapeHtml(formatCurrency(meta.totalOutstanding))}</b></div>
+        </div>
+
+        <div class="footer-note">
+          Purchase statement generated from procurement records. Amounts include taxable value, GST, expenses, and payment status per saved bill.
+        </div>
+
+        <div class="signatory">
+          <div>${escapeHtml(store.signatureCompany)}</div>
+          <div>${escapeHtml(store.signatureRole)}</div>
+        </div>
+      </div>
+    </body>
+  </html>`;
+}
+
+async function waitForPurchaseFrame(html: string, sheetSelector = ".purchase-sheet"): Promise<HTMLIFrameElement> {
+  const iframe = document.createElement("iframe");
+  Object.assign(iframe.style, PURCHASE_FRAME_STYLE);
+  iframe.setAttribute("aria-hidden", "true");
+  document.body.appendChild(iframe);
+  const frameDocument = iframe.contentDocument;
+  if (!frameDocument) {
+    iframe.remove();
+    throw new Error("Unable to prepare the purchase document.");
+  }
+  frameDocument.open();
+  frameDocument.write(html);
+  frameDocument.close();
+  await new Promise<void>((resolve, reject) => {
+    const startedAt = Date.now();
+    const checkReady = () => {
+      const readyState = iframe.contentDocument?.readyState;
+      if (readyState === "interactive" || readyState === "complete") {
+        resolve();
+        return;
+      }
+      if (Date.now() - startedAt > 5000) {
+        reject(new Error("Purchase preview took too long to load."));
+        return;
+      }
+      window.setTimeout(checkReady, 50);
+    };
+    checkReady();
+  });
+  const sheet = iframe.contentDocument?.querySelector(sheetSelector);
+  if (sheet instanceof HTMLElement) {
+    iframe.style.height = `${sheet.scrollHeight + 40}px`;
+  }
+  await new Promise((resolve) => window.setTimeout(resolve, 120));
+  return iframe;
+}
+
+async function exportPurchasePdf(
+  html: string,
+  filename: string,
+  sheetSelector = ".purchase-sheet",
+  singlePage = true,
+): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForPurchaseFrame(html, sheetSelector);
+    const sheet = iframe.contentDocument?.querySelector(sheetSelector);
+    if (!(sheet instanceof HTMLElement)) {
+      throw new Error("Unable to prepare the purchase layout for PDF export.");
+    }
+    const canvas = await html2canvas(sheet, { scale: 2, useCORS: true, backgroundColor: "#ffffff" });
+    const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const margin = 12;
+
+    if (singlePage) {
+      const maxWidth = pageWidth - margin * 2;
+      const maxHeight = pageHeight - margin * 2;
+      const scale = Math.min(maxWidth / canvas.width, maxHeight / canvas.height);
+      pdf.addImage(canvas.toDataURL("image/png"), "PNG", margin, margin, canvas.width * scale, canvas.height * scale, undefined, "FAST");
+    } else {
+      const imgWidth = pageWidth - margin * 2;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+      const imgData = canvas.toDataURL("image/png");
+      let heightLeft = imgHeight;
+      let position = margin;
+      pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+      heightLeft -= pageHeight - margin * 2;
+      while (heightLeft > 0) {
+        pdf.addPage();
+        position = margin - (imgHeight - heightLeft);
+        pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+        heightLeft -= pageHeight - margin * 2;
+      }
+    }
+    pdf.save(filename);
+  } finally {
+    iframe?.remove();
+  }
+}
+
+async function printPurchaseHtml(html: string, sheetSelector = ".purchase-sheet"): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForPurchaseFrame(html, sheetSelector);
+    const printWindow = iframe.contentWindow;
+    if (!printWindow) throw new Error("Unable to open the print dialog.");
+    printWindow.focus();
+    printWindow.print();
+  } finally {
+    window.setTimeout(() => iframe?.remove(), 1200);
+  }
 }
 
 // Custom Searchable Dropdown for Selecting Products
@@ -347,6 +1061,14 @@ export default function PurchasePage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [viewingPurchase, setViewingPurchase] = useState<PurchaseRecord | null>(null);
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
+  const [reportMode, setReportMode] = useState<PurchaseReportMode>("full");
+  const [reportDate, setReportDate] = useState(todayIso());
+  const [reportMonth, setReportMonth] = useState(() => todayIso().slice(0, 7));
+  const [reportFrom, setReportFrom] = useState(todayIso());
+  const [reportTo, setReportTo] = useState(todayIso());
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [reportBusy, setReportBusy] = useState(false);
 
   // Dynamic lists
   const availableSuppliers = useMemo(() => {
@@ -783,164 +1505,25 @@ export default function PurchasePage() {
     setIsFormOpen(true);
   };
 
-  const handlePrintPurchase = (rec: PurchaseRecord) => {
-    const printWindow = window.open("", "_blank");
-    if (!printWindow) {
-      alert("Popup blocker is active. Please allow popups to print purchase bills.");
-      return;
+  const handlePrintPurchase = async (rec: PurchaseRecord) => {
+    try {
+      await printPurchaseHtml(buildPurchaseHtml(rec, {
+        renderMode: "pdf",
+        helperText: "Purchase bill print preview.",
+      }));
+    } catch (err) {
+      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     }
-    const tableRows = rec.items
-      .map((i) => {
-        const taxable = Math.max(0, i.qty * i.rate - (i.disc || 0));
-        const sgstAmt = taxable * ((i.sgst ?? 0) / 100);
-        const cgstAmt = taxable * ((i.cgst ?? 0) / 100);
-        const lineTotal = taxable + sgstAmt + cgstAmt;
-        return `
-      <tr>
-        <td>${i.code}</td>
-        <td>${i.name}</td>
-        <td style="text-align: center;">${i.qty}</td>
-        <td style="text-align: center;">${i.unit}</td>
-        <td style="text-align: right;">&#8377;${i.rate.toFixed(2)}</td>
-        <td style="text-align: right;">&#8377;${(i.disc || 0).toFixed(2)}</td>
-        <td style="text-align: center;">${i.sgst ?? 0}%</td>
-        <td style="text-align: center;">${i.cgst ?? 0}%</td>
-        <td style="text-align: right;">&#8377;${sgstAmt.toFixed(2)}</td>
-        <td style="text-align: right;">&#8377;${cgstAmt.toFixed(2)}</td>
-        <td style="text-align: right;">&#8377;${lineTotal.toFixed(2)}</td>
-      </tr>`;
-      })
-      .join("");
-
-    printWindow.document.write(`
-      <html>
-        <head>
-          <title>Purchase Invoice - ${rec.invoice_no}</title>
-          <style>
-            body { font-family: 'Inter', sans-serif; padding: 30px; color: #1e293b; background-color: #ffffff; }
-            .header { border-bottom: 2px solid #0f172a; padding-bottom: 12px; margin-bottom: 20px; display: flex; justify-content: space-between; }
-            .title { font-size: 20px; font-weight: 700; color: #0f172a; margin: 0; }
-            .subtitle { font-size: 12px; color: #64748b; margin-top: 4px; }
-            .details-grid { display: grid; grid-template-cols: 1fr 1fr; gap: 15px; font-size: 12px; margin-bottom: 20px; background: #f8fafc; padding: 15px; border-radius: 8px; border: 1px solid #e2e8f0; }
-            .details-grid div span { font-weight: 600; color: #475569; }
-            table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }
-            th, td { border: 1px solid #e2e8f0; padding: 8px 10px; text-align: left; }
-            th { background-color: #f1f5f9; font-weight: 600; color: #334155; }
-            .totals-panel { display: flex; justify-content: flex-end; margin-top: 20px; font-size: 12px; }
-            .totals-panel table { width: 300px; }
-            .totals-panel td { padding: 6px; border: none; }
-            .totals-panel tr.bold td { font-weight: 700; border-top: 1px solid #cbd5e1; font-size: 13px; color: #0f172a; }
-          </style>
-        </head>
-        <body>
-          <div class="header">
-            <div>
-              <h1 class="title">New Kaniyamparambil Stores</h1>
-              <p class="subtitle">Procurement & Warehouse Stock Inflow Voucher</p>
-            </div>
-            <div style="text-align: right;">
-              <h2 style="margin:0; font-size: 16px; color:#4f46e5;">Purchase Bill</h2>
-              <p style="margin:4px 0 0 0; font-size:11px; font-family:monospace; color:#64748b;">No: ${rec.invoice_no}</p>
-            </div>
-          </div>
-          <div class="details-grid">
-            <div>
-              <div><span>Supplier:</span> ${rec.supplier_name}</div>
-              <div><span>Purchase Type:</span> ${rec.purchase_type}</div>
-              <div><span>Destination Godown:</span> ${rec.branch_godown}</div>
-            </div>
-            <div>
-              <div><span>Invoice Date:</span> ${rec.invoice_date}</div>
-              <div><span>Pur. Entry Date:</span> ${rec.entry_date}</div>
-              <div><span>Vehicle No:</span> ${rec.vehicle_no || "—"}</div>
-            </div>
-          </div>
-
-          <table>
-            <thead>
-              <tr>
-                <th>Code</th>
-                <th>Item Description</th>
-                <th style="text-align: center;">Qty</th>
-                <th style="text-align: center;">Unit</th>
-                <th style="text-align: right;">Rate</th>
-                <th style="text-align: right;">Discount</th>
-                <th style="text-align: center;">SGST%</th>
-                <th style="text-align: center;">CGST%</th>
-                <th style="text-align: right;">SGST Amt</th>
-                <th style="text-align: right;">CGST Amt</th>
-                <th style="text-align: right;">Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${tableRows}
-            </tbody>
-          </table>
-
-          <div class="totals-panel">
-            <table>
-              <tr>
-                <td>Subtotal (Base):</td>
-                <td style="text-align: right;">&#8377;${rec.subtotal.toFixed(2)}</td>
-              </tr>
-              <tr>
-                <td>Discount (–):</td>
-                <td style="text-align: right; color:#dc2626;">–&#8377;${(rec.total_discount ?? 0).toFixed(2)}</td>
-              </tr>
-              <tr>
-                <td>Total SGST:</td>
-                <td style="text-align: right; color:#b45309;">&#8377;${(rec.total_sgst ?? 0).toFixed(2)}</td>
-              </tr>
-              <tr>
-                <td>Total CGST:</td>
-                <td style="text-align: right; color:#b45309;">&#8377;${(rec.total_cgst ?? 0).toFixed(2)}</td>
-              </tr>
-              <tr>
-                <td>Expenses (Freight/Overhead):</td>
-                <td style="text-align: right;">&#8377;${rec.expenses.toFixed(2)}</td>
-              </tr>
-              <tr class="bold">
-                <td>Net Amount:</td>
-                <td style="text-align: right;">&#8377;${rec.net_amount.toFixed(2)}</td>
-              </tr>
-              <tr>
-                <td>Paid:</td>
-                <td style="text-align: right; color: green; font-weight:600;">&#8377;${rec.paid_amount.toFixed(2)}</td>
-              </tr>
-              <tr>
-                <td>Payment Status:</td>
-                <td style="text-align: right; font-weight:700;">${rec.payment_status}</td>
-              </tr>
-            </table>
-          </div>
-          <script>
-            setTimeout(function() {
-              window.focus();
-              window.print();
-              window.close();
-            }, 300);
-          </script>
-        </body>
-      </html>
-    `);
-    printWindow.document.close();
   };
 
-  const handleDownloadPurchase = (rec: PurchaseRecord) => {
+  const handleDownloadPurchase = async (rec: PurchaseRecord) => {
     try {
-      const jsonString = JSON.stringify(rec, null, 2);
-      const blob = new Blob([jsonString], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const downloadAnchor = document.createElement("a");
-      downloadAnchor.href = url;
-      downloadAnchor.download = `purchase_invoice_${rec.invoice_no}.json`;
-      document.body.appendChild(downloadAnchor);
-      downloadAnchor.click();
-      document.body.removeChild(downloadAnchor);
-      URL.revokeObjectURL(url);
+      await exportPurchasePdf(
+        buildPurchaseHtml(rec, { renderMode: "pdf" }),
+        `purchase_bill_${rec.invoice_no}.pdf`,
+      );
     } catch (err) {
-      console.error("Failed to download purchase:", err);
-      alert("Failed to download purchase details.");
+      alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     }
   };
 
@@ -1039,6 +1622,124 @@ export default function PurchasePage() {
   const indexOfFirstItem = indexOfLastItem - itemsPerPage;
   const currentPurchases = filteredPurchases.slice(indexOfFirstItem, indexOfLastItem);
 
+  const resolvePurchaseStatementReport = (): {
+    records: PurchaseRecord[];
+    reportType: string;
+    periodLabel: string;
+    filenameSuffix: string;
+  } | null => {
+    const applyStatus = (list: PurchaseRecord[]) =>
+      statusFilter === "All" ? list : list.filter((p) => p.payment_status === statusFilter);
+
+    switch (reportMode) {
+      case "full":
+        return {
+          records: applyStatus([...purchases]),
+          reportType: "Complete Purchase Register",
+          periodLabel: "All Bills (Full Register)",
+          filenameSuffix: `full_${todayIso()}`,
+        };
+      case "current":
+        return {
+          records: [...filteredPurchases],
+          reportType: "Filtered Table View",
+          periodLabel: `Current filters — Status: ${statusFilter}, Search: ${searchQuery.trim() || "—"}`,
+          filenameSuffix: `filtered_${todayIso()}`,
+        };
+      case "date": {
+        const dated = applyStatus(filterPurchasesByDate(purchases, reportDate));
+        return {
+          records: dated,
+          reportType: "Daily Purchase Statement",
+          periodLabel: formatDocDate(reportDate),
+          filenameSuffix: `date_${reportDate}`,
+        };
+      }
+      case "month": {
+        const monthly = applyStatus(filterPurchasesByMonth(purchases, reportMonth));
+        return {
+          records: monthly,
+          reportType: "Monthly Purchase Statement",
+          periodLabel: formatMonthLabel(reportMonth),
+          filenameSuffix: `month_${reportMonth}`,
+        };
+      }
+      case "range": {
+        if (reportFrom > reportTo) {
+          setReportError("From date cannot be after To date.");
+          return null;
+        }
+        const ranged = applyStatus(filterPurchasesByRange(purchases, reportFrom, reportTo));
+        return {
+          records: ranged,
+          reportType: "Date Range Purchase Statement",
+          periodLabel: `${formatDocDate(reportFrom)} to ${formatDocDate(reportTo)}`,
+          filenameSuffix: `${reportFrom}_to_${reportTo}`,
+        };
+      }
+      default:
+        return null;
+    }
+  };
+
+  const buildPurchaseStatementDocument = () => {
+    const report = resolvePurchaseStatementReport();
+    if (!report) return null;
+    if (report.records.length === 0) {
+      setReportError("No purchase bills match the selected statement period.");
+      return null;
+    }
+    setReportError(null);
+    return buildPurchaseStatementHtml(
+      report.records,
+      buildPurchaseStatementMeta(
+        report.records,
+        report.reportType,
+        report.periodLabel,
+        statusFilter,
+        searchQuery.trim(),
+      ),
+      { renderMode: "pdf", helperText: "Generating purchase statement PDF..." },
+    );
+  };
+
+  const handlePrintStatement = async () => {
+    setReportBusy(true);
+    const report = resolvePurchaseStatementReport();
+    if (!report) { setReportBusy(false); return; }
+    const html = buildPurchaseStatementDocument();
+    if (!html) { setReportBusy(false); return; }
+    try {
+      await printPurchaseHtml(html, ".purchase-statement-sheet");
+      setIsReportModalOpen(false);
+    } catch (err) {
+      setReportError(err instanceof Error ? err.message : "Print failed.");
+    } finally {
+      setReportBusy(false);
+    }
+  };
+
+  const handleDownloadStatement = async () => {
+    setReportBusy(true);
+    const report = resolvePurchaseStatementReport();
+    if (!report) { setReportBusy(false); return; }
+    const html = buildPurchaseStatementDocument();
+    if (!html) { setReportBusy(false); return; }
+    try {
+      await exportPurchasePdf(
+        html,
+        `purchase_statement_${report.filenameSuffix}.pdf`,
+        ".purchase-statement-sheet",
+        false,
+      );
+      setIsReportModalOpen(false);
+    } catch (err) {
+      setReportError(err instanceof Error ? err.message : "PDF download failed.");
+    } finally {
+      setReportBusy(false);
+    }
+  };
+
   return (
     <div className="p-6 space-y-6">
       {/* ── Page Header ── */}
@@ -1053,16 +1754,27 @@ export default function PurchasePage() {
           </p>
         </div>
 
-        <button
-          onClick={() => {
-            resetForm();
-            setIsFormOpen(true);
-          }}
-          className="btn-primary bg-purple-600 hover:bg-purple-700 active:bg-purple-800 flex items-center gap-1.5 shadow-sm"
-        >
-          <Plus className="w-4 h-4" />
-          Log New Purchase
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => { setReportError(null); setIsReportModalOpen(true); }}
+            disabled={loading}
+            className="btn-secondary px-3 py-2 text-xs flex items-center gap-1.5"
+          >
+            <FileText className="w-3.5 h-3.5" />
+            Purchase Statement
+          </button>
+          <button
+            onClick={() => {
+              resetForm();
+              setIsFormOpen(true);
+            }}
+            className="btn-primary bg-purple-600 hover:bg-purple-700 active:bg-purple-800 flex items-center gap-1.5 shadow-sm"
+          >
+            <Plus className="w-4 h-4" />
+            Log New Purchase
+          </button>
+        </div>
       </div>
 
       {/* ── DB Status Notice ── */}
@@ -1750,7 +2462,7 @@ export default function PurchasePage() {
                           type="button"
                           onClick={() => handleDownloadPurchase(rec)}
                           className="text-slate-500 hover:text-slate-900 hover:bg-slate-100 p-1.5 rounded transition-all"
-                          title="Download JSON Spec"
+                          title="Download PDF"
                         >
                           <Download className="w-3.5 h-3.5" />
                         </button>
@@ -1991,6 +2703,14 @@ export default function PurchasePage() {
             <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 bg-slate-50 p-4 rounded-b-xl sticky bottom-0">
               <button
                 type="button"
+                onClick={() => handleDownloadPurchase(viewingPurchase)}
+                className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Download PDF
+              </button>
+              <button
+                type="button"
                 onClick={() => handlePrintPurchase(viewingPurchase)}
                 className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
               >
@@ -2003,6 +2723,112 @@ export default function PurchasePage() {
                 className="btn-primary bg-slate-950 hover:bg-slate-800 active:bg-slate-900 px-6 py-2 font-bold shadow-sm text-white transition-colors rounded text-xs"
               >
                 Close View
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Purchase Statement Modal ── */}
+      {isReportModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px]">
+          <div className="absolute inset-0" onClick={() => setIsReportModalOpen(false)} />
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-lg w-full z-10 flex flex-col font-sans animate-in fade-in zoom-in-95 duration-150">
+            <div className="bg-purple-700 px-5 py-4 text-white rounded-t-xl flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-bold tracking-tight flex items-center gap-2">
+                  <FileText className="w-4 h-4" />
+                  Download Purchase Statement
+                </h2>
+                <p className="text-[10px] text-purple-100 mt-0.5">Account-style PDF with full purchase bill details</p>
+              </div>
+              <button type="button" onClick={() => setIsReportModalOpen(false)}
+                className="text-purple-100 hover:text-white p-1.5 rounded-lg hover:bg-white/10">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {reportError && (
+                <div className="bg-red-50 border border-red-200 text-red-800 text-xs px-3 py-2 rounded-md flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                  <span>{reportError}</span>
+                </div>
+              )}
+
+              <div>
+                <label className="form-label text-xs font-semibold text-slate-700 mb-2 block">Statement Type</label>
+                <div className="space-y-2">
+                  {([
+                    ["full", "Full Register", "All purchase bills in the system"],
+                    ["date", "By Date", "Bills entered on a specific date"],
+                    ["month", "By Month", "Bills in a calendar month"],
+                    ["range", "Date Range", "Bills between two dates"],
+                    ["current", "Current Table Filter", "Uses search & payment status filters"],
+                  ] as const).map(([mode, title, desc]) => (
+                    <label key={mode}
+                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                        reportMode === mode ? "border-purple-600 bg-purple-50" : "border-slate-200 hover:bg-slate-50"
+                      }`}>
+                      <input type="radio" name="purchaseReportMode" value={mode} checked={reportMode === mode}
+                        onChange={() => { setReportMode(mode); setReportError(null); }}
+                        className="mt-0.5" />
+                      <span>
+                        <span className="text-xs font-bold text-slate-800 block">{title}</span>
+                        <span className="text-[10px] text-slate-500">{desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {reportMode === "date" && (
+                <div>
+                  <label className="form-label text-xs">Entry Date</label>
+                  <input type="date" value={reportDate} onChange={(e) => setReportDate(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "month" && (
+                <div>
+                  <label className="form-label text-xs">Month</label>
+                  <input type="month" value={reportMonth} onChange={(e) => setReportMonth(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {reportMode === "range" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="form-label text-xs">From Date</label>
+                    <input type="date" value={reportFrom} onChange={(e) => setReportFrom(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                  <div>
+                    <label className="form-label text-xs">To Date</label>
+                    <input type="date" value={reportTo} min={reportFrom} onChange={(e) => setReportTo(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Statement includes entry date, invoice no, supplier, godown, item count, subtotal, GST, net amount, paid, balance, and status — with period totals and signatory.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-200 bg-slate-50 rounded-b-xl">
+              <button type="button" onClick={() => setIsReportModalOpen(false)} className="btn-secondary px-4 text-xs">
+                Cancel
+              </button>
+              <button type="button" onClick={handlePrintStatement} disabled={reportBusy}
+                className="btn-secondary px-4 text-xs flex items-center gap-1.5 disabled:opacity-50">
+                <Printer className="w-3.5 h-3.5" /> Print
+              </button>
+              <button type="button" onClick={handleDownloadStatement} disabled={reportBusy}
+                className="btn-primary bg-purple-600 hover:bg-purple-700 px-4 text-xs flex items-center gap-1.5 disabled:opacity-50">
+                <Download className="w-3.5 h-3.5" /> Download PDF
               </button>
             </div>
           </div>
