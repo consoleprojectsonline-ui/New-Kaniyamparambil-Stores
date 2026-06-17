@@ -48,12 +48,11 @@ export default function DashboardPage() {
         let customersCount = 0;
         const missingTables: string[] = [];
 
-        // 1. Fetch sales and calculate today's sales, monthly revenue, sellers, and customers
+        // 1. Fetch sales and calculate today's sales, monthly revenue, and customers
         try {
           const salesRows: Array<{
             created_at: string;
             grand_total: number | string;
-            salesman?: string | null;
             customer_name?: string | null;
           }> = [];
           const pageSize = 1000;
@@ -62,7 +61,7 @@ export default function DashboardPage() {
           while (true) {
             const { data: page, error: salesError } = await supabase
               .from("sales")
-              .select("grand_total, created_at, salesman, customer_name")
+              .select("grand_total, created_at, customer_name")
               .order("created_at", { ascending: false })
               .range(from, from + pageSize - 1);
 
@@ -89,7 +88,6 @@ export default function DashboardPage() {
             startOfMonth.setDate(1);
             startOfMonth.setHours(0, 0, 0, 0);
 
-            const uniqueSellers = new Set<string>();
             const uniqueCustomers = new Set<string>();
 
             salesRows.forEach((sale) => {
@@ -103,18 +101,54 @@ export default function DashboardPage() {
                 monthlyRevenueSum += amount;
               }
 
-              const seller = sale.salesman?.trim();
-              if (seller) uniqueSellers.add(seller);
-
               const customer = sale.customer_name?.trim();
               if (customer) uniqueCustomers.add(customer);
             });
 
-            sellersCount = uniqueSellers.size;
             customersCount = uniqueCustomers.size;
           }
         } catch (err) {
           console.error("Sales fetch execution failed:", err);
+        }
+
+        // 2. Fetch purchases and count unique suppliers (sellers)
+        try {
+          const purchaseRows: Array<{ supplier_name?: string | null }> = [];
+          const pageSize = 1000;
+          let from = 0;
+
+          while (true) {
+            const { data: page, error: purchasesError } = await supabase
+              .from("purchases")
+              .select("supplier_name")
+              .order("created_at", { ascending: false })
+              .range(from, from + pageSize - 1);
+
+            if (purchasesError) {
+              if (isMissingTableError(purchasesError)) {
+                missingTables.push("purchases");
+              } else {
+                console.error("Error fetching purchases:", purchasesError);
+              }
+              break;
+            }
+
+            if (!page?.length) break;
+            purchaseRows.push(...page);
+            if (page.length < pageSize) break;
+            from += pageSize;
+          }
+
+          if (purchaseRows.length > 0) {
+            const uniqueSuppliers = new Set<string>();
+            purchaseRows.forEach((purchase) => {
+              const supplier = purchase.supplier_name?.trim();
+              if (supplier) uniqueSuppliers.add(supplier);
+            });
+            sellersCount = uniqueSuppliers.size;
+          }
+        } catch (err) {
+          console.error("Purchases fetch execution failed:", err);
         }
 
         if (missingTables.length > 0) {

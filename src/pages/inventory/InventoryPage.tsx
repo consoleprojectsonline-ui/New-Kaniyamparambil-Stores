@@ -1099,11 +1099,12 @@ export default function InventoryPage() {
 
   // Filtered Items
   const filteredItems = items.filter((item) => {
+    const q = searchQuery.toLowerCase();
     const matchesSearch =
-      item.code.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.brand.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.company_code.toLowerCase().includes(searchQuery.toLowerCase());
+      (item.code ?? "").toLowerCase().includes(q) ||
+      (item.name ?? "").toLowerCase().includes(q) ||
+      (item.brand ?? "").toLowerCase().includes(q) ||
+      (item.company_code ?? "").toLowerCase().includes(q);
 
     const matchesGroup = selectedGroup === "All" || item.group === selectedGroup;
 
