@@ -2093,22 +2093,25 @@ export default function SalesPage() {
     const fCessNum  = Number(fCess)      || 0;
     const commNum   = Number(commission) || 0;
     const postNum   = Number(postage)    || 0;
-    const rawTotal  = linesTotal - discNum + fCessNum + commNum + postNum;
-    const roundOff  = Math.round(rawTotal) - rawTotal;
-    const grandTotal = rawTotal + roundOff;
+    const rawTotal = linesTotal - discNum + fCessNum + commNum + postNum;
+    const rawTotalPaise = Math.round(rawTotal * 100) / 100;
+    const grandTotal = Math.round(rawTotalPaise);
+    const roundOff = Math.round((grandTotal - rawTotalPaise) * 100) / 100;
     return {
       subtotal: Math.round(sub * 100) / 100,
       totalGst: Math.round(totalGst * 100) / 100,
       linesTotal: Math.round(linesTotal * 100) / 100,
-      roundOff: Math.round(roundOff * 100) / 100,
-      grandTotal: Math.round(grandTotal * 100) / 100,
+      roundOff,
+      grandTotal,
     };
   }, [gridItems, discount, fCess, commission, postage]);
 
-  // Auto-fill payment amount
+  // Auto-fill payment amount for new bills (rounded grand total)
   useEffect(() => {
-    if (calc.grandTotal > 0) setPaymentAmount(String(calc.grandTotal));
-  }, [calc.grandTotal]);
+    if (!editingSale && isFormOpen && calc.grandTotal > 0) {
+      setPaymentAmount(String(calc.grandTotal));
+    }
+  }, [calc.grandTotal, editingSale, isFormOpen]);
 
   // ── Reset form ──
   const resetForm = () => {
