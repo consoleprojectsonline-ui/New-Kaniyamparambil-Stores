@@ -19,7 +19,7 @@ import {
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
-import { formatCurrency } from "@/lib/utils";
+import { formatCurrency, formatTableDate } from "@/lib/utils";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1627,8 +1627,8 @@ export default function QuotationPage() {
                   <td className="px-4 py-2.5 font-mono font-semibold text-center">{rec.quotation_no}</td>
                   <td className="px-4 py-2.5 font-mono text-center text-text-secondary">{rec.serial_no}</td>
                   <td className="px-4 py-2.5 font-medium text-center truncate max-w-[140px]" title={rec.customer_name}>{rec.customer_name}</td>
-                  <td className="px-4 py-2.5 font-mono text-center text-text-secondary">{rec.quotation_date}</td>
-                  <td className="px-4 py-2.5 font-mono text-center text-text-secondary">{rec.valid_till}</td>
+                  <td className="px-4 py-2.5 font-mono text-center text-text-secondary">{formatTableDate(rec.quotation_date)}</td>
+                  <td className="px-4 py-2.5 font-mono text-center text-text-secondary">{formatTableDate(rec.valid_till)}</td>
                   <td className="px-4 py-2.5 text-center font-mono font-bold">{formatCurrency(rec.net_amount)}</td>
                   <td className="px-4 py-2.5 text-center">
                     <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold ${statusBadgeClass(rec.status)}`}>
@@ -1969,8 +1969,8 @@ export default function QuotationPage() {
                 {[
                   ["Quotation No.", viewingQuotation.quotation_no],
                   ["Serial", viewingQuotation.serial_no],
-                  ["Date", viewingQuotation.quotation_date],
-                  ["Valid Till", viewingQuotation.valid_till],
+                  ["Date", formatTableDate(viewingQuotation.quotation_date)],
+                  ["Valid Till", formatTableDate(viewingQuotation.valid_till)],
                   ["Ref No.", viewingQuotation.ref_no || "—"],
                   ["Rate Type", viewingQuotation.rate_type],
                   ["Customer", viewingQuotation.customer_name],

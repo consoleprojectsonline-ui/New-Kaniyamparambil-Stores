@@ -20,7 +20,7 @@ import {
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
-import { formatCurrency } from "@/lib/utils";
+import { formatCurrency, formatTableDate } from "@/lib/utils";
 
 interface InventoryItem {
   code: string;
@@ -2412,7 +2412,7 @@ export default function PurchasePage() {
                     <td className="px-4 py-2.5 text-text-secondary text-center truncate max-w-[140px] mx-auto" title={rec.branch_godown}>
                       {rec.branch_godown}
                     </td>
-                    <td className="px-4 py-2.5 text-text-secondary font-mono text-center">{rec.invoice_date}</td>
+                    <td className="px-4 py-2.5 text-text-secondary font-mono text-center">{formatTableDate(rec.invoice_date)}</td>
                     <td className="px-4 py-2.5 text-center font-mono font-semibold text-green-700">
                       {formatCurrency(rec.paid_amount)}
                     </td>
@@ -2575,11 +2575,11 @@ export default function PurchasePage() {
                 </div>
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Invoice Date</span>
-                  <span className="font-mono text-slate-700">{viewingPurchase.invoice_date}</span>
+                  <span className="font-mono text-slate-700">{formatTableDate(viewingPurchase.invoice_date)}</span>
                 </div>
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Pur. Entry Date</span>
-                  <span className="font-mono text-slate-700">{viewingPurchase.entry_date}</span>
+                  <span className="font-mono text-slate-700">{formatTableDate(viewingPurchase.entry_date)}</span>
                 </div>
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Vehicle No</span>

@@ -14,13 +14,29 @@ export function formatCurrency(amount: number): string {
   }).format(amount);
 }
 
+export function formatTableDate(value: string | Date | null | undefined): string {
+  if (value == null || value === "") return "—";
+
+  if (typeof value === "string") {
+    const isoMatch = /^(\d{4})-(\d{2})-(\d{2})/.exec(value.trim());
+    if (isoMatch) {
+      return `${isoMatch[3]}-${isoMatch[2]}-${isoMatch[1]}`;
+    }
+  }
+
+  const d = typeof value === "string"
+    ? new Date(value.includes("T") ? value : `${value.slice(0, 10)}T00:00:00`)
+    : value;
+  if (Number.isNaN(d.getTime())) return String(value);
+
+  const day = String(d.getDate()).padStart(2, "0");
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const year = d.getFullYear();
+  return `${day}-${month}-${year}`;
+}
+
 export function formatDate(date: Date | string): string {
-  const d = typeof date === "string" ? new Date(date) : date;
-  return new Intl.DateTimeFormat("en-IN", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-  }).format(d);
+  return formatTableDate(date);
 }
 
 export function formatNumber(n: number): string {

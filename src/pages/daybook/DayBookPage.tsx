@@ -20,7 +20,7 @@ import {
   FileText,
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
-import { formatCurrency } from "@/lib/utils";
+import { formatCurrency, formatTableDate } from "@/lib/utils";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 
@@ -1578,7 +1578,7 @@ export default function DayBookPage() {
               ) : (
                 currentTransactions.map((tx) => (
                   <tr key={tx.id} className="border-b border-border hover:bg-gray-50/50 transition-colors">
-                    <td className="px-4 py-2.5 font-semibold text-text-secondary font-mono text-center">{tx.date}</td>
+                    <td className="px-4 py-2.5 font-semibold text-text-secondary font-mono text-center">{formatTableDate(tx.date)}</td>
                     <td className="px-4 py-2.5 text-center">
                       <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold border ${
                         tx.category === "Sales"
@@ -1862,7 +1862,7 @@ export default function DayBookPage() {
                 </div>
                 <div className="border-b border-slate-100 pb-2">
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Transaction Date</span>
-                  <span className="font-mono text-slate-700">{viewingTransaction.date}</span>
+                  <span className="font-mono text-slate-700">{formatTableDate(viewingTransaction.date)}</span>
                 </div>
                 <div className="col-span-2 border-b border-slate-100 pb-2">
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Description</span>

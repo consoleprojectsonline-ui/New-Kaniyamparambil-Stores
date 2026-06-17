@@ -2,11 +2,12 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Receipt, Plus, Search, Filter, Trash2, AlertTriangle, Check,
   Database, Calendar, Eye, Download, Printer, X, Edit, User, Truck, FileText,
+  ArrowUp, ArrowDown, ArrowUpDown,
 } from "lucide-react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
-import { formatCurrency } from "@/lib/utils";
+import { formatCurrency, formatTableDate } from "@/lib/utils";
 import upiQrUrl from "@/assets/upi-qr.png";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -34,6 +35,7 @@ export interface SaleRecord {
   customer_phone?: string;
   ship_to?: string;
   salesman?: string;
+  vehicle_no?: string;
   branch_godown: string;
   rate_tp: string;
   items: SaleItem[];
@@ -65,6 +67,19 @@ const RATE_TP_OPTIONS = [
   { value: "GST_28",      label: "GST @ 28%" },
   { value: "Exempt",      label: "GST Exempt (0%)" },
 ];
+
+function gstRatesFromRateTp(rateTp: string): { sgst: number; cgst: number } | null {
+  const map: Record<string, { sgst: number; cgst: number }> = {
+    GST_5: { sgst: 2.5, cgst: 2.5 },
+    GST_12: { sgst: 6, cgst: 6 },
+    GST_18: { sgst: 9, cgst: 9 },
+    GST_28: { sgst: 14, cgst: 14 },
+    Exempt: { sgst: 0, cgst: 0 },
+  };
+  return map[rateTp] ?? null;
+}
+
+const TRAVEL_EXPENSE_LABEL = "Travel Expense";
 
 const BRANCHES_GODOWNS = [
   "Shop (Main Showroom)",
@@ -257,7 +272,8 @@ function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): 
   const billedAddress = rec.ship_to || store.customerAddress;
   const shippedAddress = rec.ship_to || billedAddress;
   const customerGstin = store.customerGstin.includes("â") ? "-" : store.customerGstin;
-  const vehicleNo = store.vehicleNo.includes("â") ? "-" : store.vehicleNo;
+  const vehicleNo = rec.vehicle_no?.trim()
+    || (store.vehicleNo.includes("â") ? "-" : store.vehicleNo);
   const placeOfSupply = `${store.customerCode}-${store.customerState.toUpperCase()}`;
   const lineSummaries = rec.items.map(getSaleItemSummary);
   const totalQuantity = lineSummaries.reduce((sum, item) => sum + item.quantity, 0);
@@ -716,7 +732,7 @@ function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): 
                 </tr>
                 ${rec.f_cess > 0 ? `<tr><td class="sum-label">F.Cess</td><td class="sum-value">${formatCurrency(rec.f_cess)}</td></tr>` : ""}
                 ${rec.commission > 0 ? `<tr><td class="sum-label">Commission</td><td class="sum-value">${formatCurrency(rec.commission)}</td></tr>` : ""}
-                ${rec.postage > 0 ? `<tr><td class="sum-label">Postage</td><td class="sum-value">${formatCurrency(rec.postage)}</td></tr>` : ""}
+                ${rec.postage > 0 ? `<tr><td class="sum-label">${TRAVEL_EXPENSE_LABEL}</td><td class="sum-value">${formatCurrency(rec.postage)}</td></tr>` : ""}
                 ${rec.discount > 0 ? `<tr><td class="sum-label">Bill Discount</td><td class="sum-value">${formatCurrency(rec.discount)}</td></tr>` : ""}
                 ${rec.round_off !== 0 ? `<tr><td class="sum-label">Round Off</td><td class="sum-value">${formatCurrency(rec.round_off)}</td></tr>` : ""}
                 <tr class="total-row">
@@ -894,6 +910,34 @@ async function waitForInvoiceFrame(html: string): Promise<HTMLIFrameElement> {
 // ─── Sales Statement (account-style register) ────────────────────────────────
 
 type SalesReportMode = "full" | "date" | "month" | "range" | "current";
+type SalesListDateFilter = "all" | "date" | "month" | "range";
+type SalesSortKey = "bill_no" | "form_type" | "customer_name" | "bill_date" | "salesman" | "grand_total" | "payment_amount" | "payment_status";
+type SortDir = "asc" | "desc";
+
+const SALES_TABLE_COLUMNS: { key: SalesSortKey | null; label: string }[] = [
+  { key: "bill_no", label: "Bill No." },
+  { key: "form_type", label: "Form Type" },
+  { key: "customer_name", label: "Customer" },
+  { key: "bill_date", label: "Date" },
+  { key: "salesman", label: "Salesman" },
+  { key: "grand_total", label: "Grand Total (₹)" },
+  { key: "payment_amount", label: "Payment" },
+  { key: "payment_status", label: "Status" },
+  { key: null, label: "Actions" },
+];
+
+const SALES_FETCH_PAGE_SIZE = 1000;
+
+async function detectSalesDbColumns(): Promise<{ hasVehicleNo: boolean }> {
+  const { error } = await supabase.from("sales").select("vehicle_no").limit(1);
+  return { hasVehicleNo: !error };
+}
+
+function buildSupabaseSaleRow(payload: SaleRecord, hasVehicleNo: boolean): Record<string, unknown> {
+  const row: Record<string, unknown> = { ...payload };
+  if (!hasVehicleNo) delete row.vehicle_no;
+  return row;
+}
 
 type SalesStatementMeta = {
   reportTitle: string;
@@ -938,6 +982,48 @@ function filterSalesByRange(salesList: SaleRecord[], from: string, to: string): 
   });
 }
 
+function compareBillNo(a: string, b: string): number {
+  const parse = (value: string) => {
+    const match = value.match(/^BILL-(\d+)-(\d+)$/i);
+    if (match) return { year: Number(match[1]), num: Number(match[2]), raw: value };
+    return { year: 0, num: 0, raw: value };
+  };
+  const left = parse(a);
+  const right = parse(b);
+  if (left.year !== right.year) return left.year - right.year;
+  if (left.num !== right.num) return left.num - right.num;
+  return left.raw.localeCompare(right.raw, undefined, { numeric: true, sensitivity: "base" });
+}
+
+function defaultSortDir(key: SalesSortKey): SortDir {
+  return key === "bill_no" || key === "bill_date" || key === "grand_total" || key === "payment_amount"
+    ? "desc"
+    : "asc";
+}
+
+function compareSalesRecords(a: SaleRecord, b: SaleRecord, key: SalesSortKey): number {
+  switch (key) {
+    case "bill_no":
+      return compareBillNo(a.bill_no, b.bill_no);
+    case "form_type":
+      return a.form_type.localeCompare(b.form_type, undefined, { sensitivity: "base" });
+    case "customer_name":
+      return a.customer_name.localeCompare(b.customer_name, undefined, { sensitivity: "base" });
+    case "bill_date":
+      return (saleBillDate(a) ?? "").localeCompare(saleBillDate(b) ?? "");
+    case "salesman":
+      return (a.salesman ?? "").localeCompare(b.salesman ?? "", undefined, { sensitivity: "base" });
+    case "grand_total":
+      return a.grand_total - b.grand_total;
+    case "payment_amount":
+      return a.payment_amount - b.payment_amount;
+    case "payment_status":
+      return a.payment_status.localeCompare(b.payment_status, undefined, { sensitivity: "base" });
+    default:
+      return 0;
+  }
+}
+
 function formatMonthLabel(monthYm: string): string {
   const [year, month] = monthYm.split("-");
   const d = new Date(Number(year), Number(month) - 1, 1);
@@ -964,9 +1050,9 @@ function buildSalesStatementMeta(
     searchQuery,
     generatedOn: formatStatementGeneratedOn(),
     totalBills: salesList.length,
-    totalSales: salesList.reduce((sum, s) => sum + s.grand_total, 0),
-    totalCollected: salesList.reduce((sum, s) => sum + s.payment_amount, 0),
-    totalOutstanding: salesList.reduce((sum, s) => sum + s.balance, 0),
+    totalSales: sumSaleGrandTotals(salesList),
+    totalCollected: salesList.reduce((sum, s) => sum + toDbNumber(s.payment_amount), 0),
+    totalOutstanding: salesList.reduce((sum, s) => sum + toDbNumber(s.balance), 0),
   };
 }
 
@@ -1301,6 +1387,43 @@ async function printSalesStatementHtml(html: string): Promise<void> {
   }
 }
 
+function toDbNumber(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** Sum of `grand_total` exactly as stored on each sales row (Supabase source of truth). */
+function readSaleGrandTotal(sale: SaleRecord): number {
+  return toDbNumber(sale.grand_total);
+}
+
+function sumSaleGrandTotals(salesList: SaleRecord[]): number {
+  const total = salesList.reduce((sum, sale) => sum + readSaleGrandTotal(sale), 0);
+  return Math.round(total * 100) / 100;
+}
+
+function normalizeSaleItem(raw: Record<string, unknown>): SaleItem {
+  const gstPercent = toDbNumber(raw.gst_percent);
+  const hasSplitGst = raw.sgst != null || raw.cgst != null;
+  const sgst = hasSplitGst ? toDbNumber(raw.sgst) : (gstPercent > 0 ? gstPercent / 2 : 0);
+  const cgst = hasSplitGst ? toDbNumber(raw.cgst) : (gstPercent > 0 ? gstPercent / 2 : 0);
+
+  return {
+    code: String(raw.code ?? ""),
+    name: String(raw.name ?? ""),
+    hsn_code: String(raw.hsn_code ?? ""),
+    qty: toDbNumber(raw.qty) || 1,
+    unit: String(raw.unit ?? "Nos"),
+    rate: toDbNumber(raw.rate),
+    amount: toDbNumber(raw.amount),
+    disc_pct: toDbNumber(raw.disc_pct),
+    mrp: toDbNumber(raw.mrp),
+    sgst,
+    cgst,
+    line_total: toDbNumber(raw.line_total),
+  };
+}
+
 function blankItem(): SaleItem {
   return { code: "", name: "", hsn_code: "", qty: 1, unit: "Nos", rate: 0,
     amount: 0, disc_pct: 0, mrp: 0, sgst: 9, cgst: 9, line_total: 0 };
@@ -1309,21 +1432,9 @@ function blankItem(): SaleItem {
 function normalizeSale(raw: Record<string, unknown>): SaleRecord {
   let items: SaleItem[] = [];
   if (Array.isArray(raw.items) && raw.items.length > 0) {
-    items = (raw.items as Record<string, unknown>[]).map((it) => ({
-      code: String(it.code ?? ""),
-      name: String(it.name ?? ""),
-      hsn_code: String(it.hsn_code ?? ""),
-      qty: Number(it.qty ?? 1),
-      unit: String(it.unit ?? "Nos"),
-      rate: Number(it.rate ?? 0),
-      amount: Number(it.amount ?? 0),
-      disc_pct: Number(it.disc_pct ?? 0),
-      mrp: Number(it.mrp ?? 0),
-      sgst: Number(it.sgst ?? 0),
-      cgst: Number(it.cgst ?? 0),
-      line_total: Number(it.line_total ?? 0),
-    }));
+    items = (raw.items as Record<string, unknown>[]).map(normalizeSaleItem);
   }
+  const grandTotal = toDbNumber(raw.grand_total ?? raw.total_amount);
   return {
     bill_no: String(raw.bill_no ?? raw.invoice_no ?? ""),
     form_type: String(raw.form_type ?? "Tax Invoice"),
@@ -1332,20 +1443,21 @@ function normalizeSale(raw: Record<string, unknown>): SaleRecord {
     customer_phone: raw.customer_phone ? String(raw.customer_phone) : "",
     ship_to: raw.ship_to ? String(raw.ship_to) : "",
     salesman: raw.salesman ? String(raw.salesman) : "",
+    vehicle_no: raw.vehicle_no ? String(raw.vehicle_no) : undefined,
     branch_godown: String(raw.branch_godown ?? "Shop (Main Showroom)"),
     rate_tp: String(raw.rate_tp ?? "Retail"),
     items,
-    subtotal: Number(raw.subtotal ?? raw.amount ?? 0),
-    f_cess: Number(raw.f_cess ?? 0),
-    discount: Number(raw.discount ?? 0),
-    total_gst: Number(raw.total_gst ?? raw.tax_amount ?? 0),
-    commission: Number(raw.commission ?? 0),
-    postage: Number(raw.postage ?? 0),
-    round_off: Number(raw.round_off ?? 0),
-    grand_total: Number(raw.grand_total ?? raw.amount ?? 0),
-    payment_amount: Number(raw.payment_amount ?? raw.grand_total ?? raw.amount ?? 0),
+    subtotal: toDbNumber(raw.subtotal),
+    f_cess: toDbNumber(raw.f_cess),
+    discount: toDbNumber(raw.discount),
+    total_gst: toDbNumber(raw.total_gst ?? raw.tax_amount),
+    commission: toDbNumber(raw.commission),
+    postage: toDbNumber(raw.postage),
+    round_off: toDbNumber(raw.round_off),
+    grand_total: grandTotal,
+    payment_amount: toDbNumber(raw.payment_amount ?? grandTotal),
     payment_mode: String(raw.payment_mode ?? "Cash"),
-    balance: Number(raw.balance ?? 0),
+    balance: toDbNumber(raw.balance),
     payment_status: String(raw.payment_status ?? "Paid"),
     created_at: raw.created_at ? String(raw.created_at) : undefined,
   };
@@ -1444,6 +1556,8 @@ export default function SalesPage() {
   const [loading, setLoading] = useState(true);
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [dbStatus, setDbStatus] = useState<"connected" | "local">("connected");
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const salesDbColumnsRef = useRef({ hasVehicleNo: false });
   const [editingSale, setEditingSale] = useState<SaleRecord | null>(null);
   const [viewingSale, setViewingSale] = useState<SaleRecord | null>(null);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
@@ -1469,10 +1583,28 @@ export default function SalesPage() {
   // Search & filter
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
+  const [dateFilterMode, setDateFilterMode] = useState<SalesListDateFilter>("all");
+  const [filterDate, setFilterDate] = useState(todayIso);
+  const [filterMonth, setFilterMonth] = useState(() => todayIso().slice(0, 7));
+  const [filterFrom, setFilterFrom] = useState(() => `${todayIso().slice(0, 7)}-01`);
+  const [filterTo, setFilterTo] = useState(todayIso);
+  const [sortKey, setSortKey] = useState<SalesSortKey>("bill_no");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 10;
 
-  useEffect(() => { setTimeout(() => setCurrentPage(1), 0); }, [searchQuery, statusFilter]);
+  const handleSort = (key: SalesSortKey) => {
+    if (sortKey === key) {
+      setSortDir((dir) => (dir === "asc" ? "desc" : "asc"));
+      return;
+    }
+    setSortKey(key);
+    setSortDir(defaultSortDir(key));
+  };
+
+  useEffect(() => {
+    setTimeout(() => setCurrentPage(1), 0);
+  }, [searchQuery, statusFilter, dateFilterMode, filterDate, filterMonth, filterFrom, filterTo, sortKey, sortDir]);
 
   // ── Header form fields ──
   const [billNo, setBillNo] = useState("");
@@ -1483,6 +1615,7 @@ export default function SalesPage() {
   const [customCustomerText, setCustomCustomerText] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [shipTo, setShipTo] = useState("");
+  const [vehicleNo, setVehicleNo] = useState("");
   const [salesman, setSalesman] = useState("Manager");
   const [isCustomSalesman, setIsCustomSalesman] = useState(false);
   const [customSalesmanText, setCustomSalesmanText] = useState("");
@@ -1600,11 +1733,44 @@ export default function SalesPage() {
   const fetchSales = useCallback(async () => {
     try {
       setLoading(true);
-      const { data, error } = await supabase.from("sales").select("*").order("created_at", { ascending: false });
-      if (error) { setDbStatus("local"); loadLocalSales(); }
-      else if (data) { setSales((data as Record<string, unknown>[]).map(normalizeSale)); setDbStatus("connected"); }
-    } catch { setDbStatus("local"); loadLocalSales(); }
-    finally { setLoading(false); }
+      setFetchError(null);
+      const rows: Record<string, unknown>[] = [];
+      let from = 0;
+
+      while (true) {
+        const { data, error } = await supabase
+          .from("sales")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .range(from, from + SALES_FETCH_PAGE_SIZE - 1);
+
+        if (error) {
+          setFetchError(error.message);
+          setDbStatus("local");
+          loadLocalSales();
+          return;
+        }
+
+        if (!data?.length) break;
+        rows.push(...(data as Record<string, unknown>[]));
+        if (data.length < SALES_FETCH_PAGE_SIZE) break;
+        from += SALES_FETCH_PAGE_SIZE;
+      }
+
+      const schema = await detectSalesDbColumns();
+      salesDbColumnsRef.current = schema;
+
+      const normalized = rows.map(normalizeSale);
+      setSales(normalized);
+      setDbStatus("connected");
+      localStorage.setItem("kaniyamparambil_sales_v2", JSON.stringify(rows));
+    } catch (err) {
+      setFetchError(err instanceof Error ? err.message : "Failed to load sales from Supabase.");
+      setDbStatus("local");
+      loadLocalSales();
+    } finally {
+      setLoading(false);
+    }
   }, [loadLocalSales]);
 
   useEffect(() => {
@@ -1665,26 +1831,38 @@ export default function SalesPage() {
     }));
   };
 
-  // ── Live calculations ──
+  const handleRateTpChange = (nextRateTp: string) => {
+    setRateTp(nextRateTp);
+    const rates = gstRatesFromRateTp(nextRateTp);
+    if (!rates) return;
+    setGridItems((prev) => prev.map((item) => {
+      const updated = { ...item, sgst: rates.sgst, cgst: rates.cgst };
+      return { ...updated, ...computeLineAutos(updated) };
+    }));
+  };
+
+  // ── Live calculations (derived from edited unit price × qty per line) ──
   const calc = useMemo(() => {
-    let sub = 0, totalGst = 0;
+    let sub = 0;
+    let totalGst = 0;
+    let linesTotal = 0;
     gridItems.forEach((item) => {
-      const mrpAmt  = item.qty * item.mrp;                          // qty × MRP = selling value
-      const discAmt = mrpAmt * ((item.disc_pct || 0) / 100);       // discount on MRP
-      const taxable = Math.max(0, mrpAmt - discAmt);               // taxable = MRP - discount
-      sub      += taxable;
-      totalGst += taxable * (((item.sgst ?? 0) + (item.cgst ?? 0)) / 100);
+      const summary = getSaleItemSummary(item);
+      sub += summary.taxableValue;
+      totalGst += summary.cgstAmount + summary.sgstAmount;
+      linesTotal += summary.total;
     });
     const discNum   = Number(discount)   || 0;
     const fCessNum  = Number(fCess)      || 0;
     const commNum   = Number(commission) || 0;
     const postNum   = Number(postage)    || 0;
-    const rawTotal  = sub - discNum + totalGst + fCessNum + commNum + postNum;
+    const rawTotal  = linesTotal - discNum + fCessNum + commNum + postNum;
     const roundOff  = Math.round(rawTotal) - rawTotal;
     const grandTotal = rawTotal + roundOff;
     return {
       subtotal: Math.round(sub * 100) / 100,
       totalGst: Math.round(totalGst * 100) / 100,
+      linesTotal: Math.round(linesTotal * 100) / 100,
       roundOff: Math.round(roundOff * 100) / 100,
       grandTotal: Math.round(grandTotal * 100) / 100,
     };
@@ -1701,7 +1879,7 @@ export default function SalesPage() {
     setFormType("Tax Invoice");
     setBillDate(new Date().toISOString().split("T")[0]);
     setCustomerName(""); setIsCustomCustomer(false); setCustomCustomerText("");
-    setCustomerPhone(""); setShipTo("");
+    setCustomerPhone(""); setShipTo(""); setVehicleNo("");
     setSalesman("Manager"); setIsCustomSalesman(false); setCustomSalesmanText("");
     setBranchGodown("Shop (Main Showroom)"); setRateTp("Retail");
     setGridItems([blankItem()]);
@@ -1723,6 +1901,7 @@ export default function SalesPage() {
     else { setCustomerName("CUSTOM"); setIsCustomCustomer(true); setCustomCustomerText(rec.customer_name); }
     setCustomerPhone(rec.customer_phone ?? "");
     setShipTo(rec.ship_to ?? "");
+    setVehicleNo(rec.vehicle_no ?? "");
     if (SEED_SALESMEN.includes(rec.salesman ?? "")) { setSalesman(rec.salesman ?? "Manager"); setIsCustomSalesman(false); }
     else { setSalesman("CUSTOM"); setIsCustomSalesman(true); setCustomSalesmanText(rec.salesman ?? ""); }
     setBranchGodown(rec.branch_godown);
@@ -1752,6 +1931,8 @@ export default function SalesPage() {
     const bal = Math.max(0, calc.grandTotal - paidNum);
     const status = paidNum >= calc.grandTotal ? "Paid" : paidNum > 0 ? "Partial" : "Credit";
 
+    const itemsFinal = gridItems.map((item) => ({ ...item, ...computeLineAutos(item) }));
+
     const payload: SaleRecord = {
       bill_no: billNo,
       form_type: formType,
@@ -1760,9 +1941,10 @@ export default function SalesPage() {
       customer_phone: customerPhone.trim() || undefined,
       ship_to: shipTo.trim() || undefined,
       salesman: salesmanFinal || undefined,
+      vehicle_no: vehicleNo.trim() || undefined,
       branch_godown: branchGodown,
       rate_tp: rateTp,
-      items: gridItems,
+      items: itemsFinal,
       subtotal: calc.subtotal,
       f_cess: Number(fCess) || 0,
       discount: Number(discount) || 0,
@@ -1780,7 +1962,8 @@ export default function SalesPage() {
     if (editingSale) {
       if (dbStatus === "connected") {
         try {
-          const { error } = await supabase.from("sales").update(payload).eq("bill_no", editingSale.bill_no);
+          const row = buildSupabaseSaleRow(payload, salesDbColumnsRef.current.hasVehicleNo);
+          const { error } = await supabase.from("sales").update(row).eq("bill_no", editingSale.bill_no);
           if (error) throw error;
           setSuccessMsg(`Updated Bill "${billNo}" successfully!`);
           fetchSales(); resetForm();
@@ -1796,7 +1979,8 @@ export default function SalesPage() {
       if (sales.some((s) => s.bill_no === billNo)) { setFormError(`Bill No. "${billNo}" already exists.`); return; }
       if (dbStatus === "connected") {
         try {
-          const { error } = await supabase.from("sales").insert([payload]);
+          const row = buildSupabaseSaleRow(payload, salesDbColumnsRef.current.hasVehicleNo);
+          const { error } = await supabase.from("sales").insert([row]);
           if (error) throw error;
           setSuccessMsg(`Saved Bill "${billNo}" successfully!`);
           fetchSales(); resetForm();
@@ -1889,7 +2073,7 @@ export default function SalesPage() {
     <tr><td>Discount (–):</td><td style="text-align:right;color:#dc2626">–₹${rec.discount.toFixed(2)}</td></tr>
     <tr><td>GST & Cess:</td><td style="text-align:right;color:#b45309">₹${rec.total_gst.toFixed(2)}</td></tr>
     <tr><td>Commission:</td><td style="text-align:right">₹${rec.commission.toFixed(2)}</td></tr>
-    <tr><td>Postage:</td><td style="text-align:right">₹${rec.postage.toFixed(2)}</td></tr>
+    <tr><td>${TRAVEL_EXPENSE_LABEL}:</td><td style="text-align:right">₹${rec.postage.toFixed(2)}</td></tr>
     <tr><td>Round Off:</td><td style="text-align:right">${rec.round_off >= 0 ? "+" : ""}₹${rec.round_off.toFixed(2)}</td></tr>
     <tr class="bold"><td>Grand Total:</td><td style="text-align:right">₹${rec.grand_total.toFixed(2)}</td></tr>
     <tr><td>Payment:</td><td style="text-align:right;color:green">₹${rec.payment_amount.toFixed(2)}</td></tr>
@@ -1993,15 +2177,75 @@ export default function SalesPage() {
     }
   };
 
-  const filteredSales = useMemo(() => sales.filter((s) => {
-    const q = searchQuery.toLowerCase();
-    const matchQ = s.bill_no.toLowerCase().includes(q) || s.customer_name.toLowerCase().includes(q);
-    const matchS = statusFilter === "All" || s.payment_status === statusFilter;
-    return matchQ && matchS;
-  }), [sales, searchQuery, statusFilter]);
+  const listDateRangeInvalid = dateFilterMode === "range" && filterFrom > filterTo;
 
-  const totalPages = Math.ceil(filteredSales.length / itemsPerPage);
-  const currentSales = filteredSales.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+  const listPeriodLabel = useMemo(() => {
+    switch (dateFilterMode) {
+      case "date":
+        return formatTableDate(filterDate);
+      case "month":
+        return formatMonthLabel(filterMonth);
+      case "range":
+        return `${formatTableDate(filterFrom)} to ${formatTableDate(filterTo)}`;
+      default:
+        return null;
+    }
+  }, [dateFilterMode, filterDate, filterMonth, filterFrom, filterTo]);
+
+  const filteredSales = useMemo(() => {
+    if (listDateRangeInvalid) return [];
+
+    let list = sales;
+    switch (dateFilterMode) {
+      case "date":
+        list = filterSalesByDate(list, filterDate);
+        break;
+      case "month":
+        list = filterSalesByMonth(list, filterMonth);
+        break;
+      case "range":
+        list = filterSalesByRange(list, filterFrom, filterTo);
+        break;
+      default:
+        break;
+    }
+
+    return list.filter((s) => {
+      const q = searchQuery.toLowerCase();
+      const matchQ = s.bill_no.toLowerCase().includes(q) || s.customer_name.toLowerCase().includes(q);
+      const matchS = statusFilter === "All" || s.payment_status === statusFilter;
+      return matchQ && matchS;
+    });
+  }, [
+    sales,
+    searchQuery,
+    statusFilter,
+    dateFilterMode,
+    filterDate,
+    filterMonth,
+    filterFrom,
+    filterTo,
+    listDateRangeInvalid,
+  ]);
+
+  const sortedSales = useMemo(() => {
+    const list = [...filteredSales];
+    const multiplier = sortDir === "asc" ? 1 : -1;
+    list.sort((a, b) => compareSalesRecords(a, b, sortKey) * multiplier);
+    return list;
+  }, [filteredSales, sortKey, sortDir]);
+
+  const filteredSalesTotal = useMemo(
+    () => sumSaleGrandTotals(filteredSales),
+    [filteredSales],
+  );
+
+  const isFilteredView = dateFilterMode !== "all"
+    || statusFilter !== "All"
+    || searchQuery.trim().length > 0;
+
+  const totalPages = Math.ceil(sortedSales.length / itemsPerPage);
+  const currentSales = sortedSales.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
 
   const availableCustomers = useMemo(() =>
     Array.from(new Set([...SEED_CUSTOMERS, ...sales.map((s) => s.customer_name)])).filter(Boolean),
@@ -2028,7 +2272,9 @@ export default function SalesPage() {
         return {
           records: [...filteredSales],
           reportType: "Filtered Table View",
-          periodLabel: `Current filters — Status: ${statusFilter}, Search: ${searchQuery.trim() || "—"}`,
+          periodLabel: listPeriodLabel
+            ? `${listPeriodLabel} — Status: ${statusFilter}, Search: ${searchQuery.trim() || "—"}`
+            : `Current filters — Status: ${statusFilter}, Search: ${searchQuery.trim() || "—"}`,
           filenameSuffix: `filtered_${todayIso()}`,
         };
       case "date": {
@@ -2150,9 +2396,24 @@ export default function SalesPage() {
           <div>
             <h4 className="text-sm font-semibold text-blue-800">Local Mode Active</h4>
             <p className="text-xs text-blue-700 mt-0.5">
-              The <code>sales</code> table is missing or has old columns. Run the SQL in{" "}
-              <code>sql/04_sales.sql</code> in your Supabase Editor (use the DROP + CREATE block).
+              Could not load from Supabase. Showing local backup data.
+              {fetchError && (
+                <> Error: <code className="text-[11px] bg-blue-100 px-1 rounded">{fetchError}</code></>
+              )}
             </p>
+            <p className="text-xs text-blue-700 mt-1.5">
+              To add missing columns <strong>without deleting your table</strong>, run{" "}
+              <code className="text-[11px] bg-blue-100 px-1 rounded">sql/04_sales_add_missing_columns.sql</code>{" "}
+              (or the full <code className="text-[11px] bg-blue-100 px-1 rounded">sql/04_sales.sql</code>) in
+              Supabase → SQL Editor, then refresh this page.
+            </p>
+            <button
+              type="button"
+              onClick={() => fetchSales()}
+              className="mt-2 text-xs font-semibold text-blue-800 underline hover:text-blue-950"
+            >
+              Retry Supabase connection
+            </button>
           </div>
         </div>
       )}
@@ -2277,24 +2538,114 @@ export default function SalesPage() {
       )}
 
       {/* ── Search & Filter ── */}
-      <div className="bg-white border border-border rounded-xl shadow-card p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div className="relative flex-1 max-w-md">
-          <Search className="w-4 h-4 text-text-secondary absolute left-3 top-3" />
-          <input type="text" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search Bill No, Customer..." className="input-enterprise pl-9" />
-        </div>
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-text-secondary">
-            <Filter className="w-3.5 h-3.5" /><span>Status:</span>
+      <div className="bg-white border border-border rounded-xl shadow-card p-4 space-y-3">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="relative flex-1 max-w-md">
+            <Search className="w-4 h-4 text-text-secondary absolute left-3 top-3" />
+            <input type="text" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search Bill No, Customer..." className="input-enterprise pl-9" />
           </div>
-          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}
-            className="input-enterprise bg-white cursor-pointer w-40">
-            <option value="All">All Bills</option>
-            <option value="Paid">Paid</option>
-            <option value="Partial">Partial</option>
-            <option value="Credit">Credit</option>
-          </select>
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5 text-xs font-semibold text-text-secondary">
+              <Filter className="w-3.5 h-3.5" /><span>Status:</span>
+            </div>
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}
+              className="input-enterprise bg-white cursor-pointer w-40">
+              <option value="All">All Bills</option>
+              <option value="Paid">Paid</option>
+              <option value="Partial">Partial</option>
+              <option value="Credit">Credit</option>
+            </select>
+          </div>
         </div>
+
+        <div className="flex flex-col lg:flex-row lg:items-end gap-3 pt-1 border-t border-slate-100">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-text-secondary shrink-0">
+            <Calendar className="w-3.5 h-3.5" />
+            <span>Bill Period:</span>
+          </div>
+          <select
+            value={dateFilterMode}
+            onChange={(e) => setDateFilterMode(e.target.value as SalesListDateFilter)}
+            className="input-enterprise bg-white cursor-pointer text-xs w-full sm:w-44"
+          >
+            <option value="all">All Dates</option>
+            <option value="date">By Date</option>
+            <option value="month">By Month</option>
+            <option value="range">Date Range</option>
+          </select>
+
+          {dateFilterMode === "date" && (
+            <div className="flex-1 min-w-[140px]">
+              <label className="form-label text-[10px] text-slate-500 mb-1 block">Bill Date</label>
+              <input
+                type="date"
+                value={filterDate}
+                onChange={(e) => setFilterDate(e.target.value)}
+                className="input-enterprise font-mono text-xs w-full"
+              />
+            </div>
+          )}
+
+          {dateFilterMode === "month" && (
+            <div className="flex-1 min-w-[140px]">
+              <label className="form-label text-[10px] text-slate-500 mb-1 block">Month</label>
+              <input
+                type="month"
+                value={filterMonth}
+                onChange={(e) => setFilterMonth(e.target.value)}
+                className="input-enterprise font-mono text-xs w-full"
+              />
+            </div>
+          )}
+
+          {dateFilterMode === "range" && (
+            <div className="flex flex-1 flex-wrap gap-3">
+              <div className="min-w-[140px] flex-1">
+                <label className="form-label text-[10px] text-slate-500 mb-1 block">From Date</label>
+                <input
+                  type="date"
+                  value={filterFrom}
+                  onChange={(e) => setFilterFrom(e.target.value)}
+                  className="input-enterprise font-mono text-xs w-full"
+                />
+              </div>
+              <div className="min-w-[140px] flex-1">
+                <label className="form-label text-[10px] text-slate-500 mb-1 block">To Date</label>
+                <input
+                  type="date"
+                  value={filterTo}
+                  min={filterFrom}
+                  onChange={(e) => setFilterTo(e.target.value)}
+                  className="input-enterprise font-mono text-xs w-full"
+                />
+              </div>
+            </div>
+          )}
+
+          {dateFilterMode !== "all" && (
+            <button
+              type="button"
+              onClick={() => setDateFilterMode("all")}
+              className="btn-secondary px-3 py-2 text-xs whitespace-nowrap"
+            >
+              Clear Period
+            </button>
+          )}
+        </div>
+
+        {listDateRangeInvalid && (
+          <p className="text-xs text-red-600 flex items-center gap-1.5">
+            <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+            From date cannot be after To date.
+          </p>
+        )}
+
+        {listPeriodLabel && !listDateRangeInvalid && (
+          <p className="text-[10px] text-slate-500">
+            Showing bills for period: <span className="font-semibold text-slate-700">{listPeriodLabel}</span>
+          </p>
+        )}
       </div>
 
       {/* ── Sales Table ── */}
@@ -2303,8 +2654,28 @@ export default function SalesPage() {
           <table className="table-enterprise w-full text-xs">
             <thead>
               <tr className="bg-gray-50 border-b border-border">
-                {["Bill No.", "Form Type", "Customer", "Date", "Salesman", "Grand Total (₹)", "Payment", "Status", "Actions"].map((h) => (
-                  <th key={h} className="px-4 py-3 text-center font-semibold uppercase tracking-wider text-text-secondary">{h}</th>
+                {SALES_TABLE_COLUMNS.map(({ key, label }) => (
+                  <th key={label} className="px-4 py-3 text-center font-semibold uppercase tracking-wider text-text-secondary">
+                    {key ? (
+                      <button
+                        type="button"
+                        onClick={() => handleSort(key)}
+                        className={`inline-flex items-center justify-center gap-1 w-full transition-colors ${
+                          sortKey === key ? "text-slate-900" : "text-text-secondary hover:text-slate-800"
+                        }`}
+                        title={`Sort by ${label}`}
+                      >
+                        <span>{label}</span>
+                        {sortKey === key ? (
+                          sortDir === "asc" ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />
+                        ) : (
+                          <ArrowUpDown className="w-3 h-3 opacity-35" />
+                        )}
+                      </button>
+                    ) : (
+                      label
+                    )}
+                  </th>
                 ))}
               </tr>
             </thead>
@@ -2317,18 +2688,28 @@ export default function SalesPage() {
                   </svg>
                   <span className="text-xs text-text-secondary">Loading sales records...</span>
                 </td></tr>
-              ) : filteredSales.length === 0 ? (
+              ) : sortedSales.length === 0 ? (
                 <tr><td colSpan={9} className="text-center py-16 text-text-secondary">
                   <Calendar className="w-8 h-8 mx-auto text-gray-300 mb-2"/>
-                  <p className="font-semibold text-sm">No sales bills found</p>
-                  <p className="text-xs text-gray-400 mt-1">Click "New Sales Bill" to create one.</p>
+                  <p className="font-semibold text-sm">
+                    {listDateRangeInvalid
+                      ? "Invalid date range"
+                      : listPeriodLabel
+                        ? `No sales bills for ${listPeriodLabel}`
+                        : "No sales bills found"}
+                  </p>
+                  <p className="text-xs text-gray-400 mt-1">
+                    {listPeriodLabel || searchQuery || statusFilter !== "All"
+                      ? "Try changing the period, status, or search filters."
+                      : 'Click "New Sales Bill" to create one.'}
+                  </p>
                 </td></tr>
               ) : currentSales.map((rec) => (
                 <tr key={rec.bill_no} className="border-b border-border hover:bg-gray-50/50 transition-colors">
                   <td className="px-4 py-2.5 font-mono font-semibold text-center">{rec.bill_no}</td>
                   <td className="px-4 py-2.5 text-center text-xs">{rec.form_type}</td>
                   <td className="px-4 py-2.5 font-medium text-center truncate max-w-[140px]" title={rec.customer_name}>{rec.customer_name}</td>
-                  <td className="px-4 py-2.5 font-mono text-center text-text-secondary">{rec.bill_date}</td>
+                  <td className="px-4 py-2.5 font-mono text-center text-text-secondary">{formatTableDate(rec.bill_date)}</td>
                   <td className="px-4 py-2.5 text-center text-text-secondary">{rec.salesman || "—"}</td>
                   <td className="px-4 py-2.5 text-center font-mono font-bold">{formatCurrency(rec.grand_total)}</td>
                   <td className="px-4 py-2.5 text-center font-mono text-green-700">{formatCurrency(rec.payment_amount)}</td>
@@ -2366,7 +2747,7 @@ export default function SalesPage() {
         </div>
         {/* Pagination */}
         <div className="bg-gray-50 px-4 py-3 border-t border-border flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-text-secondary">
-          <span>Showing {filteredSales.length > 0 ? (currentPage - 1) * itemsPerPage + 1 : 0}–{Math.min(currentPage * itemsPerPage, filteredSales.length)} of {filteredSales.length}</span>
+          <span>Showing {sortedSales.length > 0 ? (currentPage - 1) * itemsPerPage + 1 : 0}–{Math.min(currentPage * itemsPerPage, sortedSales.length)} of {sortedSales.length}</span>
           <div className="flex items-center gap-2">
             <button onClick={() => setCurrentPage((p) => Math.max(p - 1, 1))} disabled={currentPage === 1}
               className="px-3 py-1.5 font-semibold rounded border border-border bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">Previous</button>
@@ -2374,10 +2755,14 @@ export default function SalesPage() {
             <button onClick={() => setCurrentPage((p) => Math.min(p + 1, totalPages))} disabled={currentPage >= totalPages || totalPages === 0}
               className="px-3 py-1.5 font-semibold rounded border border-border bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">Next</button>
           </div>
-          <div className="font-semibold text-gray-900">
-            Total Sales: <span className="font-mono text-green-700 bg-green-50 px-2 py-0.5 border border-green-100 rounded">
-              {formatCurrency(filteredSales.reduce((a, s) => a + s.grand_total, 0))}
-            </span>
+          <div className="font-semibold text-gray-900 text-right">
+            <div>
+              Total Sales
+              {isFilteredView ? " (filtered)" : ""}:{" "}
+              <span className="font-mono text-green-700 bg-green-50 px-2 py-0.5 border border-green-100 rounded">
+                {formatCurrency(filteredSalesTotal)}
+              </span>
+            </div>
           </div>
         </div>
       </div>
@@ -2512,10 +2897,19 @@ export default function SalesPage() {
                   {/* Rate TP */}
                   <div>
                     <label className="form-label text-xs font-semibold text-slate-700 mb-1 block">Rate TP / Sale TP (GST Class) *</label>
-                    <select value={rateTp} onChange={(e) => setRateTp(e.target.value)}
+                    <select value={rateTp} onChange={(e) => handleRateTpChange(e.target.value)}
                       className="input-enterprise bg-white cursor-pointer text-xs" required>
                       {RATE_TP_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                     </select>
+                  </div>
+
+                  {/* Vehicle No */}
+                  <div>
+                    <label className="form-label text-xs font-semibold text-slate-700 mb-1 block">
+                      <span className="flex items-center gap-1"><Truck className="w-3 h-3" /> Vehicle No.</span>
+                    </label>
+                    <input type="text" value={vehicleNo} onChange={(e) => setVehicleNo(e.target.value.toUpperCase())}
+                      placeholder="e.g. KL-07-AB-1234" className="input-enterprise font-mono text-xs uppercase" />
                   </div>
 
                   {/* Customer Phone */}
@@ -2548,6 +2942,7 @@ export default function SalesPage() {
                         <th className="p-2 w-[60px] text-center">Dis%</th>
                         <th className="p-2 w-[55px] text-center">SGST%</th>
                         <th className="p-2 w-[55px] text-center">CGST%</th>
+                        <th className="p-2 w-[80px] text-right">Line Total (₹)</th>
                         <th className="p-2 w-[80px] text-center">HSN Code</th>
                         <th className="p-2 w-[75px] text-right text-slate-400">Cost Rate</th>
                         <th className="p-2 w-[36px] text-center">Del</th>
@@ -2607,6 +3002,12 @@ export default function SalesPage() {
                               onChange={(e) => updateGridRow(idx, "cgst", parseFloat(e.target.value) || 0)}
                               className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono" placeholder="9" />
                           </td>
+                          {/* Line total incl. GST — updates when unit price / qty / disc changes */}
+                          <td className="p-1.5">
+                            <input readOnly value={item.line_total.toFixed(2)} tabIndex={-1}
+                              className="w-full text-right border border-green-200 rounded p-1 text-xs font-mono font-semibold bg-green-50 text-green-800 cursor-not-allowed"
+                              title="Taxable + SGST + CGST for this line" />
+                          </td>
                           {/* HSN Code */}
                           <td className="p-1.5">
                             <input type="text" value={item.hsn_code}
@@ -2658,9 +3059,9 @@ export default function SalesPage() {
                         placeholder="0.00" className="input-enterprise font-mono text-xs w-full" />
                     </div>
                     <div>
-                      <label className="form-label text-xs font-semibold text-slate-700 mb-1 block">Postage (₹)</label>
+                      <label className="form-label text-xs font-semibold text-slate-700 mb-1 block">{TRAVEL_EXPENSE_LABEL} (₹)</label>
                       <input type="number" min="0" value={postage} onChange={(e) => setPostage(e.target.value)}
-                        placeholder="0.00" className="input-enterprise font-mono text-xs w-full" />
+                        placeholder="Extra delivery / travel charge" className="input-enterprise font-mono text-xs w-full" />
                     </div>
                     <div>
                       <label className="form-label text-xs font-semibold text-slate-700 mb-1 block">Payment Mode</label>
@@ -2683,7 +3084,11 @@ export default function SalesPage() {
                   <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-4 space-y-2 text-xs">
                     <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-400 pb-1 border-b border-slate-100">Bill Summary</h4>
                     <div className="flex justify-between text-slate-600 font-semibold border-b border-slate-100 pb-1.5">
-                      <span>Subtot. (qty × MRP − Disc):</span>
+                      <span>Items Total (qty × unit price − line disc + GST):</span>
+                      <span className="font-mono">{formatCurrency(calc.linesTotal)}</span>
+                    </div>
+                    <div className="flex justify-between text-slate-500 text-[10px]">
+                      <span>Taxable subtotal:</span>
                       <span className="font-mono">{formatCurrency(calc.subtotal)}</span>
                     </div>
                     <div className="flex justify-between text-slate-500">
@@ -2695,7 +3100,7 @@ export default function SalesPage() {
                       <span className="font-mono">–{formatCurrency(Number(discount) || 0)}</span>
                     </div>
                     <div className="flex justify-between text-amber-600 border-b border-slate-100 pb-1.5">
-                      <span>GST &amp; Cess (auto from Rate TP):</span>
+                      <span>GST (recalculated from edited unit price):</span>
                       <span className="font-mono">+{formatCurrency(calc.totalGst)}</span>
                     </div>
                     <div className="flex justify-between text-slate-500">
@@ -2703,7 +3108,7 @@ export default function SalesPage() {
                       <span className="font-mono">+{formatCurrency(Number(commission) || 0)}</span>
                     </div>
                     <div className="flex justify-between text-slate-500">
-                      <span>Postage (+):</span>
+                      <span>{TRAVEL_EXPENSE_LABEL} (+):</span>
                       <span className="font-mono">+{formatCurrency(Number(postage) || 0)}</span>
                     </div>
                     <div className="flex justify-between text-slate-400 text-[10px] italic">
@@ -2771,11 +3176,12 @@ export default function SalesPage() {
                 {[
                   ["Bill No.", viewingSale.bill_no],
                   ["Form Type", viewingSale.form_type],
-                  ["Date", viewingSale.bill_date],
+                  ["Date", formatTableDate(viewingSale.bill_date)],
                   ["Rate TP", viewingSale.rate_tp],
                   ["Customer", viewingSale.customer_name],
                   ["Phone", viewingSale.customer_phone || "—"],
                   ["Ship To", viewingSale.ship_to || "—"],
+                  ["Vehicle No.", viewingSale.vehicle_no || "—"],
                   ["Salesman", viewingSale.salesman || "—"],
                   ["Branch/Godown", viewingSale.branch_godown],
                   ["Payment Mode", viewingSale.payment_mode],
@@ -2855,7 +3261,7 @@ export default function SalesPage() {
                     <span className="font-mono">+{formatCurrency(viewingSale.commission)}</span>
                   </div>
                   <div className="flex justify-between text-slate-500">
-                    <span>Postage:</span>
+                    <span>{TRAVEL_EXPENSE_LABEL}:</span>
                     <span className="font-mono">+{formatCurrency(viewingSale.postage)}</span>
                   </div>
                   <div className="flex justify-between text-slate-400 text-[10px] italic">
