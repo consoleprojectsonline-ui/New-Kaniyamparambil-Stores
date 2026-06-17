@@ -52,7 +52,7 @@ export interface PurchaseItem {
 }
 
 export interface PurchaseRecord {
-  invoice_no: string;      // unique bill number (digits only)
+  invoice_no: string;      // unique bill / invoice number
   serial_no?: string;      // internal serial / reference number
   supplier_name: string;
   purchase_type: string;   // e.g., "Local Purchase"
@@ -70,6 +70,20 @@ export interface PurchaseRecord {
   paid_amount: number;     // amount paid to supplier
   payment_status: string;
   created_at?: string;
+}
+
+type PaymentStatus = "Pending" | "Partial" | "Paid";
+
+function formatGridNumberValue(value: number | undefined): string | number {
+  if (value === undefined || value === null || Number.isNaN(value)) return "";
+  return value;
+}
+
+function parseGridNumber(raw: string, mode: "int" | "decimal"): number {
+  const trimmed = raw.trim();
+  if (!trimmed) return 0;
+  const parsed = mode === "int" ? parseInt(trimmed, 10) : parseFloat(trimmed);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 const SEED_SUPPLIERS = [
@@ -1052,6 +1066,7 @@ export default function PurchasePage() {
   const [vehicleNo, setVehicleNo] = useState("");
   const [expenses, setExpenses] = useState("");
   const [paidAmount, setPaidAmount] = useState("");
+  const [paymentStatus, setPaymentStatus] = useState<PaymentStatus>("Pending");
 
   // Dynamic Item Grid
   const [gridItems, setGridItems] = useState<PurchaseItem[]>([
@@ -1266,12 +1281,32 @@ export default function PurchasePage() {
     };
   }, [gridItems, expenses]);
 
-  // Auto-populate Paid Amount when net amount changes (still editable for partials)
+  // Auto-populate paid amount for new bills only (do not overwrite when editing)
   useEffect(() => {
-    if (calculatedTotals.netAmount > 0) {
+    if (!editingPurchase && calculatedTotals.netAmount > 0) {
       setPaidAmount(String(calculatedTotals.netAmount));
+      setPaymentStatus("Paid");
     }
-  }, [calculatedTotals.netAmount]);
+  }, [calculatedTotals.netAmount, editingPurchase]);
+
+  const handlePaymentStatusChange = (status: PaymentStatus) => {
+    setPaymentStatus(status);
+    if (status === "Paid") {
+      setPaidAmount(String(calculatedTotals.netAmount));
+    } else if (status === "Pending") {
+      setPaidAmount("0");
+    }
+  };
+
+  const handlePaidAmountChange = (value: string) => {
+    setPaidAmount(value);
+    const paidNum = Number(value) || 0;
+    const net = calculatedTotals.netAmount;
+    if (net <= 0) return;
+    if (paidNum >= net) setPaymentStatus("Paid");
+    else if (paidNum > 0) setPaymentStatus("Partial");
+    else setPaymentStatus("Pending");
+  };
 
   // Submit Handler: Creates or Updates Purchases & Stock Quantities
   const handleSubmitForm = async (e: React.FormEvent) => {
@@ -1281,8 +1316,8 @@ export default function PurchasePage() {
 
     // Validations
     const invoiceNumClean = invoiceNo.trim();
-    if (!/^\d+$/.test(invoiceNumClean)) {
-      setFormError("Invoice Number must contain digits only.");
+    if (!invoiceNumClean) {
+      setFormError("Invoice Number is required.");
       return;
     }
 
@@ -1300,8 +1335,19 @@ export default function PurchasePage() {
     }
 
     const expensesNum = Number(expenses) || 0;
-    const paidNum = Number(paidAmount) || 0;
-    const status = paidNum >= calculatedTotals.netAmount ? "Paid" : paidNum > 0 ? "Partial" : "Pending";
+    let paidNum = Number(paidAmount) || 0;
+    let status: PaymentStatus = paymentStatus;
+
+    if (paymentStatus === "Paid") {
+      paidNum = calculatedTotals.netAmount;
+    } else if (paymentStatus === "Pending") {
+      paidNum = 0;
+    } else if (paidNum <= 0 || paidNum >= calculatedTotals.netAmount) {
+      setFormError("Partial payment must be greater than ₹0 and less than the net amount.");
+      return;
+    }
+
+    status = paidNum >= calculatedTotals.netAmount ? "Paid" : paidNum > 0 ? "Partial" : "Pending";
 
     const payload: PurchaseRecord = {
       invoice_no: invoiceNumClean,
@@ -1501,6 +1547,11 @@ export default function PurchasePage() {
     setVehicleNo(rec.vehicle_no || "");
     setExpenses(String(rec.expenses));
     setPaidAmount(String(rec.paid_amount));
+    setPaymentStatus(
+      rec.payment_status === "Paid" || rec.payment_status === "Partial"
+        ? rec.payment_status
+        : "Pending",
+    );
     setGridItems(rec.items);
     setIsFormOpen(true);
   };
@@ -1602,6 +1653,7 @@ export default function PurchasePage() {
     setVehicleNo("");
     setExpenses("");
     setPaidAmount("");
+    setPaymentStatus("Pending");
     setGridItems([{ code: "", name: "", hsn_code: "", qty: 1, unit: "Nos", rate: 0, disc: 0, sgst: 9, cgst: 9 }]);
     setEditingPurchase(null);
     setIsFormOpen(false);
@@ -1963,12 +2015,12 @@ export default function PurchasePage() {
 
                   {/* Invoice No */}
                   <div>
-                    <label className="form-label text-xs text-slate-700 font-semibold mb-1 block">Invoice No. (Numbers Only) *</label>
+                    <label className="form-label text-xs text-slate-700 font-semibold mb-1 block">Invoice No. *</label>
                     <input
                       type="text"
                       value={invoiceNo}
-                      onChange={(e) => setInvoiceNo(e.target.value.replace(/\D/g, ""))}
-                      placeholder="e.g. 290123"
+                      onChange={(e) => setInvoiceNo(e.target.value)}
+                      placeholder="e.g. INV-2026-001 or 290123"
                       className="input-enterprise font-mono text-xs"
                       disabled={!!editingPurchase}
                       required
@@ -2078,9 +2130,11 @@ export default function PurchasePage() {
                           <td className="p-2 text-center">
                             <input
                               type="number"
-                              min="1"
-                              value={item.qty}
-                              onChange={(e) => updateGridRow(idx, "qty", parseInt(e.target.value) || 0)}
+                              min="0"
+                              step="1"
+                              inputMode="numeric"
+                              value={formatGridNumberValue(item.qty)}
+                              onChange={(e) => updateGridRow(idx, "qty", parseGridNumber(e.target.value, "int"))}
                               className="w-full text-center border border-slate-300 rounded p-1 font-semibold text-xs font-mono"
                               required
                             />
@@ -2117,10 +2171,12 @@ export default function PurchasePage() {
                             <input
                               type="number"
                               min="0"
-                              value={item.rate || ""}
-                              onChange={(e) => updateGridRow(idx, "rate", parseFloat(e.target.value) || 0)}
+                              step="any"
+                              inputMode="decimal"
+                              value={formatGridNumberValue(item.rate)}
+                              onChange={(e) => updateGridRow(idx, "rate", parseGridNumber(e.target.value, "decimal"))}
                               className="w-full text-right border border-slate-300 rounded p-1 text-xs font-mono"
-                              placeholder="0.00"
+                              placeholder="0"
                               required
                             />
                           </td>
@@ -2141,8 +2197,10 @@ export default function PurchasePage() {
                             <input
                               type="number"
                               min="0"
-                              value={item.disc || ""}
-                              onChange={(e) => updateGridRow(idx, "disc", parseFloat(e.target.value) || 0)}
+                              step="any"
+                              inputMode="decimal"
+                              value={formatGridNumberValue(item.disc)}
+                              onChange={(e) => updateGridRow(idx, "disc", parseGridNumber(e.target.value, "decimal"))}
                               className="w-full text-right border border-slate-300 rounded p-1 text-xs font-mono"
                               placeholder="0"
                             />
@@ -2154,9 +2212,10 @@ export default function PurchasePage() {
                               type="number"
                               min="0"
                               max="50"
-                              step="0.5"
-                              value={item.sgst ?? 9}
-                              onChange={(e) => updateGridRow(idx, "sgst", parseFloat(e.target.value) || 0)}
+                              step="any"
+                              inputMode="decimal"
+                              value={formatGridNumberValue(item.sgst)}
+                              onChange={(e) => updateGridRow(idx, "sgst", parseGridNumber(e.target.value, "decimal"))}
                               className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono"
                               placeholder="9"
                             />
@@ -2168,9 +2227,10 @@ export default function PurchasePage() {
                               type="number"
                               min="0"
                               max="50"
-                              step="0.5"
-                              value={item.cgst ?? 9}
-                              onChange={(e) => updateGridRow(idx, "cgst", parseFloat(e.target.value) || 0)}
+                              step="any"
+                              inputMode="decimal"
+                              value={formatGridNumberValue(item.cgst)}
+                              onChange={(e) => updateGridRow(idx, "cgst", parseGridNumber(e.target.value, "decimal"))}
                               className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono"
                               placeholder="9"
                             />
@@ -2181,8 +2241,10 @@ export default function PurchasePage() {
                             <input
                               type="number"
                               min="0"
-                              value={item.s_rate || ""}
-                              onChange={(e) => updateGridRow(idx, "s_rate", parseFloat(e.target.value) || 0)}
+                              step="any"
+                              inputMode="decimal"
+                              value={formatGridNumberValue(item.s_rate)}
+                              onChange={(e) => updateGridRow(idx, "s_rate", parseGridNumber(e.target.value, "decimal"))}
                               className="w-full text-right border border-slate-300 rounded p-1 text-xs font-mono"
                               placeholder="Sell rate"
                             />
@@ -2193,8 +2255,10 @@ export default function PurchasePage() {
                             <input
                               type="number"
                               min="0"
-                              value={item.mrp || ""}
-                              onChange={(e) => updateGridRow(idx, "mrp", parseFloat(e.target.value) || 0)}
+                              step="any"
+                              inputMode="decimal"
+                              value={formatGridNumberValue(item.mrp)}
+                              onChange={(e) => updateGridRow(idx, "mrp", parseGridNumber(e.target.value, "decimal"))}
                               className="w-full text-right border border-slate-300 rounded p-1 text-xs font-mono"
                               placeholder="MRP Price"
                             />
@@ -2239,17 +2303,38 @@ export default function PurchasePage() {
                     </div>
 
                     <div>
+                      <label className="form-label text-xs text-slate-700 font-semibold mb-1 block">Payment Status</label>
+                      <select
+                        value={paymentStatus}
+                        onChange={(e) => handlePaymentStatusChange(e.target.value as PaymentStatus)}
+                        className="input-enterprise bg-white cursor-pointer text-xs w-full"
+                      >
+                        <option value="Pending">Pending</option>
+                        <option value="Partial">Partial</option>
+                        <option value="Paid">Paid</option>
+                      </select>
+                      {editingPurchase && editingPurchase.payment_status === "Pending" && paymentStatus === "Paid" && (
+                        <p className="text-[10px] text-green-600 mt-1">Bill will be marked as fully paid on save.</p>
+                      )}
+                    </div>
+
+                    <div className="sm:col-span-2">
                       <label className="form-label text-xs text-slate-700 font-semibold mb-1 block">
                         Paid Amount to Supplier (₹)
-                        <span className="ml-1 text-[10px] text-purple-500 font-normal">(auto-filled · editable for partial)</span>
+                        <span className="ml-1 text-[10px] text-purple-500 font-normal">
+                          {paymentStatus === "Partial" ? "(enter partial amount)" : paymentStatus === "Paid" ? "(full net amount)" : "(₹0 when pending)"}
+                        </span>
                       </label>
                       <input
                         type="number"
                         min="0"
                         value={paidAmount}
-                        onChange={(e) => setPaidAmount(e.target.value)}
-                        placeholder="Auto-calculated from net amount"
-                        className="input-enterprise font-mono text-xs w-full text-green-700 font-bold"
+                        onChange={(e) => handlePaidAmountChange(e.target.value)}
+                        readOnly={paymentStatus === "Paid" || paymentStatus === "Pending"}
+                        placeholder="Amount paid to supplier"
+                        className={`input-enterprise font-mono text-xs w-full text-green-700 font-bold ${
+                          paymentStatus === "Paid" || paymentStatus === "Pending" ? "bg-slate-50" : ""
+                        }`}
                       />
                     </div>
                   </div>
@@ -2300,6 +2385,16 @@ export default function PurchasePage() {
                     <div className="flex justify-between text-xs font-semibold border-t border-dashed border-slate-100 pt-1.5">
                       <span className="text-slate-500">Paid:</span>
                       <span className="font-mono text-green-700">{formatCurrency(Number(paidAmount) || 0)}</span>
+                    </div>
+                    <div className="flex justify-between text-xs font-semibold">
+                      <span className="text-slate-500">Status:</span>
+                      <span className={`font-semibold ${
+                        paymentStatus === "Paid" ? "text-green-700"
+                          : paymentStatus === "Partial" ? "text-blue-700"
+                          : "text-orange-600"
+                      }`}>
+                        {paymentStatus}
+                      </span>
                     </div>
                     <div className="flex justify-between text-xs font-semibold">
                       <span className="text-slate-500">Balance Due:</span>

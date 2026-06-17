@@ -48,19 +48,40 @@ export default function DashboardPage() {
         let customersCount = 0;
         const missingTables: string[] = [];
 
-        // 1. Fetch Sales and calculate today's sales, monthly revenue, total sellers
+        // 1. Fetch sales and calculate today's sales, monthly revenue, sellers, and customers
         try {
-          const { data: salesData, error: salesError } = await supabase
-            .from("sales")
-            .select("grand_total, created_at, salesman");
+          const salesRows: Array<{
+            created_at: string;
+            grand_total: number | string;
+            salesman?: string | null;
+            customer_name?: string | null;
+          }> = [];
+          const pageSize = 1000;
+          let from = 0;
 
-          if (salesError) {
-            if (isMissingTableError(salesError)) {
-              missingTables.push("sales");
-            } else {
-              console.error("Error fetching sales:", salesError);
+          while (true) {
+            const { data: page, error: salesError } = await supabase
+              .from("sales")
+              .select("grand_total, created_at, salesman, customer_name")
+              .order("created_at", { ascending: false })
+              .range(from, from + pageSize - 1);
+
+            if (salesError) {
+              if (isMissingTableError(salesError)) {
+                missingTables.push("sales");
+              } else {
+                console.error("Error fetching sales:", salesError);
+              }
+              break;
             }
-          } else if (salesData) {
+
+            if (!page?.length) break;
+            salesRows.push(...page);
+            if (page.length < pageSize) break;
+            from += pageSize;
+          }
+
+          if (salesRows.length > 0) {
             const today = new Date();
             today.setHours(0, 0, 0, 0);
 
@@ -69,8 +90,9 @@ export default function DashboardPage() {
             startOfMonth.setHours(0, 0, 0, 0);
 
             const uniqueSellers = new Set<string>();
+            const uniqueCustomers = new Set<string>();
 
-            salesData.forEach((sale: { created_at: string; grand_total: number | string; salesman?: string | null }) => {
+            salesRows.forEach((sale) => {
               const saleDate = new Date(sale.created_at);
               const amount = Number(sale.grand_total) || 0;
 
@@ -83,31 +105,16 @@ export default function DashboardPage() {
 
               const seller = sale.salesman?.trim();
               if (seller) uniqueSellers.add(seller);
+
+              const customer = sale.customer_name?.trim();
+              if (customer) uniqueCustomers.add(customer);
             });
 
             sellersCount = uniqueSellers.size;
+            customersCount = uniqueCustomers.size;
           }
         } catch (err) {
           console.error("Sales fetch execution failed:", err);
-        }
-
-        // 2. Fetch Customers count
-        try {
-          const { count, error: custError } = await supabase
-            .from("customers")
-            .select("*", { count: "exact", head: true });
-
-          if (custError) {
-            if (isMissingTableError(custError)) {
-              missingTables.push("customers");
-            } else {
-              console.error("Error fetching customers:", custError);
-            }
-          } else if (count !== null) {
-            customersCount = count;
-          }
-        } catch (err) {
-          console.error("Customers count execution failed:", err);
         }
 
         if (missingTables.length > 0) {

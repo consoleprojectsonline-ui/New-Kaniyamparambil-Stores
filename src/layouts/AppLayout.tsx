@@ -11,6 +11,7 @@ import {
   FileSpreadsheet,
   LogOut,
   Store,
+  Building2,
 } from "lucide-react";
 import { useAuthStore } from "@/stores/authStore";
 import { cn } from "@/lib/utils";
@@ -22,6 +23,7 @@ import PurchasePage from "@/pages/purchase/PurchasePage";
 import SalesPage from "@/pages/sales/SalesPage";
 import DayBookPage from "@/pages/daybook/DayBookPage";
 import QuotationPage from "@/pages/quotation/QuotationPage";
+import SalesB2BPage from "@/pages/sales-b2b/SalesB2BPage";
 
 export default function AppLayout() {
   const { user, logout, loading } = useAuthStore();
@@ -61,6 +63,7 @@ export default function AppLayout() {
     { name: "Dashboard",  path: "/app/dashboard",  icon: LayoutDashboard },
     { name: "Inventory",  path: "/app/inventory",  icon: Boxes },
     { name: "Sales",      path: "/app/sales",      icon: Receipt },
+    { name: "Sales B2B",  path: "/app/sales-b2b",  icon: Building2 },
     { name: "Day Book",   path: "/app/daybook",    icon: BookOpen },
     { name: "Quotation",  path: "/app/quotation",  icon: FileSpreadsheet },
     { name: "Purchase",   path: "/app/purchase",   icon: ShoppingCart },
@@ -205,6 +208,7 @@ export default function AppLayout() {
             <Route path="inventory" element={<InventoryPage />} />
             <Route path="purchase"  element={<PurchasePage />} />
             <Route path="sales"     element={<SalesPage />} />
+            <Route path="sales-b2b" element={<SalesB2BPage />} />
             <Route path="daybook"   element={<DayBookPage />} />
             <Route path="quotation" element={<QuotationPage />} />
             <Route path="*"         element={<Navigate to="dashboard" replace />} />

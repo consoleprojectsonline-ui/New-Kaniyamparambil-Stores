@@ -995,6 +995,39 @@ function compareBillNo(a: string, b: string): number {
   return left.raw.localeCompare(right.raw, undefined, { numeric: true, sensitivity: "base" });
 }
 
+/** Next bill number after the highest existing one (numeric, BILL-YEAR-N, or trailing digits). */
+function getNextBillNo(existingBillNos: string[]): string {
+  const bills = existingBillNos.map((b) => b.trim()).filter(Boolean);
+  if (bills.length === 0) return "0001";
+
+  let latest = bills[0];
+  for (const billNo of bills) {
+    if (compareBillNo(billNo, latest) > 0) latest = billNo;
+  }
+
+  const billPattern = latest.match(/^BILL-(\d+)-(\d+)$/i);
+  if (billPattern) {
+    const year = Number(billPattern[1]);
+    const num = Number(billPattern[2]);
+    const numWidth = billPattern[2].length;
+    const currentYear = new Date().getFullYear();
+    if (year === currentYear) {
+      return `BILL-${currentYear}-${String(num + 1).padStart(numWidth, "0")}`;
+    }
+    return `BILL-${currentYear}-${String(1).padStart(numWidth, "0")}`;
+  }
+
+  const trailingDigits = latest.match(/^(.*?)(\d+)$/);
+  if (trailingDigits) {
+    const prefix = trailingDigits[1];
+    const numStr = trailingDigits[2];
+    const nextNum = Number(numStr) + 1;
+    return `${prefix}${String(nextNum).padStart(numStr.length, "0")}`;
+  }
+
+  return `${latest}-1`;
+}
+
 function defaultSortDir(key: SalesSortKey): SortDir {
   return key === "bill_no" || key === "bill_date" || key === "grand_total" || key === "payment_amount"
     ? "desc"
@@ -1429,6 +1462,91 @@ function blankItem(): SaleItem {
     amount: 0, disc_pct: 0, mrp: 0, sgst: 9, cgst: 9, line_total: 0 };
 }
 
+type PurchaseLineLookup = {
+  purchase_rate: number;
+  sgst: number;
+  cgst: number;
+  hsn_code: string;
+  unit: string;
+  s_rate: number;
+  mrp: number;
+};
+
+const PURCHASE_LOOKUP_PAGE_SIZE = 1000;
+
+function normalizeItemCode(code: unknown): string {
+  return String(code ?? "").trim();
+}
+
+function formatSaleGridValue(value: number | undefined): string | number {
+  if (value === undefined || value === null || Number.isNaN(value)) return "";
+  return value;
+}
+
+function purchaseLineFromRaw(it: Record<string, unknown>): PurchaseLineLookup | null {
+  const code = normalizeItemCode(it.code);
+  if (!code) return null;
+
+  const qty = Number(it.qty ?? 0);
+  const rate = Number(it.rate ?? 0);
+  const amount = Number(it.amount ?? 0);
+  const purchase_rate = rate > 0
+    ? rate
+    : (qty > 0 && amount > 0 ? amount / qty : 0);
+
+  const gstPercent = Number(it.gst_percent ?? 0);
+  const hasSplitGst = it.sgst != null || it.cgst != null;
+  const sgst = hasSplitGst ? Number(it.sgst ?? 0) : (gstPercent > 0 ? gstPercent / 2 : 9);
+  const cgst = hasSplitGst ? Number(it.cgst ?? 0) : (gstPercent > 0 ? gstPercent / 2 : 9);
+
+  return {
+    purchase_rate: Math.round(purchase_rate * 100) / 100,
+    sgst,
+    cgst,
+    hsn_code: String(it.hsn_code ?? ""),
+    unit: String(it.unit ?? it.uom ?? "Nos"),
+    s_rate: Number(it.s_rate ?? 0),
+    mrp: Number(it.mrp ?? 0),
+  };
+}
+
+function buildPurchaseItemMap(rows: Array<{ items: unknown[] }>): Map<string, PurchaseLineLookup> {
+  const map = new Map<string, PurchaseLineLookup>();
+  for (const row of rows) {
+    if (!Array.isArray(row.items)) continue;
+    for (const raw of row.items as Record<string, unknown>[]) {
+      const parsed = purchaseLineFromRaw(raw);
+      if (!parsed) continue;
+      const code = normalizeItemCode(raw.code);
+      if (!map.has(code)) map.set(code, parsed);
+    }
+  }
+  return map;
+}
+
+function buildSalesItemPriceMap(salesList: SaleRecord[]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const sale of salesList) {
+    for (const item of sale.items) {
+      const code = normalizeItemCode(item.code);
+      if (!code || map.has(code)) continue;
+      const mrp = Number(item.mrp) || Number(item.rate) || 0;
+      if (mrp > 0) map.set(code, mrp);
+    }
+  }
+  return map;
+}
+
+function resolveSellingUnitPrice(purchaseData?: PurchaseLineLookup, salesMrp?: number): number {
+  if (purchaseData) {
+    if (purchaseData.s_rate > 0) return purchaseData.s_rate;
+    if (purchaseData.mrp > 0) return purchaseData.mrp;
+    if (purchaseData.purchase_rate > 0) return purchaseData.purchase_rate;
+  }
+  if (salesMrp && salesMrp > 0) return salesMrp;
+  return 0;
+}
+
 function normalizeSale(raw: Record<string, unknown>): SaleRecord {
   let items: SaleItem[] = [];
   if (Array.isArray(raw.items) && raw.items.length > 0) {
@@ -1548,6 +1666,122 @@ function SearchableProductSelect({
   );
 }
 
+function SearchableCustomerSelect({
+  customers,
+  value,
+  onChange,
+  onAddNew,
+  placeholder = "Search customer...",
+}: {
+  customers: string[];
+  value: string;
+  onChange: (name: string) => void;
+  onAddNew: () => void;
+  placeholder?: string;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [dropStyle, setDropStyle] = useState<{ top: number; left: number; width: number } | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const list = q
+      ? customers.filter((name) => name.toLowerCase().includes(q))
+      : customers;
+    return [...list].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  }, [customers, search]);
+
+  const openDrop = () => {
+    if (btnRef.current) {
+      const r = btnRef.current.getBoundingClientRect();
+      const dropH = Math.min(280, filtered.length * 36 + 96);
+      const spaceBelow = window.innerHeight - r.bottom;
+      const top = spaceBelow >= dropH ? r.bottom + 4 : r.top - dropH - 4;
+      setDropStyle({ top, left: r.left, width: r.width });
+    }
+    setIsOpen(true);
+  };
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const recalc = () => {
+      if (btnRef.current) {
+        const r = btnRef.current.getBoundingClientRect();
+        const dropH = Math.min(280, filtered.length * 36 + 96);
+        const top = window.innerHeight - r.bottom >= dropH ? r.bottom + 4 : r.top - dropH - 4;
+        setDropStyle({ top, left: r.left, width: r.width });
+      }
+    };
+    window.addEventListener("scroll", recalc, true);
+    window.addEventListener("resize", recalc);
+    return () => { window.removeEventListener("scroll", recalc, true); window.removeEventListener("resize", recalc); };
+  }, [isOpen, filtered.length]);
+
+  return (
+    <div className="relative w-full text-left font-sans">
+      <button
+        ref={btnRef}
+        type="button"
+        onClick={() => isOpen ? setIsOpen(false) : openDrop()}
+        className="input-enterprise w-full flex items-center justify-between bg-white cursor-pointer text-xs text-left"
+      >
+        <span className={`truncate ${value ? "text-slate-800 font-medium" : "text-slate-400"}`}>
+          {value || placeholder}
+        </span>
+        <span className="ml-1 text-slate-400 text-[9px] shrink-0">{isOpen ? "▲" : "▼"}</span>
+      </button>
+      {isOpen && dropStyle && (
+        <>
+          <div className="fixed inset-0 z-[60]" onClick={() => { setIsOpen(false); setSearch(""); }} />
+          <div
+            className="fixed z-[70] bg-white border border-slate-200 rounded-lg shadow-2xl overflow-hidden"
+            style={{ top: dropStyle.top, left: dropStyle.left, width: dropStyle.width, maxHeight: "280px", display: "flex", flexDirection: "column" }}
+          >
+            <div className="p-2 border-b border-slate-100 bg-white flex-shrink-0">
+              <input
+                autoFocus
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Type to search customer..."
+                onClick={(e) => e.stopPropagation()}
+                className="w-full text-xs border border-slate-300 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-green-600 focus:border-green-600"
+              />
+            </div>
+            <ul className="overflow-y-auto py-1 flex-1">
+              {filtered.length === 0 ? (
+                <li className="px-3 py-2 text-xs text-slate-500 text-center">No customers found</li>
+              ) : (
+                filtered.map((name) => (
+                  <li
+                    key={name}
+                    onClick={() => { onChange(name); setIsOpen(false); setSearch(""); }}
+                    className={`px-3 py-2 text-xs cursor-pointer hover:bg-green-50 hover:text-green-700 transition-colors border-b border-slate-50 last:border-0 ${
+                      name === value ? "bg-green-100/50 text-green-700 font-semibold" : "text-slate-700"
+                    }`}
+                  >
+                    {name}
+                  </li>
+                ))
+              )}
+            </ul>
+            <div className="p-2 border-t border-slate-100 bg-slate-50 flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => { onAddNew(); setIsOpen(false); setSearch(""); }}
+                className="w-full text-left text-xs font-bold text-green-700 hover:bg-green-50 px-2 py-1.5 rounded transition-colors"
+              >
+                + Add New Customer
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Page Component ──────────────────────────────────────────────────────
 
 export default function SalesPage() {
@@ -1570,15 +1804,9 @@ export default function SalesPage() {
 
   // ── Purchase item lookup: code → latest PurchaseItem data ──
   // Used to pre-fill unit, purchase cost, selling price, sgst, cgst, hsn from latest purchase bill.
-  const [purchaseItemMap, setPurchaseItemMap] = useState<Map<string, {
-    purchase_rate: number;
-    sgst: number;
-    cgst: number;
-    hsn_code: string;
-    unit: string;
-    s_rate: number;
-    mrp: number;
-  }>>(new Map());
+  const [purchaseItemMap, setPurchaseItemMap] = useState<Map<string, PurchaseLineLookup>>(new Map());
+
+  const salesItemPriceMap = useMemo(() => buildSalesItemPriceMap(sales), [sales]);
 
   // Search & filter
   const [searchQuery, setSearchQuery] = useState("");
@@ -1636,12 +1864,12 @@ export default function SalesPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
-  // ── Auto-generate bill number ──
-  const generateBillNo = useCallback(() => {
-    const yr = new Date().getFullYear();
-    const rnd = Math.floor(1000 + Math.random() * 9000);
-    setBillNo(`BILL-${yr}-${rnd}`);
-  }, []);
+  // Next bill number from highest existing bill (updates when sales list changes)
+  useEffect(() => {
+    if (!editingSale) {
+      setBillNo(getNextBillNo(sales.map((s) => s.bill_no)));
+    }
+  }, [sales, editingSale]);
 
   // ── Load inventory ──
   const fetchInventory = useCallback(async () => {
@@ -1656,65 +1884,38 @@ export default function SalesPage() {
   // ── Build purchase item lookup map ──
   // Scans all purchase bills, keeps the MOST RECENT values per item code.
   const fetchPurchaseItemMap = useCallback(async () => {
+    const applyRows = (rows: Array<{ items: unknown[] }>) => {
+      setPurchaseItemMap(buildPurchaseItemMap(rows));
+    };
+
     try {
-      const { data, error } = await supabase
-        .from("purchases")
-        .select("items, created_at")
-        .order("created_at", { ascending: false });
+      const rows: Array<{ items: unknown[] }> = [];
+      let from = 0;
 
-      if (error || !data) {
-        // Fallback: local storage
-        const local = localStorage.getItem("kaniyamparambil_purchases");
-        if (!local) return;
-        try {
-          const parsed = JSON.parse(local) as Array<{ items: unknown[]; created_at?: string }>;
-          buildMap(parsed);
-        } catch { /* ignore */ }
-        return;
-      }
-      buildMap(data as Array<{ items: unknown[]; created_at?: string }>);
-    } catch { /* ignore */ }
+      while (true) {
+        const { data, error } = await supabase
+          .from("purchases")
+          .select("items, created_at")
+          .order("created_at", { ascending: false })
+          .range(from, from + PURCHASE_LOOKUP_PAGE_SIZE - 1);
 
-    function buildMap(rows: Array<{ items: unknown[]; created_at?: string }>) {
-      const map = new Map<string, {
-        purchase_rate: number;
-        sgst: number;
-        cgst: number;
-        hsn_code: string;
-        unit: string;
-        s_rate: number;
-        mrp: number;
-      }>();
-      for (const row of rows) {
-        if (!Array.isArray(row.items)) continue;
-        for (const it of row.items as Record<string, unknown>[]) {
-          const code = String(it.code ?? "").trim();
-          if (!code || map.has(code)) continue;
-          map.set(code, {
-            purchase_rate: Number(it.rate ?? 0),
-            sgst: Number(it.sgst ?? 9),
-            cgst: Number(it.cgst ?? 9),
-            hsn_code: String(it.hsn_code ?? ""),
-            unit: String(it.unit ?? "Nos"),
-            s_rate: Number(it.s_rate ?? 0),
-            mrp: Number(it.mrp ?? 0),
-          });
-        }
+        if (error) throw error;
+        if (!data?.length) break;
+        rows.push(...(data as Array<{ items: unknown[] }>));
+        if (data.length < PURCHASE_LOOKUP_PAGE_SIZE) break;
+        from += PURCHASE_LOOKUP_PAGE_SIZE;
       }
-      setPurchaseItemMap(map);
+
+      applyRows(rows);
+    } catch {
+      const local = localStorage.getItem("kaniyamparambil_purchases");
+      if (!local) return;
+      try {
+        const parsed = JSON.parse(local) as Array<{ items: unknown[] }>;
+        applyRows(parsed);
+      } catch { /* ignore */ }
     }
   }, []);
-
-  const resolveSellingUnitPrice = (purchaseData?: {
-    purchase_rate: number;
-    s_rate: number;
-    mrp: number;
-  }): number => {
-    if (!purchaseData) return 0;
-    if (purchaseData.s_rate > 0) return purchaseData.s_rate;
-    if (purchaseData.mrp > 0) return purchaseData.mrp;
-    return purchaseData.purchase_rate;
-  };
 
   const unitOptionsForRow = (unit: string): string[] => {
     if (!unit || UNITS.includes(unit)) return [...UNITS];
@@ -1774,9 +1975,13 @@ export default function SalesPage() {
   }, [loadLocalSales]);
 
   useEffect(() => {
-    const t = setTimeout(() => { fetchSales(); fetchInventory(); fetchPurchaseItemMap(); generateBillNo(); }, 0);
+    const t = setTimeout(() => { fetchSales(); fetchInventory(); fetchPurchaseItemMap(); }, 0);
     return () => clearTimeout(t);
-  }, [fetchSales, fetchInventory, fetchPurchaseItemMap, generateBillNo]);
+  }, [fetchSales, fetchInventory, fetchPurchaseItemMap]);
+
+  useEffect(() => {
+    if (isFormOpen) fetchPurchaseItemMap();
+  }, [isFormOpen, fetchPurchaseItemMap]);
 
   // ── Grid helpers ──
   const addGridRow = () => setGridItems((prev) => [...prev, blankItem()]);
@@ -1809,10 +2014,12 @@ export default function SalesPage() {
   };
 
   const handleProductSelect = (i: number, prod: InventoryItem) => {
-    const purchaseData = purchaseItemMap.get(prod.code);
+    const code = normalizeItemCode(prod.code);
+    const purchaseData = purchaseItemMap.get(code);
+    const salesMrp = salesItemPriceMap.get(code);
     const unitVal = purchaseData?.unit || prod.uom || "Nos";
     const costRate = purchaseData?.purchase_rate ?? 0;
-    const sellingUnitPrice = resolveSellingUnitPrice(purchaseData);
+    const sellingUnitPrice = resolveSellingUnitPrice(purchaseData, salesMrp);
 
     setGridItems((prev) => prev.map((item, idx) => {
       if (idx !== i) return item;
@@ -1830,6 +2037,36 @@ export default function SalesPage() {
       return { ...updated, ...computeLineAutos(updated) };
     }));
   };
+
+  // Back-fill unit price when purchase/sales lookups finish loading after product selection
+  useEffect(() => {
+    if (!isFormOpen) return;
+    setGridItems((prev) => {
+      let changed = false;
+      const next = prev.map((item) => {
+        if (!item.code || item.mrp > 0) return item;
+        const code = normalizeItemCode(item.code);
+        const sellingUnitPrice = resolveSellingUnitPrice(
+          purchaseItemMap.get(code),
+          salesItemPriceMap.get(code),
+        );
+        if (sellingUnitPrice <= 0) return item;
+        changed = true;
+        const purchaseData = purchaseItemMap.get(code);
+        const updated: SaleItem = {
+          ...item,
+          rate: purchaseData?.purchase_rate ?? item.rate,
+          mrp: sellingUnitPrice,
+          sgst: purchaseData?.sgst ?? item.sgst,
+          cgst: purchaseData?.cgst ?? item.cgst,
+          hsn_code: purchaseData?.hsn_code || item.hsn_code,
+          unit: purchaseData?.unit || item.unit,
+        };
+        return { ...updated, ...computeLineAutos(updated) };
+      });
+      return changed ? next : prev;
+    });
+  }, [isFormOpen, purchaseItemMap, salesItemPriceMap]);
 
   const handleRateTpChange = (nextRateTp: string) => {
     setRateTp(nextRateTp);
@@ -1887,7 +2124,6 @@ export default function SalesPage() {
     setPaymentAmount(""); setPaymentMode("Cash");
     setFormError(null);
     setIsFormOpen(false);
-    generateBillNo();
     setTimeout(() => setSuccessMsg(null), 4000);
   };
 
@@ -2247,9 +2483,10 @@ export default function SalesPage() {
   const totalPages = Math.ceil(sortedSales.length / itemsPerPage);
   const currentSales = sortedSales.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
 
-  const availableCustomers = useMemo(() =>
-    Array.from(new Set([...SEED_CUSTOMERS, ...sales.map((s) => s.customer_name)])).filter(Boolean),
-    [sales]);
+  const availableCustomers = useMemo(
+    () => Array.from(new Set([...SEED_CUSTOMERS, ...sales.map((s) => s.customer_name)])).filter(Boolean),
+    [sales],
+  );
 
   const resolveSalesStatementReport = (): {
     records: SaleRecord[];
@@ -2846,17 +3083,17 @@ export default function SalesPage() {
                   <div className="lg:col-span-2">
                     <label className="form-label text-xs font-semibold text-slate-700 mb-1 block">Customer *</label>
                     {!isCustomCustomer ? (
-                      <select value={customerName}
-                        onChange={(e) => e.target.value === "CUSTOM" ? (setIsCustomCustomer(true)) : setCustomerName(e.target.value)}
-                        className="input-enterprise bg-white cursor-pointer text-xs w-full" required>
-                        <option value="">-- Select Customer --</option>
-                        {availableCustomers.map((c) => <option key={c} value={c}>{c}</option>)}
-                        <option value="CUSTOM" className="text-green-700 font-bold">+ Add New Customer</option>
-                      </select>
+                      <SearchableCustomerSelect
+                        customers={availableCustomers}
+                        value={customerName}
+                        onChange={setCustomerName}
+                        onAddNew={() => setIsCustomCustomer(true)}
+                        placeholder="Search customer name..."
+                      />
                     ) : (
                       <div className="flex gap-2 items-center">
                         <input type="text" value={customCustomerText} onChange={(e) => setCustomCustomerText(e.target.value)}
-                          placeholder="Type customer name" className="input-enterprise text-xs w-full" required />
+                          placeholder="Type new customer name" className="input-enterprise text-xs w-full" required autoFocus />
                         <button type="button" onClick={() => { setIsCustomCustomer(false); setCustomCustomerText(""); }}
                           className="text-[10px] text-slate-500 hover:text-slate-800 underline font-bold whitespace-nowrap">Cancel</button>
                       </div>
@@ -2972,7 +3209,8 @@ export default function SalesPage() {
                           </td>
                           {/* Unit price per qty — from purchase MRP / S.Rate / purchase rate */}
                           <td className="p-1.5">
-                            <input type="number" min="0" step="0.01" value={item.mrp || ""}
+                            <input type="number" min="0" step="any" inputMode="decimal"
+                              value={formatSaleGridValue(item.mrp)}
                               onChange={(e) => updateGridRow(idx, "mrp", parseFloat(e.target.value) || 0)}
                               className="w-full text-right border border-green-400 rounded p-1 text-xs font-mono font-semibold focus:ring-2 focus:ring-green-500/20 focus:border-green-600"
                               placeholder="0.00" required
