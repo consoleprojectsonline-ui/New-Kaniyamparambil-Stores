@@ -66,7 +66,8 @@ export interface PurchaseRecord {
   total_discount: number;  // aggregate trade discount across all items
   total_sgst: number;      // aggregate SGST
   total_cgst: number;      // aggregate CGST
-  net_amount: number;      // final payable = subtotal - discount + sgst + cgst + expenses
+  round_off?: number;      // paise adjustment to nearest rupee
+  net_amount: number;      // final payable = subtotal - discount + sgst + cgst + expenses + round_off
   paid_amount: number;     // amount paid to supplier
   payment_status: string;
   created_at?: string;
@@ -84,6 +85,103 @@ function parseGridNumber(raw: string, mode: "int" | "decimal"): number {
   if (!trimmed) return 0;
   const parsed = mode === "int" ? parseInt(trimmed, 10) : parseFloat(trimmed);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeItemCode(code: unknown): string {
+  return String(code ?? "").trim();
+}
+
+function inventoryLookupKey(code: unknown): string {
+  return normalizeItemCode(code).toUpperCase();
+}
+
+function buildInventoryHsnMap(items: InventoryItem[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const item of items) {
+    const code = inventoryLookupKey(item.code);
+    const hsn = String(item.hsn_code ?? "").trim();
+    if (code && hsn) map.set(code, hsn);
+  }
+  return map;
+}
+
+/** Latest non-empty HSN per item code from saved purchase bills (newest purchases first). */
+function buildPurchaseHsnMap(purchases: PurchaseRecord[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const rec of purchases) {
+    for (const it of rec.items) {
+      const code = inventoryLookupKey(it.code);
+      const hsn = String(it.hsn_code ?? "").trim();
+      if (code && hsn && !map.has(code)) map.set(code, hsn);
+    }
+  }
+  return map;
+}
+
+function buildInventoryHsnByNameMap(items: InventoryItem[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const item of items) {
+    const name = String(item.name ?? "").trim().toUpperCase();
+    const hsn = String(item.hsn_code ?? "").trim();
+    if (name && hsn) map.set(name, hsn);
+  }
+  return map;
+}
+
+function findInventoryHsnForItem(item: PurchaseItem, inventory: InventoryItem[]): string {
+  const codeKey = inventoryLookupKey(item.code);
+  const nameKey = String(item.name ?? "").trim().toUpperCase();
+  for (const inv of inventory) {
+    const hsn = String(inv.hsn_code ?? "").trim();
+    if (!hsn) continue;
+    if (codeKey && inventoryLookupKey(inv.code) === codeKey) return hsn;
+    if (nameKey && String(inv.name ?? "").trim().toUpperCase() === nameKey) return hsn;
+  }
+  return "";
+}
+
+function resolveItemHsnCode(
+  code: string,
+  name: string | undefined,
+  currentHsn: string | undefined,
+  inventoryHsn: Map<string, string>,
+  purchaseHsn: Map<string, string>,
+  inventoryHsnByName: Map<string, string>,
+  inventoryItems: InventoryItem[] = [],
+): string {
+  const existing = String(currentHsn ?? "").trim();
+  if (existing) return existing;
+  const normalized = inventoryLookupKey(code);
+  if (normalized) {
+    const fromCode = inventoryHsn.get(normalized) || purchaseHsn.get(normalized);
+    if (fromCode) return fromCode;
+  }
+  const nameKey = String(name ?? "").trim().toUpperCase();
+  if (nameKey) {
+    const fromName = inventoryHsnByName.get(nameKey);
+    if (fromName) return fromName;
+  }
+  return findInventoryHsnForItem({ code, name: name ?? "", hsn_code: "", qty: 0, unit: "", rate: 0, disc: 0, sgst: 0, cgst: 0 }, inventoryItems);
+}
+
+function enrichPurchaseItemWithHsn(
+  item: PurchaseItem,
+  inventoryHsn: Map<string, string>,
+  purchaseHsn: Map<string, string>,
+  inventoryHsnByName: Map<string, string>,
+  inventoryItems: InventoryItem[] = [],
+): PurchaseItem {
+  const hsn = resolveItemHsnCode(
+    item.code,
+    item.name,
+    item.hsn_code,
+    inventoryHsn,
+    purchaseHsn,
+    inventoryHsnByName,
+    inventoryItems,
+  );
+  if (!hsn || hsn === item.hsn_code) return item;
+  return { ...item, hsn_code: hsn };
 }
 
 const SEED_SUPPLIERS = [
@@ -155,11 +253,27 @@ function normalizePurchase(raw: Record<string, unknown>): PurchaseRecord {
   let totalCgst = Number(raw.total_cgst ?? 0);
   if (!raw.total_sgst && !raw.total_cgst) {
     items.forEach((it) => {
-      const taxable = Math.max(0, it.qty * it.rate - it.disc);
-      totalSgst += taxable * (it.sgst / 100);
-      totalCgst += taxable * (it.cgst / 100);
+      const summary = getPurchaseItemLineSummary(it);
+      totalSgst += summary.sgstAmt;
+      totalCgst += summary.cgstAmt;
     });
   }
+
+  const expenses = Number(raw.expenses ?? 0);
+  const storedRoundOff = raw.round_off !== undefined ? Number(raw.round_off) : undefined;
+  const computed = computePurchaseTotals(items, expenses, storedRoundOff);
+  const storedNet = Number(raw.net_amount ?? raw.amount ?? 0);
+  const storedSubtotal = Number(raw.subtotal ?? raw.amount ?? 0);
+  const hasItemTax = purchaseHasLineTax(items);
+  const grossOnly = purchaseStoredAsGrossOnly(storedNet, computed.subtotal);
+  const useComputed = hasItemTax || grossOnly || (storedNet > 0 && storedNet < computed.net_amount - 0.5);
+
+  const paidAmount = Number(raw.paid_amount ?? 0);
+  const paymentStatus = String(raw.payment_status ?? "Pending");
+  const resolvedNet = useComputed ? computed.net_amount : (storedNet || computed.net_amount);
+  const resolvedPaid = paymentStatus === "Paid" && grossOnly
+    ? resolvedNet
+    : (useComputed && paymentStatus === "Paid" ? resolvedNet : paidAmount);
 
   return {
     invoice_no: String(raw.invoice_no ?? raw.bill_no ?? ""),
@@ -171,14 +285,15 @@ function normalizePurchase(raw: Record<string, unknown>): PurchaseRecord {
     invoice_date: String(raw.invoice_date ?? raw.purchase_date ?? ""),
     vehicle_no: raw.vehicle_no ? String(raw.vehicle_no) : "",
     items,
-    expenses: Number(raw.expenses ?? 0),
-    subtotal: Number(raw.subtotal ?? raw.amount ?? 0),
-    total_discount: Number(raw.total_discount ?? 0),
-    total_sgst: Math.round(totalSgst * 100) / 100,
-    total_cgst: Math.round(totalCgst * 100) / 100,
-    net_amount: Number(raw.net_amount ?? raw.amount ?? 0),
-    paid_amount: Number(raw.paid_amount ?? 0),
-    payment_status: String(raw.payment_status ?? "Pending"),
+    expenses,
+    subtotal: useComputed ? computed.subtotal : (storedSubtotal || computed.subtotal),
+    total_discount: useComputed ? computed.total_discount : Number(raw.total_discount ?? computed.total_discount),
+    total_sgst: useComputed ? computed.total_sgst : Math.round(totalSgst * 100) / 100,
+    total_cgst: useComputed ? computed.total_cgst : Math.round(totalCgst * 100) / 100,
+    round_off: useComputed ? computed.round_off : Number(raw.round_off ?? 0),
+    net_amount: resolvedNet,
+    paid_amount: resolvedPaid,
+    payment_status: paymentStatus,
     created_at: raw.created_at ? String(raw.created_at) : undefined,
   };
 }
@@ -246,6 +361,52 @@ function getPurchaseItemLineSummary(item: PurchaseItem) {
     cgstAmt,
     lineTotal: taxable + sgstAmt + cgstAmt,
   };
+}
+
+/** Recompute purchase bill totals from line items (discount + GST + round-off). */
+function computePurchaseTotals(
+  items: PurchaseItem[],
+  expenses = 0,
+  explicitRoundOff?: number,
+) {
+  let subtotal = 0;
+  let totalDiscount = 0;
+  let totalSgst = 0;
+  let totalCgst = 0;
+
+  items.forEach((item) => {
+    const lineBase = item.qty * item.rate;
+    const lineDisc = Number(item.disc) || 0;
+    const summary = getPurchaseItemLineSummary(item);
+    subtotal += lineBase;
+    totalDiscount += lineDisc;
+    totalSgst += summary.sgstAmt;
+    totalCgst += summary.cgstAmt;
+  });
+
+  const extra = Number(expenses) || 0;
+  const rawNet = subtotal - totalDiscount + totalSgst + totalCgst + extra;
+  const roundOff = explicitRoundOff !== undefined
+    ? explicitRoundOff
+    : Math.round(rawNet * 100) / 100 - rawNet;
+  const netAmount = rawNet + roundOff;
+
+  return {
+    subtotal: Math.round(subtotal * 100) / 100,
+    total_discount: Math.round(totalDiscount * 100) / 100,
+    total_sgst: Math.round(totalSgst * 100) / 100,
+    total_cgst: Math.round(totalCgst * 100) / 100,
+    round_off: Math.round(roundOff * 100) / 100,
+    net_amount: Math.round(netAmount * 100) / 100,
+  };
+}
+
+function purchaseHasLineTax(items: PurchaseItem[]): boolean {
+  return items.some((it) => (it.sgst ?? 0) > 0 || (it.cgst ?? 0) > 0);
+}
+
+function purchaseStoredAsGrossOnly(storedNet: number, subtotal: number): boolean {
+  return storedNet > 0 && Math.abs(storedNet - subtotal) < 0.02;
 }
 
 type PurchaseDocOptions = {
@@ -480,6 +641,7 @@ function buildPurchaseHtml(rec: PurchaseRecord, options: PurchaseDocOptions = {}
           </div>
           <div class="totals-box">
             <div class="total-row"><span>Expenses (Freight)</span><span>${escapeHtml(formatCurrency(rec.expenses))}</span></div>
+            ${(rec.round_off ?? 0) !== 0 ? `<div class="total-row"><span>Round Off</span><span>${escapeHtml(formatCurrency(rec.round_off ?? 0))}</span></div>` : ""}
             <div class="total-row grand"><span>Net Amount</span><span>${escapeHtml(formatCurrency(rec.net_amount))}</span></div>
             <div class="total-row"><span>Paid</span><span>${escapeHtml(formatCurrency(rec.paid_amount))}</span></div>
             <div class="total-row"><span>Balance Due</span><span>${escapeHtml(formatCurrency(balanceDue))}</span></div>
@@ -1091,6 +1253,10 @@ export default function PurchasePage() {
     return Array.from(new Set([...SEED_SUPPLIERS, ...uniqueFromDB])).filter(Boolean);
   }, [purchases]);
 
+  const inventoryHsnMap = useMemo(() => buildInventoryHsnMap(inventoryItems), [inventoryItems]);
+  const inventoryHsnByNameMap = useMemo(() => buildInventoryHsnByNameMap(inventoryItems), [inventoryItems]);
+  const purchaseHsnMap = useMemo(() => buildPurchaseHsnMap(purchases), [purchases]);
+
   const loadLocalPurchases = useCallback(() => {
     const local = localStorage.getItem("kaniyamparambil_purchases");
     if (local) {
@@ -1154,7 +1320,22 @@ export default function PurchasePage() {
         const local = localStorage.getItem("kaniyamparambil_inventory");
         if (local) setInventoryItems(JSON.parse(local));
       } else if (data) {
-        setInventoryItems(data);
+        setInventoryItems(
+          (data as Record<string, unknown>[]).map((row) => ({
+            code: String(row.code ?? ""),
+            name: String(row.name ?? ""),
+            company_code: String(row.company_code ?? ""),
+            group: String(row.group ?? ""),
+            sub_group: String(row.sub_group ?? ""),
+            brand: String(row.brand ?? ""),
+            type: String(row.type ?? ""),
+            hsn_code: String(row.hsn_code ?? ""),
+            uom: String(row.uom ?? "Nos"),
+            enable_batch: String(row.enable_batch ?? "N"),
+            stock_qty: row.stock_qty != null ? Number(row.stock_qty) : undefined,
+            created_at: row.created_at ? String(row.created_at) : undefined,
+          })),
+        );
       }
     } catch {
       const local = localStorage.getItem("kaniyamparambil_inventory");
@@ -1202,6 +1383,30 @@ export default function PurchasePage() {
     return () => clearTimeout(timer);
   }, [fetchPurchases, fetchInventory]);
 
+  useEffect(() => {
+    if (viewingPurchase) fetchInventory();
+  }, [viewingPurchase, fetchInventory]);
+
+  // Back-fill HSN from inventory catalog (or prior purchase bills) when the form opens
+  useEffect(() => {
+    if (!isFormOpen) return;
+    setGridItems((prev) => {
+      let changed = false;
+      const next = prev.map((item) => {
+        const enriched = enrichPurchaseItemWithHsn(
+          item,
+          inventoryHsnMap,
+          purchaseHsnMap,
+          inventoryHsnByNameMap,
+          inventoryItems,
+        );
+        if (enriched.hsn_code !== item.hsn_code) changed = true;
+        return enriched;
+      });
+      return changed ? next : prev;
+    });
+  }, [isFormOpen, inventoryHsnMap, inventoryHsnByNameMap, purchaseHsnMap, inventoryItems]);
+
   // Item Grid Actions
   const addGridRow = () => {
     setGridItems([
@@ -1230,13 +1435,23 @@ export default function PurchasePage() {
   };
 
   const handleProductSelect = (index: number, product: InventoryItem) => {
+    const code = normalizeItemCode(product.code);
+    const hsn = resolveItemHsnCode(
+      code,
+      product.name,
+      product.hsn_code,
+      inventoryHsnMap,
+      purchaseHsnMap,
+      inventoryHsnByNameMap,
+      inventoryItems,
+    );
     const updated = gridItems.map((item, idx) => {
       if (idx === index) {
         return {
           ...item,
           code: product.code,
           name: product.name,
-          hsn_code: product.hsn_code ?? "",
+          hsn_code: hsn,
           unit: product.uom,
           rate: 0,
           disc: 0,
@@ -1251,33 +1466,14 @@ export default function PurchasePage() {
 
   // Calculations
   const calculatedTotals = useMemo(() => {
-    let sub = 0;
-    let totalDiscount = 0;
-    let totalSgst = 0;
-    let totalCgst = 0;
-
-    gridItems.forEach((item) => {
-      const lineBase = item.qty * item.rate;
-      const lineDisc = Number(item.disc) || 0;
-      const taxable = Math.max(0, lineBase - lineDisc);
-      const lineSgst = taxable * ((item.sgst ?? 0) / 100);
-      const lineCgst = taxable * ((item.cgst ?? 0) / 100);
-
-      sub += lineBase;
-      totalDiscount += lineDisc;
-      totalSgst += lineSgst;
-      totalCgst += lineCgst;
-    });
-
-    const extra = Number(expenses) || 0;
-    const net = sub - totalDiscount + totalSgst + totalCgst + extra;
-
+    const computed = computePurchaseTotals(gridItems, Number(expenses) || 0);
     return {
-      subtotal: sub,
-      discount: totalDiscount,
-      totalSgst: Math.round(totalSgst * 100) / 100,
-      totalCgst: Math.round(totalCgst * 100) / 100,
-      netAmount: Math.round(net * 100) / 100,
+      subtotal: computed.subtotal,
+      discount: computed.total_discount,
+      totalSgst: computed.total_sgst,
+      totalCgst: computed.total_cgst,
+      roundOff: computed.round_off,
+      netAmount: computed.net_amount,
     };
   }, [gridItems, expenses]);
 
@@ -1552,13 +1748,30 @@ export default function PurchasePage() {
         ? rec.payment_status
         : "Pending",
     );
-    setGridItems(rec.items);
+    setGridItems(
+      rec.items.map((item) =>
+        enrichPurchaseItemWithHsn(item, inventoryHsnMap, purchaseHsnMap, inventoryHsnByNameMap, inventoryItems),
+      ),
+    );
     setIsFormOpen(true);
   };
 
+  const enrichPurchaseRecordForDocs = (rec: PurchaseRecord): PurchaseRecord => ({
+    ...rec,
+    items: (rec.items ?? []).map((item) =>
+      enrichPurchaseItemWithHsn(item, inventoryHsnMap, purchaseHsnMap, inventoryHsnByNameMap, inventoryItems),
+    ),
+  });
+
+  const viewingPurchaseDisplay = useMemo(() => {
+    if (!viewingPurchase) return null;
+    return enrichPurchaseRecordForDocs(viewingPurchase);
+  }, [viewingPurchase, inventoryHsnMap, inventoryHsnByNameMap, purchaseHsnMap, inventoryItems]);
+
   const handlePrintPurchase = async (rec: PurchaseRecord) => {
     try {
-      await printPurchaseHtml(buildPurchaseHtml(rec, {
+      const enriched = enrichPurchaseRecordForDocs(rec);
+      await printPurchaseHtml(buildPurchaseHtml(enriched, {
         renderMode: "pdf",
         helperText: "Purchase bill print preview.",
       }));
@@ -1570,7 +1783,7 @@ export default function PurchasePage() {
   const handleDownloadPurchase = async (rec: PurchaseRecord) => {
     try {
       await exportPurchasePdf(
-        buildPurchaseHtml(rec, { renderMode: "pdf" }),
+        buildPurchaseHtml(enrichPurchaseRecordForDocs(rec), { renderMode: "pdf" }),
         `purchase_bill_${rec.invoice_no}.pdf`,
       );
     } catch (err) {
@@ -1868,7 +2081,7 @@ export default function PurchasePage() {
       {/* ── Popup Modal for Log/Edit Purchase ── */}
       {isFormOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-fade-in">
-          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-5xl w-full max-h-[90vh] overflow-y-auto flex flex-col font-sans animate-in zoom-in-95 duration-150">
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-7xl w-full max-h-[92vh] overflow-y-auto flex flex-col font-sans animate-in zoom-in-95 duration-150">
             {/* Header */}
             <div className="bg-slate-950 px-6 py-4 text-white flex items-center justify-between sticky top-0 z-20 shadow-md">
               <div>
@@ -2377,6 +2590,15 @@ export default function PurchasePage() {
                       <span className="font-mono">+{formatCurrency(Number(expenses) || 0)}</span>
                     </div>
 
+                    {calculatedTotals.roundOff !== 0 && (
+                      <div className="flex justify-between text-slate-400 italic">
+                        <span>Round Off:</span>
+                        <span className="font-mono">
+                          {calculatedTotals.roundOff >= 0 ? "+" : ""}{formatCurrency(calculatedTotals.roundOff)}
+                        </span>
+                      </div>
+                    )}
+
                     <div className="flex justify-between text-sm font-bold text-slate-900 border-t border-slate-200 pt-2">
                       <span>Net Amount:</span>
                       <span className="font-mono text-base text-purple-700">{formatCurrency(calculatedTotals.netAmount)}</span>
@@ -2615,21 +2837,21 @@ export default function PurchasePage() {
       </div>
 
       {/* ── View Purchase Details Modal ── */}
-      {viewingPurchase && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px]">
+      {viewingPurchaseDisplay && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-3 bg-slate-900/40 backdrop-blur-[2px]">
           <div
             className="absolute inset-0 transition-opacity"
             onClick={() => setViewingPurchase(null)}
           />
 
-          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-4xl w-full animate-in fade-in zoom-in-95 duration-150 z-10 flex flex-col font-sans max-h-[90vh] overflow-y-auto">
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative w-[min(100rem,98vw)] max-w-none animate-in fade-in zoom-in-95 duration-150 z-10 flex flex-col font-sans max-h-[94vh] overflow-hidden">
             {/* Header */}
-            <div className="bg-slate-950 px-6 py-4 text-white rounded-t-xl flex items-center justify-between shadow-md sticky top-0">
+            <div className="bg-slate-950 px-6 py-4 text-white rounded-t-xl flex items-center justify-between shadow-md sticky top-0 z-10 shrink-0">
               <div>
                 <h2 className="text-sm font-bold tracking-tight">Purchase Bill Specifications</h2>
                 <p className="text-[10px] text-slate-300 mt-0.5">
-                  Invoice: {viewingPurchase.invoice_no}
-                  {viewingPurchase.serial_no && ` · Ref: ${viewingPurchase.serial_no}`}
+                  Invoice: {viewingPurchaseDisplay.invoice_no}
+                  {viewingPurchaseDisplay.serial_no && ` · Ref: ${viewingPurchaseDisplay.serial_no}`}
                 </p>
               </div>
               <button
@@ -2643,55 +2865,55 @@ export default function PurchasePage() {
             </div>
 
             {/* Content Details */}
-            <div className="p-6 space-y-6">
+            <div className="p-6 space-y-6 overflow-y-auto flex-1">
               {/* Metadata Grid */}
               <div className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-3.5 text-xs bg-slate-50 border border-slate-100 p-4 rounded-xl">
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Invoice Number</span>
-                  <span className="font-mono font-semibold text-slate-900">{viewingPurchase.invoice_no}</span>
+                  <span className="font-mono font-semibold text-slate-900">{viewingPurchaseDisplay.invoice_no}</span>
                 </div>
-                {viewingPurchase.serial_no && (
+                {viewingPurchaseDisplay.serial_no && (
                   <div>
                     <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Serial / Ref No.</span>
-                    <span className="font-mono text-slate-700">{viewingPurchase.serial_no}</span>
+                    <span className="font-mono text-slate-700">{viewingPurchaseDisplay.serial_no}</span>
                   </div>
                 )}
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Supplier Name</span>
-                  <span className="font-semibold text-slate-900">{viewingPurchase.supplier_name}</span>
+                  <span className="font-semibold text-slate-900">{viewingPurchaseDisplay.supplier_name}</span>
                 </div>
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Purchase Type</span>
-                  <span className="font-semibold text-slate-900">{viewingPurchase.purchase_type}</span>
+                  <span className="font-semibold text-slate-900">{viewingPurchaseDisplay.purchase_type}</span>
                 </div>
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Branch / Godown</span>
-                  <span className="font-semibold text-slate-900">{viewingPurchase.branch_godown}</span>
+                  <span className="font-semibold text-slate-900">{viewingPurchaseDisplay.branch_godown}</span>
                 </div>
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Invoice Date</span>
-                  <span className="font-mono text-slate-700">{formatTableDate(viewingPurchase.invoice_date)}</span>
+                  <span className="font-mono text-slate-700">{formatTableDate(viewingPurchaseDisplay.invoice_date)}</span>
                 </div>
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Pur. Entry Date</span>
-                  <span className="font-mono text-slate-700">{formatTableDate(viewingPurchase.entry_date)}</span>
+                  <span className="font-mono text-slate-700">{formatTableDate(viewingPurchaseDisplay.entry_date)}</span>
                 </div>
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Vehicle No</span>
-                  <span className="font-mono text-slate-700">{viewingPurchase.vehicle_no || "—"}</span>
+                  <span className="font-mono text-slate-700">{viewingPurchaseDisplay.vehicle_no || "—"}</span>
                 </div>
                 <div>
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Payment Status</span>
                   <span
                     className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold mt-1 ${
-                      viewingPurchase.payment_status === "Paid"
+                      viewingPurchaseDisplay.payment_status === "Paid"
                         ? "bg-green-100 text-green-800"
-                        : viewingPurchase.payment_status === "Partial"
+                        : viewingPurchaseDisplay.payment_status === "Partial"
                         ? "bg-blue-100 text-blue-800"
                         : "bg-red-100 text-red-800"
                     }`}
                   >
-                    {viewingPurchase.payment_status}
+                    {viewingPurchaseDisplay.payment_status}
                   </span>
                 </div>
               </div>
@@ -2699,13 +2921,13 @@ export default function PurchasePage() {
               {/* Items List Table */}
               <div className="space-y-2">
                 <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">Purchased Product Details</h4>
-                <div className="border border-slate-200 rounded-xl overflow-hidden">
-                  <table className="w-full text-xs text-left border-collapse">
+                <div className="border border-slate-200 rounded-xl overflow-x-auto">
+                  <table className="w-full min-w-[1280px] text-xs text-left border-collapse">
                     <thead>
                       <tr className="bg-slate-100 border-b border-slate-200 font-semibold text-slate-700">
-                        <th className="p-2.5">Code</th>
-                        <th className="p-2.5">Name</th>
-                        <th className="p-2.5 text-center">HSN</th>
+                        <th className="p-2.5 whitespace-nowrap">Code</th>
+                        <th className="p-2.5 min-w-[160px]">Name</th>
+                        <th className="p-2.5 text-center min-w-[100px] whitespace-nowrap">HSN Code</th>
                         <th className="p-2.5 text-center">Qty</th>
                         <th className="p-2.5 text-center">Unit</th>
                         <th className="p-2.5 text-right">Rate</th>
@@ -2719,7 +2941,7 @@ export default function PurchasePage() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {viewingPurchase.items?.map((item, index) => {
+                      {viewingPurchaseDisplay.items?.map((item, index) => {
                         const lineBase = item.qty * item.rate;
                         const lineDisc = item.disc || 0;
                         const taxable = Math.max(0, lineBase - lineDisc);
@@ -2730,7 +2952,17 @@ export default function PurchasePage() {
                           <tr key={index} className="hover:bg-slate-50/30">
                             <td className="p-2.5 font-mono font-semibold">{item.code}</td>
                             <td className="p-2.5">{item.name}</td>
-                            <td className="p-2.5 text-center font-mono text-slate-500">{item.hsn_code || "—"}</td>
+                            <td className="p-2.5 text-center font-mono font-semibold text-slate-900 bg-violet-50/40 whitespace-nowrap">
+                              {resolveItemHsnCode(
+                                item.code,
+                                item.name,
+                                item.hsn_code,
+                                inventoryHsnMap,
+                                purchaseHsnMap,
+                                inventoryHsnByNameMap,
+                                inventoryItems,
+                              ) || "—"}
+                            </td>
                             <td className="p-2.5 text-center font-mono">{item.qty}</td>
                             <td className="p-2.5 text-center">{item.unit}</td>
                             <td className="p-2.5 text-right font-mono">{formatCurrency(item.rate)}</td>
@@ -2754,40 +2986,49 @@ export default function PurchasePage() {
                 <div className="w-80 space-y-2 border-t border-slate-200 pt-3 text-xs text-slate-600">
                   <div className="flex justify-between font-semibold text-slate-700 border-b border-slate-100 pb-1.5">
                     <span>SubTotal:</span>
-                    <span className="font-mono">{formatCurrency(viewingPurchase.subtotal)}</span>
+                    <span className="font-mono">{formatCurrency(viewingPurchaseDisplay.subtotal)}</span>
                   </div>
                   <div className="flex justify-between text-red-600">
                     <span>Discount (–):</span>
-                    <span className="font-mono">–{formatCurrency(viewingPurchase.total_discount ?? 0)}</span>
+                    <span className="font-mono">–{formatCurrency(viewingPurchaseDisplay.total_discount ?? 0)}</span>
                   </div>
                   <div className="flex justify-between text-amber-600">
                     <span>Total SGST:</span>
-                    <span className="font-mono">+{formatCurrency(viewingPurchase.total_sgst ?? 0)}</span>
+                    <span className="font-mono">+{formatCurrency(viewingPurchaseDisplay.total_sgst ?? 0)}</span>
                   </div>
                   <div className="flex justify-between text-amber-600">
                     <span>Total CGST:</span>
-                    <span className="font-mono">+{formatCurrency(viewingPurchase.total_cgst ?? 0)}</span>
+                    <span className="font-mono">+{formatCurrency(viewingPurchaseDisplay.total_cgst ?? 0)}</span>
                   </div>
                   <div className="flex justify-between text-slate-500">
                     <span>Expenses (Freight):</span>
-                    <span className="font-mono">+{formatCurrency(viewingPurchase.expenses)}</span>
+                    <span className="font-mono">+{formatCurrency(viewingPurchaseDisplay.expenses)}</span>
                   </div>
+                  {(viewingPurchaseDisplay.round_off ?? 0) !== 0 && (
+                    <div className="flex justify-between text-slate-400 italic">
+                      <span>Round Off:</span>
+                      <span className="font-mono">
+                        {(viewingPurchaseDisplay.round_off ?? 0) >= 0 ? "+" : ""}
+                        {formatCurrency(viewingPurchaseDisplay.round_off ?? 0)}
+                      </span>
+                    </div>
+                  )}
                   <div className="flex justify-between text-sm font-bold text-slate-900 border-t border-slate-200 pt-2">
                     <span>Net Amount:</span>
-                    <span className="font-mono text-purple-700">{formatCurrency(viewingPurchase.net_amount)}</span>
+                    <span className="font-mono text-purple-700">{formatCurrency(viewingPurchaseDisplay.net_amount)}</span>
                   </div>
                   <div className="flex justify-between text-green-700 font-semibold">
                     <span>Paid:</span>
-                    <span className="font-mono">{formatCurrency(viewingPurchase.paid_amount)}</span>
+                    <span className="font-mono">{formatCurrency(viewingPurchaseDisplay.paid_amount)}</span>
                   </div>
                   <div className="flex justify-between border-t border-dashed border-slate-200 pt-2">
                     <span className="text-slate-500">Balance Due:</span>
                     <span className={`font-mono font-semibold ${
-                      Math.max(0, viewingPurchase.net_amount - viewingPurchase.paid_amount) > 0
+                      Math.max(0, viewingPurchaseDisplay.net_amount - viewingPurchaseDisplay.paid_amount) > 0
                         ? "text-red-600"
                         : "text-green-600"
                     }`}>
-                      {formatCurrency(Math.max(0, viewingPurchase.net_amount - viewingPurchase.paid_amount))}
+                      {formatCurrency(Math.max(0, viewingPurchaseDisplay.net_amount - viewingPurchaseDisplay.paid_amount))}
                     </span>
                   </div>
                 </div>
@@ -2795,10 +3036,10 @@ export default function PurchasePage() {
             </div>
 
             {/* Footer Buttons */}
-            <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 bg-slate-50 p-4 rounded-b-xl sticky bottom-0">
+            <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 bg-slate-50 p-4 rounded-b-xl sticky bottom-0 shrink-0">
               <button
                 type="button"
-                onClick={() => handleDownloadPurchase(viewingPurchase)}
+                onClick={() => handleDownloadPurchase(viewingPurchaseDisplay)}
                 className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
               >
                 <Download className="w-3.5 h-3.5" />
@@ -2806,7 +3047,7 @@ export default function PurchasePage() {
               </button>
               <button
                 type="button"
-                onClick={() => handlePrintPurchase(viewingPurchase)}
+                onClick={() => handlePrintPurchase(viewingPurchaseDisplay)}
                 className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
               >
                 <Printer className="w-3.5 h-3.5" />
