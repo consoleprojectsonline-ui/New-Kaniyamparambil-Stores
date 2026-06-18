@@ -12,6 +12,8 @@ import {
   LogOut,
   Store,
   Building2,
+  LifeBuoy,
+  CreditCard,
 } from "lucide-react";
 import { useAuthStore } from "@/stores/authStore";
 import { cn } from "@/lib/utils";
@@ -24,6 +26,8 @@ import SalesPage from "@/pages/sales/SalesPage";
 import DayBookPage from "@/pages/daybook/DayBookPage";
 import QuotationPage from "@/pages/quotation/QuotationPage";
 import SalesB2BPage from "@/pages/sales-b2b/SalesB2BPage";
+import SupportPage from "@/pages/support/SupportPage";
+import PaymentPage from "@/pages/payment/PaymentPage";
 
 export default function AppLayout() {
   const { user, logout, loading } = useAuthStore();
@@ -67,7 +71,11 @@ export default function AppLayout() {
     { name: "Day Book",   path: "/app/daybook",    icon: BookOpen },
     { name: "Quotation",  path: "/app/quotation",  icon: FileSpreadsheet },
     { name: "Purchase",   path: "/app/purchase",   icon: ShoppingCart },
+    { name: "Payment",    path: "/app/payment",    icon: CreditCard },
+    { name: "Support",    path: "/app/support",    icon: LifeBuoy },
   ];
+
+  const headerNavigation = navigation.filter((item) => item.name !== "Payment");
 
   const handleLogout = async () => {
     await logout();
@@ -177,7 +185,7 @@ export default function AppLayout() {
           </div>
 
           <nav className="flex items-center justify-center gap-5 overflow-x-auto max-w-full">
-            {navigation.map((item) => {
+            {headerNavigation.map((item) => {
               const active = location.pathname === item.path;
               return (
                 <Link
@@ -211,6 +219,8 @@ export default function AppLayout() {
             <Route path="sales-b2b" element={<SalesB2BPage />} />
             <Route path="daybook"   element={<DayBookPage />} />
             <Route path="quotation" element={<QuotationPage />} />
+            <Route path="payment"   element={<PaymentPage />} />
+            <Route path="support"   element={<SupportPage />} />
             <Route path="*"         element={<Navigate to="dashboard" replace />} />
           </Routes>
         </main>

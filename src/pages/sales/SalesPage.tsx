@@ -24,6 +24,10 @@ export interface SaleItem {
   mrp: number;          // selling price per unit (customer pays this)
   sgst: number;         // SGST %
   cgst: number;         // CGST %
+  taxable_value?: number;
+  discount_amount?: number;
+  sgst_amount?: number;
+  cgst_amount?: number;
   line_total: number;   // (qty×mrp − disc) + SGST amount + CGST amount (auto)
 }
 
@@ -40,9 +44,12 @@ export interface SaleRecord {
   rate_tp: string;
   items: SaleItem[];
   subtotal: number;
+  lines_total: number;
   f_cess: number;
   discount: number;
   total_gst: number;
+  total_sgst: number;
+  total_cgst: number;
   commission: number;
   postage: number;
   round_off: number;
@@ -928,14 +935,50 @@ const SALES_TABLE_COLUMNS: { key: SalesSortKey | null; label: string }[] = [
 
 const SALES_FETCH_PAGE_SIZE = 1000;
 
-async function detectSalesDbColumns(): Promise<{ hasVehicleNo: boolean }> {
-  const { error } = await supabase.from("sales").select("vehicle_no").limit(1);
-  return { hasVehicleNo: !error };
+async function detectSalesDbColumns(): Promise<{
+  hasVehicleNo: boolean;
+  hasRoundOff: boolean;
+  hasLinesTotal: boolean;
+  hasTotalSgst: boolean;
+  hasTotalCgst: boolean;
+}> {
+  const probe = async (column: string) => {
+    const { error } = await supabase.from("sales").select(column).limit(1);
+    return !error;
+  };
+  const [hasVehicleNo, hasRoundOff, hasLinesTotal, hasTotalSgst, hasTotalCgst] = await Promise.all([
+    probe("vehicle_no"),
+    probe("round_off"),
+    probe("lines_total"),
+    probe("total_sgst"),
+    probe("total_cgst"),
+  ]);
+  return { hasVehicleNo, hasRoundOff, hasLinesTotal, hasTotalSgst, hasTotalCgst };
 }
 
-function buildSupabaseSaleRow(payload: SaleRecord, hasVehicleNo: boolean): Record<string, unknown> {
+const OPTIONAL_SALE_DB_COLUMNS = [
+  "vehicle_no",
+  "round_off",
+  "lines_total",
+  "total_sgst",
+  "total_cgst",
+] as const;
+
+function buildSupabaseSaleRow(
+  payload: SaleRecord,
+  schema: Awaited<ReturnType<typeof detectSalesDbColumns>>,
+): Record<string, unknown> {
   const row: Record<string, unknown> = { ...payload };
-  if (!hasVehicleNo) delete row.vehicle_no;
+  const availability: Record<(typeof OPTIONAL_SALE_DB_COLUMNS)[number], boolean> = {
+    vehicle_no: schema.hasVehicleNo,
+    round_off: schema.hasRoundOff,
+    lines_total: schema.hasLinesTotal,
+    total_sgst: schema.hasTotalSgst,
+    total_cgst: schema.hasTotalCgst,
+  };
+  for (const column of OPTIONAL_SALE_DB_COLUMNS) {
+    if (!availability[column]) delete row[column];
+  }
   return row;
 }
 
@@ -1440,8 +1483,7 @@ function normalizeSaleItem(raw: Record<string, unknown>): SaleItem {
   const hasSplitGst = raw.sgst != null || raw.cgst != null;
   const sgst = hasSplitGst ? toDbNumber(raw.sgst) : (gstPercent > 0 ? gstPercent / 2 : 0);
   const cgst = hasSplitGst ? toDbNumber(raw.cgst) : (gstPercent > 0 ? gstPercent / 2 : 0);
-
-  return {
+  const item: SaleItem = {
     code: String(raw.code ?? ""),
     name: String(raw.name ?? ""),
     hsn_code: String(raw.hsn_code ?? ""),
@@ -1454,6 +1496,15 @@ function normalizeSaleItem(raw: Record<string, unknown>): SaleItem {
     sgst,
     cgst,
     line_total: toDbNumber(raw.line_total),
+  };
+  const summary = getSaleItemSummary(item);
+  return {
+    ...item,
+    taxable_value: toDbNumber(raw.taxable_value) || summary.taxableValue,
+    discount_amount: toDbNumber(raw.discount_amount) || summary.discountAmount,
+    sgst_amount: toDbNumber(raw.sgst_amount) || summary.sgstAmount,
+    cgst_amount: toDbNumber(raw.cgst_amount) || summary.cgstAmount,
+    line_total: toDbNumber(raw.line_total) || summary.total,
   };
 }
 
@@ -1553,6 +1604,11 @@ function normalizeSale(raw: Record<string, unknown>): SaleRecord {
     items = (raw.items as Record<string, unknown>[]).map(normalizeSaleItem);
   }
   const grandTotal = toDbNumber(raw.grand_total ?? raw.total_amount);
+  const totalGst = toDbNumber(raw.total_gst ?? raw.tax_amount);
+  const totalSgst = toDbNumber(raw.total_sgst);
+  const totalCgst = toDbNumber(raw.total_cgst);
+  const resolvedTotalSgst = totalSgst > 0 ? totalSgst : (totalGst > 0 ? Math.round((totalGst / 2) * 100) / 100 : 0);
+  const resolvedTotalCgst = totalCgst > 0 ? totalCgst : (totalGst > 0 ? Math.round((totalGst - resolvedTotalSgst) * 100) / 100 : 0);
   return {
     bill_no: String(raw.bill_no ?? raw.invoice_no ?? ""),
     form_type: String(raw.form_type ?? "Tax Invoice"),
@@ -1566,9 +1622,12 @@ function normalizeSale(raw: Record<string, unknown>): SaleRecord {
     rate_tp: String(raw.rate_tp ?? "Retail"),
     items,
     subtotal: toDbNumber(raw.subtotal),
+    lines_total: toDbNumber(raw.lines_total) || grandTotal,
     f_cess: toDbNumber(raw.f_cess),
     discount: toDbNumber(raw.discount),
-    total_gst: toDbNumber(raw.total_gst ?? raw.tax_amount),
+    total_gst: totalGst,
+    total_sgst: resolvedTotalSgst,
+    total_cgst: resolvedTotalCgst,
     commission: toDbNumber(raw.commission),
     postage: toDbNumber(raw.postage),
     round_off: toDbNumber(raw.round_off),
@@ -1791,7 +1850,13 @@ export default function SalesPage() {
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [dbStatus, setDbStatus] = useState<"connected" | "local">("connected");
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const salesDbColumnsRef = useRef({ hasVehicleNo: false });
+  const salesDbColumnsRef = useRef<Awaited<ReturnType<typeof detectSalesDbColumns>>>({
+    hasVehicleNo: false,
+    hasRoundOff: false,
+    hasLinesTotal: false,
+    hasTotalSgst: false,
+    hasTotalCgst: false,
+  });
   const [editingSale, setEditingSale] = useState<SaleRecord | null>(null);
   const [viewingSale, setViewingSale] = useState<SaleRecord | null>(null);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
@@ -1991,14 +2056,14 @@ export default function SalesPage() {
   // amount   = qty × mrp
   // line_total = amount − (amount × disc%) + SGST + CGST
   const computeLineAutos = (item: SaleItem): Partial<SaleItem> => {
-    const mrpAmt   = Number(item.qty)  * Number(item.mrp);
-    const discAmt  = mrpAmt * ((Number(item.disc_pct) || 0) / 100);
-    const taxable  = Math.max(0, mrpAmt - discAmt);
-    const sgstAmt  = taxable * ((Number(item.sgst) || 0) / 100);
-    const cgstAmt  = taxable * ((Number(item.cgst) || 0) / 100);
+    const summary = getSaleItemSummary(item);
     return {
-      amount:     Math.round(mrpAmt   * 100) / 100,
-      line_total: Math.round((taxable + sgstAmt + cgstAmt) * 100) / 100,
+      amount: Math.round(summary.amount * 100) / 100,
+      taxable_value: Math.round(summary.taxableValue * 100) / 100,
+      discount_amount: Math.round(summary.discountAmount * 100) / 100,
+      sgst_amount: Math.round(summary.sgstAmount * 100) / 100,
+      cgst_amount: Math.round(summary.cgstAmount * 100) / 100,
+      line_total: Math.round(summary.total * 100) / 100,
     };
   };
 
@@ -2082,11 +2147,15 @@ export default function SalesPage() {
   const calc = useMemo(() => {
     let sub = 0;
     let totalGst = 0;
+    let totalSgst = 0;
+    let totalCgst = 0;
     let linesTotal = 0;
     gridItems.forEach((item) => {
       const summary = getSaleItemSummary(item);
       sub += summary.taxableValue;
       totalGst += summary.cgstAmount + summary.sgstAmount;
+      totalSgst += summary.sgstAmount;
+      totalCgst += summary.cgstAmount;
       linesTotal += summary.total;
     });
     const discNum   = Number(discount)   || 0;
@@ -2100,6 +2169,8 @@ export default function SalesPage() {
     return {
       subtotal: Math.round(sub * 100) / 100,
       totalGst: Math.round(totalGst * 100) / 100,
+      totalSgst: Math.round(totalSgst * 100) / 100,
+      totalCgst: Math.round(totalCgst * 100) / 100,
       linesTotal: Math.round(linesTotal * 100) / 100,
       roundOff,
       grandTotal,
@@ -2185,9 +2256,12 @@ export default function SalesPage() {
       rate_tp: rateTp,
       items: itemsFinal,
       subtotal: calc.subtotal,
+      lines_total: calc.linesTotal,
       f_cess: Number(fCess) || 0,
       discount: Number(discount) || 0,
       total_gst: calc.totalGst,
+      total_sgst: calc.totalSgst,
+      total_cgst: calc.totalCgst,
       commission: Number(commission) || 0,
       postage: Number(postage) || 0,
       round_off: calc.roundOff,
@@ -2201,7 +2275,7 @@ export default function SalesPage() {
     if (editingSale) {
       if (dbStatus === "connected") {
         try {
-          const row = buildSupabaseSaleRow(payload, salesDbColumnsRef.current.hasVehicleNo);
+          const row = buildSupabaseSaleRow(payload, salesDbColumnsRef.current);
           const { error } = await supabase.from("sales").update(row).eq("bill_no", editingSale.bill_no);
           if (error) throw error;
           setSuccessMsg(`Updated Bill "${billNo}" successfully!`);
@@ -2218,7 +2292,7 @@ export default function SalesPage() {
       if (sales.some((s) => s.bill_no === billNo)) { setFormError(`Bill No. "${billNo}" already exists.`); return; }
       if (dbStatus === "connected") {
         try {
-          const row = buildSupabaseSaleRow(payload, salesDbColumnsRef.current.hasVehicleNo);
+          const row = buildSupabaseSaleRow(payload, salesDbColumnsRef.current);
           const { error } = await supabase.from("sales").insert([row]);
           if (error) throw error;
           setSuccessMsg(`Saved Bill "${billNo}" successfully!`);

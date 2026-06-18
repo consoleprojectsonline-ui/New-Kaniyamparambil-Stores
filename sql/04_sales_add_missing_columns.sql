@@ -81,9 +81,12 @@ alter table public.sales add column if not exists subtotal        numeric not nu
 alter table public.sales add column if not exists f_cess          numeric not null default 0;
 alter table public.sales add column if not exists discount        numeric not null default 0;
 alter table public.sales add column if not exists total_gst       numeric not null default 0;
+alter table public.sales add column if not exists total_sgst      numeric not null default 0;
+alter table public.sales add column if not exists total_cgst      numeric not null default 0;
 alter table public.sales add column if not exists commission      numeric not null default 0;
 alter table public.sales add column if not exists postage         numeric not null default 0;
 alter table public.sales add column if not exists vehicle_no      text;
+alter table public.sales add column if not exists lines_total     numeric not null default 0;
 alter table public.sales add column if not exists round_off       numeric not null default 0;
 alter table public.sales add column if not exists grand_total     numeric not null default 0;
 alter table public.sales add column if not exists payment_amount  numeric not null default 0;
