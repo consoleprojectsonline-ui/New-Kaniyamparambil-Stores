@@ -6,7 +6,7 @@ import {
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
-import { formatCurrency, formatTableDate } from "@/lib/utils";
+import { formatCurrency, formatTableDate, numberToWordsIndian, reverseChargeLabel, validateGstin } from "@/lib/utils";
 import type { SaleItem } from "@/pages/sales/SalesPage";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -62,6 +62,10 @@ export interface B2BSaleRecord {
   f_cess: number;
   discount: number;
   total_gst: number;
+  total_sgst?: number;
+  total_cgst?: number;
+  total_igst?: number;
+  reverse_charge?: boolean;
   commission: number;
   postage: number;
   round_off: number;
@@ -110,11 +114,18 @@ const B2B_STORE_DETAILS = {
   storeName: "NEW KANIYAMPARAMBIL STORES",
   location: "THOPRAMKUDY PO, THOPRAMKUDY, KERALA",
   gstin: "32AWJPJ1371N1ZE",
+  sellerStateCode: "32",
   phone: "9544363171",
   email: "newkaniyamparambilstorestkdy@gmail.com",
   signatureCompany: "FOR NEW KANIYAMPARAMBIL STORES",
   signatureRole: "Authorized Signatory",
 } as const;
+
+const SELLER_STATE_CODE = B2B_STORE_DETAILS.sellerStateCode;
+
+function isInterStateB2B(rec: Pick<B2BSaleRecord, "buyer_state_code">): boolean {
+  return (rec.buyer_state_code ?? SELLER_STATE_CODE) !== SELLER_STATE_CODE;
+}
 
 const B2B_FRAME_STYLE: Partial<CSSStyleDeclaration> = {
   position: "fixed",
@@ -186,7 +197,7 @@ function getSaleItemSummary(item: SaleItem) {
   };
 }
 
-function getBillGstTotals(items: SaleItem[]) {
+function getBillGstTotals(items: SaleItem[], interState = false) {
   let totalTaxable = 0;
   let totalCgst = 0;
   let totalSgst = 0;
@@ -196,15 +207,20 @@ function getBillGstTotals(items: SaleItem[]) {
     totalCgst += s.cgstAmount;
     totalSgst += s.sgstAmount;
   });
+  const totalGst = totalCgst + totalSgst;
   const cgstRate = totalTaxable > 0 ? (totalCgst / totalTaxable) * 100 : 0;
   const sgstRate = totalTaxable > 0 ? (totalSgst / totalTaxable) * 100 : 0;
+  const igstRate = interState && totalTaxable > 0 ? (totalGst / totalTaxable) * 100 : 0;
   return {
     totalTaxable: Math.round(totalTaxable * 100) / 100,
     totalCgst: Math.round(totalCgst * 100) / 100,
     totalSgst: Math.round(totalSgst * 100) / 100,
-    totalGst: Math.round((totalCgst + totalSgst) * 100) / 100,
+    totalGst: Math.round(totalGst * 100) / 100,
+    totalIgst: interState ? Math.round(totalGst * 100) / 100 : 0,
     cgstRate,
     sgstRate,
+    igstRate,
+    interState,
   };
 }
 
@@ -352,11 +368,6 @@ function getNextB2BBillNo(existing: string[]): string {
   return `${latest}-1`;
 }
 
-function validateGstin(gstin: string): boolean {
-  const v = gstin.trim().toUpperCase();
-  return /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/.test(v);
-}
-
 function normalizeBuyer(raw: Record<string, unknown>): B2BBuyer {
   return {
     id: String(raw.id ?? crypto.randomUUID()),
@@ -456,10 +467,19 @@ function buildB2BInvoiceHtml(rec: B2BSaleRecord, options: B2BDocOptions = {}): s
   const isPdfMode = options.renderMode === "pdf";
   const shipAddress = bill.ship_to || bill.buyer_ship_to || bill.buyer_billing_address;
   const placeOfSupply = `${bill.buyer_state_code ?? "32"}-${(bill.buyer_state ?? "Kerala").toUpperCase()}`;
-  const gstTotals = getBillGstTotals(bill.items);
+  const interState = isInterStateB2B(bill);
+  const gstTotals = getBillGstTotals(bill.items, interState);
+  const amountInWords = numberToWordsIndian(bill.grand_total).replace(/^Rupees /, "INR ");
+  const reverseCharge = reverseChargeLabel(bill.reverse_charge);
 
   const rowMarkup = bill.items.map((item, index) => {
     const summary = getSaleItemSummary(item);
+    const igstRate = summary.sgstRate + summary.cgstRate;
+    const igstAmount = summary.sgstAmount + summary.cgstAmount;
+    const taxCells = interState
+      ? `<td class="col-gst align-right">${igstRate}%<br/>${escapeHtml(formatCurrency(igstAmount))}</td>`
+      : `<td class="col-gst align-right">${summary.sgstRate}%<br/>${escapeHtml(formatCurrency(summary.sgstAmount))}</td>
+      <td class="col-gst align-right">${summary.cgstRate}%<br/>${escapeHtml(formatCurrency(summary.cgstAmount))}</td>`;
     return `<tr>
       <td class="col-index">${index + 1}</td>
       <td class="col-item">
@@ -471,11 +491,19 @@ function buildB2BInvoiceHtml(rec: B2BSaleRecord, options: B2BDocOptions = {}): s
       <td class="col-rate align-right">${escapeHtml(formatCurrency(summary.rate))}</td>
       <td class="col-disc align-center">${item.disc_pct ? `${item.disc_pct}%` : "—"}</td>
       <td class="col-taxable align-right">${escapeHtml(formatCurrency(summary.taxableValue))}</td>
-      <td class="col-gst align-right">${summary.sgstRate}%<br/>${escapeHtml(formatCurrency(summary.sgstAmount))}</td>
-      <td class="col-gst align-right">${summary.cgstRate}%<br/>${escapeHtml(formatCurrency(summary.cgstAmount))}</td>
+      ${taxCells}
       <td class="col-amt align-right">${escapeHtml(formatCurrency(summary.total))}</td>
     </tr>`;
   }).join("");
+
+  const taxHeader = interState
+    ? "<th>IGST</th>"
+    : "<th>SGST</th><th>CGST</th>";
+
+  const taxTotalRows = interState
+    ? `<div class="total-row"><span>IGST ${gstTotals.igstRate.toFixed(1)}%</span><span>${escapeHtml(formatCurrency(gstTotals.totalIgst))}</span></div>`
+    : `<div class="total-row"><span>CGST ${gstTotals.cgstRate.toFixed(1)}%</span><span>${escapeHtml(formatCurrency(gstTotals.totalCgst))}</span></div>
+      <div class="total-row"><span>SGST ${gstTotals.sgstRate.toFixed(1)}%</span><span>${escapeHtml(formatCurrency(gstTotals.totalSgst))}</span></div>`;
 
   return `<!DOCTYPE html>
   <html lang="en">
@@ -586,18 +614,20 @@ function buildB2BInvoiceHtml(rec: B2BSaleRecord, options: B2BDocOptions = {}): s
             ${bill.buyer_pan ? `<div>PAN: ${escapeHtml(bill.buyer_pan)}</div>` : ""}
             <div>${escapeHtml(bill.buyer_billing_address)}</div>
             <div>Place of Supply: ${escapeHtml(placeOfSupply)}</div>
+            <div>Reverse Charge: ${escapeHtml(reverseCharge)}</div>
           </div>
         </div>
-        <div class="meta-grid" style="grid-template-columns: 1fr 1fr 1fr 1fr;">
+        <div class="meta-grid" style="grid-template-columns: 1fr 1fr 1fr 1fr 1fr;">
           <div><div class="meta-label">Bill No.</div>${escapeHtml(bill.bill_no)}</div>
           <div><div class="meta-label">Date</div>${escapeHtml(formatDocDate(bill.bill_date))}</div>
           <div><div class="meta-label">Ship To</div>${escapeHtml(shipAddress)}</div>
+          <div><div class="meta-label">Supply Type</div>${interState ? "Inter-State (IGST)" : "Intra-State (CGST+SGST)"}</div>
           <div style="border-right:0"><div class="meta-label">Payment</div>${escapeHtml(bill.payment_mode)} · ${escapeHtml(bill.payment_status)}</div>
         </div>
         <table class="items-table">
           <thead>
             <tr>
-              <th>#</th><th>Description</th><th>HSN</th><th>Qty</th><th>Rate</th><th>Disc</th><th>Taxable</th><th>SGST</th><th>CGST</th><th>Amount</th>
+              <th>#</th><th>Description</th><th>HSN</th><th>Qty</th><th>Rate</th><th>Disc</th><th>Taxable</th>${taxHeader}<th>Amount</th>
             </tr>
           </thead>
           <tbody>${rowMarkup}</tbody>
@@ -606,8 +636,7 @@ function buildB2BInvoiceHtml(rec: B2BSaleRecord, options: B2BDocOptions = {}): s
           <div class="totals">
             <div class="total-row"><span>Taxable Subtotal</span><span>${escapeHtml(formatCurrency(gstTotals.totalTaxable || bill.subtotal))}</span></div>
             ${bill.discount > 0 ? `<div class="total-row"><span>Discount</span><span>−${escapeHtml(formatCurrency(bill.discount))}</span></div>` : ""}
-            <div class="total-row"><span>CGST ${gstTotals.cgstRate.toFixed(1)}%</span><span>${escapeHtml(formatCurrency(gstTotals.totalCgst))}</span></div>
-            <div class="total-row"><span>SGST ${gstTotals.sgstRate.toFixed(1)}%</span><span>${escapeHtml(formatCurrency(gstTotals.totalSgst))}</span></div>
+            ${taxTotalRows}
             <div class="total-row"><span>Total GST</span><span>${escapeHtml(formatCurrency(gstTotals.totalGst || bill.total_gst))}</span></div>
             ${bill.f_cess > 0 ? `<div class="total-row"><span>F. Cess</span><span>${escapeHtml(formatCurrency(bill.f_cess))}</span></div>` : ""}
             ${bill.commission > 0 ? `<div class="total-row"><span>Commission</span><span>${escapeHtml(formatCurrency(bill.commission))}</span></div>` : ""}
@@ -617,6 +646,9 @@ function buildB2BInvoiceHtml(rec: B2BSaleRecord, options: B2BDocOptions = {}): s
             <div class="total-row"><span>Payment Received</span><span>${escapeHtml(formatCurrency(bill.payment_amount))}</span></div>
             <div class="total-row"><span>Balance</span><span>${escapeHtml(formatCurrency(bill.balance))}</span></div>
           </div>
+        </div>
+        <div class="words-row" style="border-top:1px solid #000;padding:8px 10px;font-size:${isPdfMode ? "8px" : "11px"};">
+          Total amount (in words): <b>${escapeHtml(amountInWords)}</b>
         </div>
         <div class="footer">
           <div>${escapeHtml(store.signatureCompany)}</div>
@@ -643,6 +675,7 @@ type B2BStatementMeta = {
   totalTaxable: number;
   totalSgst: number;
   totalCgst: number;
+  totalIgst: number;
   totalGst: number;
   totalSales: number;
   totalCollected: number;
@@ -733,11 +766,17 @@ function buildB2BStatementMeta(
   let totalTaxable = 0;
   let totalSgst = 0;
   let totalCgst = 0;
+  let totalIgst = 0;
   billList.forEach((bill) => {
-    const gst = getBillGstTotals(bill.items);
+    const interState = isInterStateB2B(bill);
+    const gst = getBillGstTotals(bill.items, interState);
     totalTaxable += gst.totalTaxable || bill.subtotal;
-    totalSgst += gst.totalSgst;
-    totalCgst += gst.totalCgst;
+    if (interState) {
+      totalIgst += gst.totalIgst;
+    } else {
+      totalSgst += gst.totalSgst;
+      totalCgst += gst.totalCgst;
+    }
   });
   return {
     reportTitle: "B2B ACCOUNT STATEMENT / BILLING REGISTER",
@@ -749,7 +788,8 @@ function buildB2BStatementMeta(
     totalTaxable: Math.round(totalTaxable * 100) / 100,
     totalSgst: Math.round(totalSgst * 100) / 100,
     totalCgst: Math.round(totalCgst * 100) / 100,
-    totalGst: Math.round((totalSgst + totalCgst) * 100) / 100,
+    totalIgst: Math.round(totalIgst * 100) / 100,
+    totalGst: Math.round((totalSgst + totalCgst + totalIgst) * 100) / 100,
     totalSales: billList.reduce((sum, b) => sum + b.grand_total, 0),
     totalCollected: billList.reduce((sum, b) => sum + b.payment_amount, 0),
     totalOutstanding: billList.reduce((sum, b) => sum + b.balance, 0),
@@ -766,7 +806,8 @@ function buildB2BStatementHtml(
   const isPdfMode = options.renderMode === "pdf";
 
   const rowMarkup = billList.map((bill, index) => {
-    const gst = getBillGstTotals(bill.items);
+    const interState = isInterStateB2B(bill);
+    const gst = getBillGstTotals(bill.items, interState);
     return `<tr>
       <td class="col-index">${index + 1}</td>
       <td class="col-date">${escapeHtml(b2bBillDate(bill) ? formatTableDate(b2bBillDate(bill)!) : "—")}</td>
@@ -774,8 +815,9 @@ function buildB2BStatementHtml(
       <td class="col-type">${escapeHtml(bill.form_type)}</td>
       <td class="col-items align-center">${bill.items.length}</td>
       <td class="col-amt align-right">${escapeHtml(formatCurrency(gst.totalTaxable || bill.subtotal))}</td>
-      <td class="col-amt align-right">${escapeHtml(formatCurrency(gst.totalSgst))}</td>
-      <td class="col-amt align-right">${escapeHtml(formatCurrency(gst.totalCgst))}</td>
+      <td class="col-amt align-right">${interState ? "—" : escapeHtml(formatCurrency(gst.totalSgst))}</td>
+      <td class="col-amt align-right">${interState ? "—" : escapeHtml(formatCurrency(gst.totalCgst))}</td>
+      <td class="col-amt align-right">${interState ? escapeHtml(formatCurrency(gst.totalIgst)) : "—"}</td>
       <td class="col-amt align-right">${escapeHtml(formatCurrency(bill.grand_total))}</td>
       <td class="col-amt align-right">${escapeHtml(formatCurrency(bill.payment_amount))}</td>
       <td class="col-amt align-right">${escapeHtml(formatCurrency(bill.balance))}</td>
@@ -950,19 +992,21 @@ function buildB2BStatementHtml(
               <th>Taxable</th>
               <th>SGST</th>
               <th>CGST</th>
+              <th>IGST</th>
               <th>Grand Total</th>
               <th>Paid</th>
               <th>Balance</th>
               <th>Status</th>
             </tr>
           </thead>
-          <tbody>${rowMarkup || `<tr><td colspan="12" style="text-align:center;padding:12px;">No B2B bills for this statement period.</td></tr>`}</tbody>
+          <tbody>${rowMarkup || `<tr><td colspan="13" style="text-align:center;padding:12px;">No B2B bills for this statement period.</td></tr>`}</tbody>
         </table>
         <div class="summary-grid">
           <div class="summary-box">Total Bills<b>${meta.totalBills}</b></div>
           <div class="summary-box">Total Taxable<b>${escapeHtml(formatCurrency(meta.totalTaxable))}</b></div>
           <div class="summary-box">Total SGST<b>${escapeHtml(formatCurrency(meta.totalSgst))}</b></div>
           <div class="summary-box">Total CGST<b>${escapeHtml(formatCurrency(meta.totalCgst))}</b></div>
+          <div class="summary-box">Total IGST<b>${escapeHtml(formatCurrency(meta.totalIgst))}</b></div>
         </div>
         <div class="summary-grid" style="border-top:0;">
           <div class="summary-box">Total GST<b>${escapeHtml(formatCurrency(meta.totalGst))}</b></div>
@@ -972,7 +1016,7 @@ function buildB2BStatementHtml(
         </div>
         <div class="footer-note">
           B2B account statement for ${escapeHtml(buyerDisplayName(buyer))} (${escapeHtml(buyer.gstin)}).
-          Amounts are computed from saved tax invoices including SGST/CGST split per bill line.
+          Amounts include SGST/CGST for intra-state and IGST for inter-state supplies per saved tax invoices.
         </div>
         <div class="signatory">
           <div>${escapeHtml(store.signatureCompany)}</div>
@@ -1439,6 +1483,49 @@ async function printB2BHtml(html: string, sheetSelector = ".b2b-sheet"): Promise
   }
 }
 
+async function detectB2BDbColumns(): Promise<{
+  hasReverseCharge: boolean;
+  hasTotalSgst: boolean;
+  hasTotalCgst: boolean;
+  hasTotalIgst: boolean;
+}> {
+  const probe = async (column: string) => {
+    const { error } = await supabase.from("sales_b2b").select(column).limit(1);
+    return !error;
+  };
+  const [hasReverseCharge, hasTotalSgst, hasTotalCgst, hasTotalIgst] = await Promise.all([
+    probe("reverse_charge"),
+    probe("total_sgst"),
+    probe("total_cgst"),
+    probe("total_igst"),
+  ]);
+  return { hasReverseCharge, hasTotalSgst, hasTotalCgst, hasTotalIgst };
+}
+
+const OPTIONAL_B2B_DB_COLUMNS = [
+  "reverse_charge",
+  "total_sgst",
+  "total_cgst",
+  "total_igst",
+] as const;
+
+function buildSupabaseB2BRow(
+  payload: B2BSaleRecord,
+  schema: Awaited<ReturnType<typeof detectB2BDbColumns>>,
+): Record<string, unknown> {
+  const row: Record<string, unknown> = { ...payload };
+  const availability: Record<(typeof OPTIONAL_B2B_DB_COLUMNS)[number], boolean> = {
+    reverse_charge: schema.hasReverseCharge,
+    total_sgst: schema.hasTotalSgst,
+    total_cgst: schema.hasTotalCgst,
+    total_igst: schema.hasTotalIgst,
+  };
+  for (const column of OPTIONAL_B2B_DB_COLUMNS) {
+    if (!availability[column]) delete row[column];
+  }
+  return row;
+}
+
 function normalizeB2BSale(raw: Record<string, unknown>): B2BSaleRecord {
   let items: SaleItem[] = [];
   if (Array.isArray(raw.items)) {
@@ -1485,7 +1572,16 @@ function normalizeB2BSale(raw: Record<string, unknown>): B2BSaleRecord {
     payment_status: String(raw.payment_status ?? "Credit"),
     created_at: raw.created_at ? String(raw.created_at) : undefined,
   };
-  return enrichB2BBill(base);
+  const interState = isInterStateB2B(base);
+  const gstFromItems = getBillGstTotals(base.items, interState);
+  const withGst: B2BSaleRecord = {
+    ...base,
+    total_sgst: toDbNumber(raw.total_sgst) || gstFromItems.totalSgst,
+    total_cgst: toDbNumber(raw.total_cgst) || gstFromItems.totalCgst,
+    total_igst: toDbNumber(raw.total_igst) || (interState ? gstFromItems.totalIgst : 0),
+    reverse_charge: raw.reverse_charge === true || raw.reverse_charge === "true",
+  };
+  return enrichB2BBill(withGst);
 }
 
 function buyerDisplayName(b: B2BBuyer): string {
@@ -1741,6 +1837,13 @@ export default function SalesB2BPage() {
   const [postage, setPostage] = useState("");
   const [paymentAmount, setPaymentAmount] = useState("");
   const [paymentMode, setPaymentMode] = useState("Bank Transfer");
+  const [reverseCharge, setReverseCharge] = useState(false);
+  const b2bDbColumnsRef = useRef<Awaited<ReturnType<typeof detectB2BDbColumns>>>({
+    hasReverseCharge: false,
+    hasTotalSgst: false,
+    hasTotalCgst: false,
+    hasTotalIgst: false,
+  });
   const [purchaseItemMap, setPurchaseItemMap] = useState<Map<string, PurchaseLineLookup>>(new Map());
   const [retailPriceMap, setRetailPriceMap] = useState<Map<string, number>>(new Map());
 
@@ -1848,6 +1951,8 @@ export default function SalesB2BPage() {
         if (data.length < FETCH_PAGE_SIZE) break;
         from += FETCH_PAGE_SIZE;
       }
+      const schema = await detectB2BDbColumns();
+      b2bDbColumnsRef.current = schema;
       setBills(rows.map(normalizeB2BSale));
       setDbStatus("connected");
       localStorage.setItem(LOCAL_SALES_KEY, JSON.stringify(rows));
@@ -1941,6 +2046,11 @@ export default function SalesB2BPage() {
     }
   }, [bills, editingBill]);
 
+  const billInterState = useMemo(
+    () => (selectedBuyer ? isInterStateB2B({ buyer_state_code: selectedBuyer.state_code }) : false),
+    [selectedBuyer],
+  );
+
   const calc = useMemo(() => {
     let sub = 0;
     let totalCgst = 0;
@@ -1960,17 +2070,21 @@ export default function SalesB2BPage() {
     const totalGst = totalCgst + totalSgst;
     const cgstRate = sub > 0 ? (totalCgst / sub) * 100 : 0;
     const sgstRate = sub > 0 ? (totalSgst / sub) * 100 : 0;
+    const igstRate = billInterState && sub > 0 ? (totalGst / sub) * 100 : 0;
     return {
       subtotal: Math.round(sub * 100) / 100,
       totalCgst: Math.round(totalCgst * 100) / 100,
       totalSgst: Math.round(totalSgst * 100) / 100,
+      totalIgst: billInterState ? Math.round(totalGst * 100) / 100 : 0,
       totalGst: Math.round(totalGst * 100) / 100,
       cgstRate,
       sgstRate,
+      igstRate,
+      interState: billInterState,
       roundOff: Math.round(roundOff * 100) / 100,
       grandTotal: Math.round(grandTotal * 100) / 100,
     };
-  }, [gridItems, discount, fCess, commission, postage]);
+  }, [gridItems, discount, fCess, commission, postage, billInterState]);
 
   useEffect(() => {
     if (calc.grandTotal > 0 && isBillFormOpen) setPaymentAmount(String(calc.grandTotal));
@@ -1994,10 +2108,11 @@ export default function SalesB2BPage() {
     );
   }, [buyers, buyerSearch]);
 
-  const viewingBillGst = useMemo(
-    () => (viewingBill ? getBillGstTotals(viewingBill.items) : null),
-    [viewingBill],
-  );
+  const viewingBillGst = useMemo(() => {
+    if (!viewingBill) return null;
+    const interState = isInterStateB2B(viewingBill);
+    return { ...getBillGstTotals(viewingBill.items, interState), interState };
+  }, [viewingBill]);
 
   const resetBuyerForm = () => {
     setEditingBuyer(null);
@@ -2131,6 +2246,7 @@ export default function SalesB2BPage() {
     setGridItems([blankItem()]);
     setFCess(""); setDiscount(""); setCommission(""); setPostage("");
     setPaymentAmount(""); setPaymentMode("Bank Transfer");
+    setReverseCharge(false);
     setFormError(null);
     setIsBillFormOpen(false);
   };
@@ -2225,6 +2341,8 @@ export default function SalesB2BPage() {
     const status = paidNum >= calc.grandTotal ? "Paid" : paidNum > 0 ? "Partial" : "Credit";
     const itemsFinal = gridItems.map((item) => ({ ...item, ...computeLineAutos(item) }));
 
+    const interState = isInterStateB2B({ buyer_state_code: selectedBuyer.state_code });
+
     const payload: B2BSaleRecord = {
       bill_no: billNo,
       buyer_id: selectedBuyer.id.startsWith("snapshot-") ? editingBill?.buyer_id : selectedBuyer.id,
@@ -2255,6 +2373,10 @@ export default function SalesB2BPage() {
       f_cess: Number(fCess) || 0,
       discount: Number(discount) || 0,
       total_gst: calc.totalGst,
+      total_sgst: calc.totalSgst,
+      total_cgst: calc.totalCgst,
+      total_igst: interState ? calc.totalIgst : 0,
+      reverse_charge: reverseCharge,
       commission: Number(commission) || 0,
       postage: Number(postage) || 0,
       round_off: calc.roundOff,
@@ -2268,7 +2390,8 @@ export default function SalesB2BPage() {
     if (editingBill) {
       if (dbStatus === "connected") {
         try {
-          const { error } = await supabase.from("sales_b2b").update(payload).eq("bill_no", editingBill.bill_no);
+          const row = buildSupabaseB2BRow(payload, b2bDbColumnsRef.current);
+          const { error } = await supabase.from("sales_b2b").update(row).eq("bill_no", editingBill.bill_no);
           if (error) throw error;
           setSuccessMsg(`Updated B2B bill ${billNo}.`);
           fetchBills();
@@ -2290,7 +2413,8 @@ export default function SalesB2BPage() {
       }
       if (dbStatus === "connected") {
         try {
-          const { error } = await supabase.from("sales_b2b").insert([payload]);
+          const row = buildSupabaseB2BRow(payload, b2bDbColumnsRef.current);
+          const { error } = await supabase.from("sales_b2b").insert([row]);
           if (error) throw error;
           setSuccessMsg(`B2B bill ${billNo} saved.`);
           fetchBills();
@@ -2344,6 +2468,7 @@ export default function SalesB2BPage() {
     setPostage(String(bill.postage || ""));
     setPaymentAmount(String(bill.payment_amount));
     setPaymentMode(bill.payment_mode);
+    setReverseCharge(Boolean(bill.reverse_charge));
     setFormError(null);
     setViewingBill(null);
     setIsBillFormOpen(true);
@@ -3029,6 +3154,12 @@ export default function SalesB2BPage() {
                     <div className="md:col-span-2"><span className="text-slate-500">Billing:</span> {selectedBuyer.billing_address}</div>
                     {selectedBuyer.pan && <div><span className="text-slate-500">PAN:</span> {selectedBuyer.pan}</div>}
                     <div><span className="text-slate-500">State:</span> {selectedBuyer.state} ({selectedBuyer.state_code})</div>
+                    <div>
+                      <span className="text-slate-500">Supply:</span>{" "}
+                      <span className={billInterState ? "text-amber-700 font-semibold" : "text-emerald-700 font-semibold"}>
+                        {billInterState ? "Inter-State (IGST)" : "Intra-State (CGST + SGST)"}
+                      </span>
+                    </div>
                   </div>
                 )}
               </div>
@@ -3074,6 +3205,14 @@ export default function SalesB2BPage() {
                 <div className="lg:col-span-2">
                   <label className="form-label text-xs">Ship To</label>
                   <input value={shipTo} onChange={(e) => setShipTo(e.target.value)} className="input-enterprise text-xs" />
+                </div>
+                <div className="flex items-end">
+                  <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer pb-2">
+                    <input type="checkbox" checked={reverseCharge}
+                      onChange={(e) => setReverseCharge(e.target.checked)}
+                      className="rounded border-slate-300" />
+                    Reverse charge applicable
+                  </label>
                 </div>
               </div>
 
@@ -3192,8 +3331,14 @@ export default function SalesB2BPage() {
                 </div>
                 <div className="bg-slate-50 rounded-xl p-4 space-y-1 text-xs">
                   <div className="flex justify-between"><span>Taxable Subtotal</span><span>{formatCurrency(calc.subtotal)}</span></div>
-                  <div className="flex justify-between"><span>CGST ({calc.cgstRate.toFixed(1)}%)</span><span>{formatCurrency(calc.totalCgst)}</span></div>
-                  <div className="flex justify-between"><span>SGST ({calc.sgstRate.toFixed(1)}%)</span><span>{formatCurrency(calc.totalSgst)}</span></div>
+                  {calc.interState ? (
+                    <div className="flex justify-between"><span>IGST ({calc.igstRate.toFixed(1)}%)</span><span>{formatCurrency(calc.totalIgst)}</span></div>
+                  ) : (
+                    <>
+                      <div className="flex justify-between"><span>CGST ({calc.cgstRate.toFixed(1)}%)</span><span>{formatCurrency(calc.totalCgst)}</span></div>
+                      <div className="flex justify-between"><span>SGST ({calc.sgstRate.toFixed(1)}%)</span><span>{formatCurrency(calc.totalSgst)}</span></div>
+                    </>
+                  )}
                   <div className="flex justify-between font-medium"><span>Total GST</span><span>{formatCurrency(calc.totalGst)}</span></div>
                   <div className="flex justify-between"><span>Round Off</span><span>{formatCurrency(calc.roundOff)}</span></div>
                   <div className="flex justify-between font-bold text-base border-t border-slate-200 pt-2 mt-2">
@@ -3251,12 +3396,19 @@ export default function SalesB2BPage() {
                 <div><span className="text-slate-500">Branch:</span> {viewingBill.branch_godown}</div>
                 <div><span className="text-slate-500">Subtotal:</span> {formatCurrency(viewingBill.subtotal)}</div>
                 {viewingBillGst && (
-                  <>
-                    <div><span className="text-slate-500">CGST ({viewingBillGst.cgstRate.toFixed(1)}%):</span> {formatCurrency(viewingBillGst.totalCgst)}</div>
-                    <div><span className="text-slate-500">SGST ({viewingBillGst.sgstRate.toFixed(1)}%):</span> {formatCurrency(viewingBillGst.totalSgst)}</div>
-                    <div><span className="text-slate-500">Total GST:</span> {formatCurrency(viewingBillGst.totalGst || viewingBill.total_gst)}</div>
-                  </>
+                  viewingBillGst.interState ? (
+                    <div><span className="text-slate-500">IGST ({viewingBillGst.igstRate.toFixed(1)}%):</span> {formatCurrency(viewingBillGst.totalIgst)}</div>
+                  ) : (
+                    <>
+                      <div><span className="text-slate-500">CGST ({viewingBillGst.cgstRate.toFixed(1)}%):</span> {formatCurrency(viewingBillGst.totalCgst)}</div>
+                      <div><span className="text-slate-500">SGST ({viewingBillGst.sgstRate.toFixed(1)}%):</span> {formatCurrency(viewingBillGst.totalSgst)}</div>
+                    </>
+                  )
                 )}
+                {viewingBillGst && (
+                  <div><span className="text-slate-500">Total GST:</span> {formatCurrency(viewingBillGst.totalGst || viewingBill.total_gst)}</div>
+                )}
+                <div><span className="text-slate-500">Reverse Charge:</span> {reverseChargeLabel(viewingBill.reverse_charge)}</div>
                 <div><span className="text-slate-500">Grand Total:</span> <strong>{formatCurrency(viewingBill.grand_total)}</strong></div>
                 <div><span className="text-slate-500">Paid:</span> {formatCurrency(viewingBill.payment_amount)}</div>
                 <div><span className="text-slate-500">Balance:</span> {formatCurrency(viewingBill.balance)}</div>

@@ -93,6 +93,9 @@ alter table public.sales add column if not exists payment_amount  numeric not nu
 alter table public.sales add column if not exists payment_mode    text not null default 'Cash';
 alter table public.sales add column if not exists balance         numeric not null default 0;
 alter table public.sales add column if not exists payment_status  text not null default 'Paid';
+alter table public.sales add column if not exists customer_gstin  text;
+alter table public.sales add column if not exists reverse_charge   boolean not null default false;
+alter table public.sales add column if not exists total_igst        numeric not null default 0;
 alter table public.sales add column if not exists created_at      timestamp with time zone default timezone('utc'::text, now()) not null;
 
 -- Reload API schema cache so the app sees new columns immediately

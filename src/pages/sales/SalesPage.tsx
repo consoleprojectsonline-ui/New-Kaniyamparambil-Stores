@@ -7,7 +7,7 @@ import {
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
-import { formatCurrency, formatTableDate } from "@/lib/utils";
+import { formatCurrency, formatTableDate, numberToWordsIndian, reverseChargeLabel, validateGstin } from "@/lib/utils";
 import upiQrUrl from "@/assets/upi-qr.png";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -37,6 +37,8 @@ export interface SaleRecord {
   bill_date: string;
   customer_name: string;
   customer_phone?: string;
+  customer_gstin?: string;
+  reverse_charge?: boolean;
   ship_to?: string;
   salesman?: string;
   vehicle_no?: string;
@@ -50,6 +52,7 @@ export interface SaleRecord {
   total_gst: number;
   total_sgst: number;
   total_cgst: number;
+  total_igst?: number;
   commission: number;
   postage: number;
   round_off: number;
@@ -122,6 +125,7 @@ const INVOICE_STATIC_DETAILS = {
   customerGstin: "—",
   customerState: "Kerala",
   customerCode: "32",
+  sellerStateCode: "32",
   transportation: "Road",
   vehicleNo: "—",
   bankName: "bank details",
@@ -192,56 +196,6 @@ function formatInvoiceTime(value?: string): string {
   }).format(validDate);
 }
 
-function toWordsBelowThousand(num: number): string {
-  const ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"];
-  const teens = ["Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
-  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
-
-  let n = Math.floor(num);
-  const parts: string[] = [];
-
-  if (n >= 100) {
-    parts.push(`${ones[Math.floor(n / 100)]} Hundred`);
-    n %= 100;
-  }
-  if (n >= 20) {
-    parts.push(tens[Math.floor(n / 10)]);
-    n %= 10;
-  } else if (n >= 10) {
-    parts.push(teens[n - 10]);
-    n = 0;
-  }
-  if (n > 0) parts.push(ones[n]);
-
-  return parts.filter(Boolean).join(" ");
-}
-
-function numberToWordsIndian(value: number): string {
-  const amount = Math.max(0, Math.round(value));
-  if (amount === 0) return "Rupees Zero Only";
-
-  const units = [
-    { value: 10000000, label: "Crore" },
-    { value: 100000, label: "Lakh" },
-    { value: 1000, label: "Thousand" },
-  ];
-
-  let remaining = amount;
-  const words: string[] = [];
-
-  units.forEach(({ value: unitValue, label }) => {
-    if (remaining >= unitValue) {
-      const unitCount = Math.floor(remaining / unitValue);
-      words.push(`${toWordsBelowThousand(unitCount)} ${label}`);
-      remaining %= unitValue;
-    }
-  });
-
-  if (remaining > 0) words.push(toWordsBelowThousand(remaining));
-
-  return `Rupees ${words.join(" ").replace(/\s+/g, " ").trim()} Only`;
-}
-
 function getSaleItemSummary(item: SaleItem) {
   const quantity = Number(item.qty) || 0;
   const rate = Number(item.mrp) || 0;
@@ -278,10 +232,12 @@ function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): 
   const companyName = store.storeNameLines.join(" ");
   const billedAddress = rec.ship_to || store.customerAddress;
   const shippedAddress = rec.ship_to || billedAddress;
-  const customerGstin = store.customerGstin.includes("â") ? "-" : store.customerGstin;
+  const customerGstin = rec.customer_gstin?.trim()
+    || (store.customerGstin.includes("â") ? "—" : store.customerGstin);
   const vehicleNo = rec.vehicle_no?.trim()
     || (store.vehicleNo.includes("â") ? "-" : store.vehicleNo);
-  const placeOfSupply = `${store.customerCode}-${store.customerState.toUpperCase()}`;
+  const placeOfSupply = `${store.sellerStateCode}-${store.customerState.toUpperCase()}`;
+  const reverseCharge = reverseChargeLabel(rec.reverse_charge);
   const lineSummaries = rec.items.map(getSaleItemSummary);
   const totalQuantity = lineSummaries.reduce((sum, item) => sum + item.quantity, 0);
   const totalAmount = lineSummaries.reduce((sum, item) => sum + item.amount, 0);
@@ -295,22 +251,15 @@ function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): 
 
   const rowMarkup = rec.items.map((item, index) => {
     const summary = lineSummaries[index];
-    const itemExtras = isPdfMode
-      ? [
-          item.code ? `Code: ${escapeHtml(item.code)}` : "",
-          summary.discountPercent > 0
-            ? `Disc: ${summary.discountPercent.toFixed(0)}%`
-            : "",
-        ].filter(Boolean).join(" | ")
-      : [
-          item.code ? `Code: ${escapeHtml(item.code)}` : "",
-          summary.discountPercent > 0
-            ? `Disc: ${summary.discountPercent.toFixed(0)}% (${formatCurrency(summary.discountAmount)})`
-            : "",
-          `CGST ${summary.cgstRate.toFixed(1)}%: ${formatCurrency(summary.cgstAmount)}`,
-          `SGST ${summary.sgstRate.toFixed(1)}%: ${formatCurrency(summary.sgstAmount)}`,
-          `Line Total: ${formatCurrency(summary.total)}`,
-        ].filter(Boolean).join(" | ");
+    const itemExtras = [
+      item.code ? `Code: ${escapeHtml(item.code)}` : "",
+      summary.discountPercent > 0
+        ? `Disc: ${summary.discountPercent.toFixed(0)}%${isPdfMode ? "" : ` (${formatCurrency(summary.discountAmount)})`}`
+        : "",
+      `CGST ${summary.cgstRate.toFixed(1)}%: ${formatCurrency(summary.cgstAmount)}`,
+      `SGST ${summary.sgstRate.toFixed(1)}%: ${formatCurrency(summary.sgstAmount)}`,
+      `Line Total: ${formatCurrency(summary.total)}`,
+    ].filter(Boolean).join(" | ");
 
     return `<tr>
       <td class="col-index">${index + 1}</td>
@@ -665,6 +614,10 @@ function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): 
                   <td class="meta-label">Payment Mode:</td>
                   <td class="meta-value">${escapeHtml(rec.payment_mode || "Cash")}</td>
                 </tr>
+                <tr>
+                  <td class="meta-label">Reverse Charge:</td>
+                  <td class="meta-value">${escapeHtml(reverseCharge)}</td>
+                </tr>
               </table>
             </td>
           </tr>
@@ -941,19 +894,31 @@ async function detectSalesDbColumns(): Promise<{
   hasLinesTotal: boolean;
   hasTotalSgst: boolean;
   hasTotalCgst: boolean;
+  hasCustomerGstin: boolean;
+  hasReverseCharge: boolean;
+  hasTotalIgst: boolean;
 }> {
   const probe = async (column: string) => {
     const { error } = await supabase.from("sales").select(column).limit(1);
     return !error;
   };
-  const [hasVehicleNo, hasRoundOff, hasLinesTotal, hasTotalSgst, hasTotalCgst] = await Promise.all([
+  const [
+    hasVehicleNo, hasRoundOff, hasLinesTotal, hasTotalSgst, hasTotalCgst,
+    hasCustomerGstin, hasReverseCharge, hasTotalIgst,
+  ] = await Promise.all([
     probe("vehicle_no"),
     probe("round_off"),
     probe("lines_total"),
     probe("total_sgst"),
     probe("total_cgst"),
+    probe("customer_gstin"),
+    probe("reverse_charge"),
+    probe("total_igst"),
   ]);
-  return { hasVehicleNo, hasRoundOff, hasLinesTotal, hasTotalSgst, hasTotalCgst };
+  return {
+    hasVehicleNo, hasRoundOff, hasLinesTotal, hasTotalSgst, hasTotalCgst,
+    hasCustomerGstin, hasReverseCharge, hasTotalIgst,
+  };
 }
 
 const OPTIONAL_SALE_DB_COLUMNS = [
@@ -962,6 +927,9 @@ const OPTIONAL_SALE_DB_COLUMNS = [
   "lines_total",
   "total_sgst",
   "total_cgst",
+  "customer_gstin",
+  "reverse_charge",
+  "total_igst",
 ] as const;
 
 function buildSupabaseSaleRow(
@@ -975,6 +943,9 @@ function buildSupabaseSaleRow(
     lines_total: schema.hasLinesTotal,
     total_sgst: schema.hasTotalSgst,
     total_cgst: schema.hasTotalCgst,
+    customer_gstin: schema.hasCustomerGstin,
+    reverse_charge: schema.hasReverseCharge,
+    total_igst: schema.hasTotalIgst,
   };
   for (const column of OPTIONAL_SALE_DB_COLUMNS) {
     if (!availability[column]) delete row[column];
@@ -1615,6 +1586,8 @@ function normalizeSale(raw: Record<string, unknown>): SaleRecord {
     bill_date: String(raw.bill_date ?? raw.invoice_date ?? ""),
     customer_name: String(raw.customer_name ?? ""),
     customer_phone: raw.customer_phone ? String(raw.customer_phone) : "",
+    customer_gstin: raw.customer_gstin ? String(raw.customer_gstin).toUpperCase() : undefined,
+    reverse_charge: raw.reverse_charge === true || raw.reverse_charge === "true",
     ship_to: raw.ship_to ? String(raw.ship_to) : "",
     salesman: raw.salesman ? String(raw.salesman) : "",
     vehicle_no: raw.vehicle_no ? String(raw.vehicle_no) : undefined,
@@ -1628,6 +1601,7 @@ function normalizeSale(raw: Record<string, unknown>): SaleRecord {
     total_gst: totalGst,
     total_sgst: resolvedTotalSgst,
     total_cgst: resolvedTotalCgst,
+    total_igst: toDbNumber(raw.total_igst),
     commission: toDbNumber(raw.commission),
     postage: toDbNumber(raw.postage),
     round_off: toDbNumber(raw.round_off),
@@ -1856,6 +1830,9 @@ export default function SalesPage() {
     hasLinesTotal: false,
     hasTotalSgst: false,
     hasTotalCgst: false,
+    hasCustomerGstin: false,
+    hasReverseCharge: false,
+    hasTotalIgst: false,
   });
   const [editingSale, setEditingSale] = useState<SaleRecord | null>(null);
   const [viewingSale, setViewingSale] = useState<SaleRecord | null>(null);
@@ -1907,6 +1884,8 @@ export default function SalesPage() {
   const [isCustomCustomer, setIsCustomCustomer] = useState(false);
   const [customCustomerText, setCustomCustomerText] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
+  const [customerGstin, setCustomerGstin] = useState("");
+  const [reverseCharge, setReverseCharge] = useState(false);
   const [shipTo, setShipTo] = useState("");
   const [vehicleNo, setVehicleNo] = useState("");
   const [salesman, setSalesman] = useState("Manager");
@@ -2190,7 +2169,7 @@ export default function SalesPage() {
     setFormType("Tax Invoice");
     setBillDate(new Date().toISOString().split("T")[0]);
     setCustomerName(""); setIsCustomCustomer(false); setCustomCustomerText("");
-    setCustomerPhone(""); setShipTo(""); setVehicleNo("");
+    setCustomerPhone(""); setCustomerGstin(""); setReverseCharge(false); setShipTo(""); setVehicleNo("");
     setSalesman("Manager"); setIsCustomSalesman(false); setCustomSalesmanText("");
     setBranchGodown("Shop (Main Showroom)"); setRateTp("Retail");
     setGridItems([blankItem()]);
@@ -2210,6 +2189,8 @@ export default function SalesPage() {
     if (SEED_CUSTOMERS.includes(rec.customer_name)) { setCustomerName(rec.customer_name); setIsCustomCustomer(false); }
     else { setCustomerName("CUSTOM"); setIsCustomCustomer(true); setCustomCustomerText(rec.customer_name); }
     setCustomerPhone(rec.customer_phone ?? "");
+    setCustomerGstin(rec.customer_gstin ?? "");
+    setReverseCharge(Boolean(rec.reverse_charge));
     setShipTo(rec.ship_to ?? "");
     setVehicleNo(rec.vehicle_no ?? "");
     if (SEED_SALESMEN.includes(rec.salesman ?? "")) { setSalesman(rec.salesman ?? "Manager"); setIsCustomSalesman(false); }
@@ -2243,12 +2224,20 @@ export default function SalesPage() {
 
     const itemsFinal = gridItems.map((item) => ({ ...item, ...computeLineAutos(item) }));
 
+    const gstinTrim = customerGstin.trim().toUpperCase();
+    if (gstinTrim && !validateGstin(gstinTrim)) {
+      setFormError("Enter a valid 15-character customer GSTIN, or leave blank for unregistered buyers.");
+      return;
+    }
+
     const payload: SaleRecord = {
       bill_no: billNo,
       form_type: formType,
       bill_date: billDate,
       customer_name: customerFinal,
       customer_phone: customerPhone.trim() || undefined,
+      customer_gstin: gstinTrim || undefined,
+      reverse_charge: reverseCharge,
       ship_to: shipTo.trim() || undefined,
       salesman: salesmanFinal || undefined,
       vehicle_no: vehicleNo.trim() || undefined,
@@ -2262,6 +2251,7 @@ export default function SalesPage() {
       total_gst: calc.totalGst,
       total_sgst: calc.totalSgst,
       total_cgst: calc.totalCgst,
+      total_igst: 0,
       commission: Number(commission) || 0,
       postage: Number(postage) || 0,
       round_off: calc.roundOff,
@@ -3232,6 +3222,29 @@ export default function SalesPage() {
                     <input type="tel" value={customerPhone} onChange={(e) => setCustomerPhone(e.target.value)}
                       placeholder="10-digit mobile" className="input-enterprise font-mono text-xs" />
                   </div>
+
+                  {/* Customer GSTIN */}
+                  <div>
+                    <label className="form-label text-xs font-semibold text-slate-700 mb-1 block">
+                      Customer GSTIN
+                      <span className="ml-1 text-[10px] font-normal text-slate-400">(optional)</span>
+                    </label>
+                    <input type="text" value={customerGstin}
+                      onChange={(e) => setCustomerGstin(e.target.value.toUpperCase())}
+                      maxLength={15}
+                      placeholder="For GST-registered buyers"
+                      className="input-enterprise font-mono text-xs uppercase" />
+                  </div>
+
+                  {/* Reverse Charge */}
+                  <div className="flex items-end">
+                    <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer pb-2">
+                      <input type="checkbox" checked={reverseCharge}
+                        onChange={(e) => setReverseCharge(e.target.checked)}
+                        className="rounded border-slate-300" />
+                      Reverse charge applicable
+                    </label>
+                  </div>
                 </div>
               </div>
 
@@ -3494,6 +3507,8 @@ export default function SalesPage() {
                   ["Date", formatTableDate(viewingSale.bill_date)],
                   ["Rate TP", viewingSale.rate_tp],
                   ["Customer", viewingSale.customer_name],
+                  ["Customer GSTIN", viewingSale.customer_gstin || "—"],
+                  ["Reverse Charge", reverseChargeLabel(viewingSale.reverse_charge)],
                   ["Phone", viewingSale.customer_phone || "—"],
                   ["Ship To", viewingSale.ship_to || "—"],
                   ["Vehicle No.", viewingSale.vehicle_no || "—"],

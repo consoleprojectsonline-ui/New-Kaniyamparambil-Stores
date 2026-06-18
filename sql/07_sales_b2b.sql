@@ -122,6 +122,10 @@ alter table public.sales_b2b add column if not exists payment_amount        nume
 alter table public.sales_b2b add column if not exists payment_mode          text not null default 'Bank Transfer';
 alter table public.sales_b2b add column if not exists balance               numeric not null default 0;
 alter table public.sales_b2b add column if not exists payment_status        text not null default 'Credit';
+alter table public.sales_b2b add column if not exists reverse_charge        boolean not null default false;
+alter table public.sales_b2b add column if not exists total_sgst            numeric not null default 0;
+alter table public.sales_b2b add column if not exists total_cgst            numeric not null default 0;
+alter table public.sales_b2b add column if not exists total_igst            numeric not null default 0;
 alter table public.sales_b2b add column if not exists created_at            timestamp with time zone default timezone('utc'::text, now()) not null;
 
 -- 4) Row Level Security

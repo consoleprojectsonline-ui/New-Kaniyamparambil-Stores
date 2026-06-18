@@ -14,6 +14,8 @@ import {
   Clock,
   Loader2,
   MoreHorizontal,
+  Eye,
+  X,
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { useAuthStore } from "@/stores/authStore";
@@ -108,6 +110,17 @@ const MODULES = [
 
 const PRIORITIES = ["Low", "Normal", "High"] as const;
 
+const SUPPORT_STATUS_OPTIONS: { value: SupportStatus; label: string }[] = [
+  { value: "Open", label: "Open" },
+  { value: "In Progress", label: "In Progress" },
+  { value: "Resolved", label: "Solved" },
+  { value: "Closed", label: "Closed" },
+];
+
+function statusLabel(status: SupportStatus): string {
+  return SUPPORT_STATUS_OPTIONS.find((o) => o.value === status)?.label ?? status;
+}
+
 function isMissingTableError(error: { code?: string; message?: string }): boolean {
   const message = (error.message ?? "").toLowerCase();
   if (error.code === "PGRST205" || error.code === "42P01") return true;
@@ -125,8 +138,8 @@ function normalizeRequest(raw: Record<string, unknown>): SupportRequest {
     description: String(raw.description ?? ""),
     reference_no: raw.reference_no ? String(raw.reference_no) : undefined,
     priority: String(raw.priority ?? "Normal"),
-    status: (["Open", "In Progress", "Resolved", "Closed"].includes(String(raw.status))
-      ? String(raw.status)
+    status: (["Open", "In Progress", "Resolved", "Closed", "Solved"].includes(String(raw.status))
+      ? (String(raw.status) === "Solved" ? "Resolved" : String(raw.status))
       : "Open") as SupportStatus,
     reporter_name: raw.reporter_name ? String(raw.reporter_name) : undefined,
     reporter_email: raw.reporter_email ? String(raw.reporter_email) : undefined,
@@ -160,6 +173,10 @@ function priorityStyle(priority: string): string {
   }
 }
 
+function issueCategoryMeta(category: string) {
+  return ISSUE_CATEGORIES.find((c) => c.value === category);
+}
+
 export default function SupportPage() {
   const { user } = useAuthStore();
   const reporterName = user?.user_metadata?.owner_name || "Manager";
@@ -172,6 +189,9 @@ export default function SupportPage() {
   const [activeTab, setActiveTab] = useState<RequestKind>("issue");
   const [formError, setFormError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [viewingRequest, setViewingRequest] = useState<SupportRequest | null>(null);
+  const [statusUpdating, setStatusUpdating] = useState(false);
+  const [statusUpdateError, setStatusUpdateError] = useState<string | null>(null);
 
   const [category, setCategory] = useState<string>("Bug");
   const [module, setModule] = useState<string>("General");
@@ -318,6 +338,65 @@ export default function SupportPage() {
       setFormError(err instanceof Error ? err.message : "Failed to submit. Please try again.");
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const applyRequestUpdate = (updated: SupportRequest) => {
+    setRequests((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    setViewingRequest(updated);
+  };
+
+  const handleStatusChange = async (newStatus: SupportStatus) => {
+    if (!viewingRequest || viewingRequest.status === newStatus) return;
+
+    setStatusUpdating(true);
+    setStatusUpdateError(null);
+    const previous = viewingRequest;
+    const optimistic = { ...viewingRequest, status: newStatus };
+    applyRequestUpdate(optimistic);
+
+    try {
+      if (dbStatus === "connected") {
+        const { data, error } = await supabase
+          .from("support_requests")
+          .update({ status: newStatus })
+          .eq("id", viewingRequest.id)
+          .select("*")
+          .single();
+
+        if (error) {
+          if (isMissingTableError(error)) {
+            setDbStatus("local");
+            setRequests((prev) => {
+              const updated = prev.map((r) =>
+                r.id === viewingRequest.id ? optimistic : r,
+              );
+              localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(updated));
+              return updated;
+            });
+          } else {
+            applyRequestUpdate(previous);
+            throw error;
+          }
+        } else if (data) {
+          applyRequestUpdate(normalizeRequest(data as Record<string, unknown>));
+        }
+      } else {
+        setRequests((prev) => {
+          const updated = prev.map((r) =>
+            r.id === viewingRequest.id ? optimistic : r,
+          );
+          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(updated));
+          return updated;
+        });
+      }
+    } catch (err) {
+      applyRequestUpdate(previous);
+      setStatusUpdateError(
+        err instanceof Error ? err.message : "Failed to update status. Please try again.",
+      );
+    } finally {
+      setStatusUpdating(false);
     }
   };
 
@@ -568,14 +647,27 @@ export default function SupportPage() {
                         )}
                       </p>
                     </div>
-                    <span
-                      className={cn(
-                        "shrink-0 text-[9px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full border",
-                        statusStyle(req.status),
-                      )}
-                    >
-                      {req.status}
-                    </span>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setStatusUpdateError(null);
+                          setViewingRequest(req);
+                        }}
+                        title="View submission"
+                        className="p-1 rounded-md text-slate-500 hover:text-primary hover:bg-white border border-transparent hover:border-slate-200 transition-colors"
+                      >
+                        <Eye className="w-3.5 h-3.5" />
+                      </button>
+                      <span
+                        className={cn(
+                          "text-[9px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full border",
+                          statusStyle(req.status),
+                        )}
+                      >
+                        {statusLabel(req.status)}
+                      </span>
+                    </div>
                   </div>
                   <p className="text-[10px] text-slate-600 line-clamp-2 leading-relaxed">
                     {req.description}
@@ -594,6 +686,153 @@ export default function SupportPage() {
           </div>
         </div>
       </div>
+
+      {viewingRequest && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div
+            className="absolute inset-0"
+            onClick={() => setViewingRequest(null)}
+            aria-hidden
+          />
+          <div className="relative bg-white rounded-xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150">
+            <div className="px-5 py-4 border-b border-border bg-slate-50/80 flex items-start justify-between gap-3 shrink-0">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 flex-wrap mb-1">
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="support-status-select" className="sr-only">Status</label>
+                    <select
+                      id="support-status-select"
+                      value={viewingRequest.status}
+                      disabled={statusUpdating}
+                      onChange={(e) => handleStatusChange(e.target.value as SupportStatus)}
+                      className={cn(
+                        "text-[10px] font-bold uppercase tracking-wide px-2 py-1 rounded-full border cursor-pointer bg-white disabled:opacity-60",
+                        statusStyle(viewingRequest.status),
+                      )}
+                    >
+                      {SUPPORT_STATUS_OPTIONS.map(({ value, label }) => (
+                        <option key={value} value={value}>{label}</option>
+                      ))}
+                    </select>
+                    {statusUpdating && (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" aria-hidden />
+                    )}
+                  </div>
+                  <span className="text-[10px] text-slate-500">
+                    {viewingRequest.request_kind === "feature" ? "Feature Request" : "Issue Report"}
+                  </span>
+                </div>
+                <h2 className="text-sm font-semibold text-text-primary leading-snug">
+                  {viewingRequest.subject}
+                </h2>
+                {statusUpdateError && (
+                  <p className="text-[10px] text-red-600 mt-1 flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3 shrink-0" />
+                    {statusUpdateError}
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setViewingRequest(null)}
+                className="p-1.5 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-200/80 shrink-0"
+                aria-label="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 overflow-y-auto flex-1 text-xs">
+              {viewingRequest.request_kind === "issue" && (() => {
+                const meta = issueCategoryMeta(viewingRequest.category);
+                const Icon = meta?.icon ?? MoreHorizontal;
+                const tone = meta?.tone ?? "slate";
+                return (
+                  <div className={cn(
+                    "flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold w-fit",
+                    issueCategoryClasses(tone, true),
+                  )}>
+                    <Icon className={cn("w-3.5 h-3.5", issueCategoryIconClass(tone, true))} />
+                    {viewingRequest.category}
+                  </div>
+                );
+              })()}
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">Module</p>
+                  <p className="text-slate-800 font-medium">{viewingRequest.module}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">Status</p>
+                  <p className={cn(
+                    "inline-flex text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full border w-fit",
+                    statusStyle(viewingRequest.status),
+                  )}>
+                    {statusLabel(viewingRequest.status)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">Priority</p>
+                  <p className={cn("font-semibold", priorityStyle(viewingRequest.priority))}>
+                    {viewingRequest.priority}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">Submitted</p>
+                  <p className="text-slate-800">{formatTableDate(viewingRequest.created_at)}</p>
+                </div>
+                <div className="col-span-2">
+                  <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">Type</p>
+                  <p className="text-slate-800">{viewingRequest.category}</p>
+                </div>
+              </div>
+
+              {viewingRequest.reference_no && (
+                <div>
+                  <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">
+                    Bill / Reference
+                  </p>
+                  <p className="font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
+                    {viewingRequest.reference_no}
+                  </p>
+                </div>
+              )}
+
+              <div>
+                <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-1">
+                  {viewingRequest.request_kind === "feature" ? "Feature Description" : "Problem Description"}
+                </p>
+                <p className="text-slate-700 leading-relaxed whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded-lg px-3 py-3">
+                  {viewingRequest.description}
+                </p>
+              </div>
+
+              {(viewingRequest.reporter_name || viewingRequest.reporter_email) && (
+                <div className="pt-3 border-t border-slate-100">
+                  <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-0.5">Reporter</p>
+                  <p className="text-slate-700">
+                    {viewingRequest.reporter_name}
+                    {viewingRequest.reporter_email && (
+                      <span className="text-slate-500"> · {viewingRequest.reporter_email}</span>
+                    )}
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="px-5 py-3 border-t border-border bg-slate-50/80 flex justify-end shrink-0">
+              <button
+                type="button"
+                onClick={() => setViewingRequest(null)}
+                className="btn-secondary text-xs px-4"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
