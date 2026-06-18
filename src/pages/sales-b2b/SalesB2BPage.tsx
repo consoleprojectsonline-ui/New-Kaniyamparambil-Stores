@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Building2, Plus, Search, Trash2, AlertTriangle, Check, Database, X, Edit,
-  Receipt, User, Truck, Eye, FileText, Users,
+  Receipt, User, Truck, Eye, FileText, Users, Printer, Download,
 } from "lucide-react";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatTableDate } from "@/lib/utils";
 import type { SaleItem } from "@/pages/sales/SalesPage";
@@ -104,6 +106,30 @@ const FETCH_PAGE_SIZE = 1000;
 const LOCAL_BUYERS_KEY = "kaniyamparambil_b2b_buyers";
 const LOCAL_SALES_KEY = "kaniyamparambil_sales_b2b";
 
+const B2B_STORE_DETAILS = {
+  storeName: "NEW KANIYAMPARAMBIL STORES",
+  location: "THOPRAMKUDY PO, THOPRAMKUDY, KERALA",
+  gstin: "32AWJPJ1371N1ZE",
+  phone: "9544363171",
+  email: "newkaniyamparambilstorestkdy@gmail.com",
+  signatureCompany: "FOR NEW KANIYAMPARAMBIL STORES",
+  signatureRole: "Authorized Signatory",
+} as const;
+
+const B2B_FRAME_STYLE: Partial<CSSStyleDeclaration> = {
+  position: "fixed",
+  top: "0",
+  left: "-20000px",
+  width: "794px",
+  height: "auto",
+  minHeight: "400px",
+  opacity: "0",
+  pointerEvents: "none",
+  border: "0",
+  background: "transparent",
+  overflow: "visible",
+};
+
 type PageTab = "bills" | "buyers";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -148,10 +174,37 @@ function getSaleItemSummary(item: SaleItem) {
   const cgstAmount = taxableValue * (cgstRate / 100);
   const sgstAmount = taxableValue * (sgstRate / 100);
   return {
+    quantity,
+    rate,
+    amount,
     taxableValue,
+    cgstRate,
+    sgstRate,
     cgstAmount,
     sgstAmount,
     total: taxableValue + cgstAmount + sgstAmount,
+  };
+}
+
+function getBillGstTotals(items: SaleItem[]) {
+  let totalTaxable = 0;
+  let totalCgst = 0;
+  let totalSgst = 0;
+  items.forEach((item) => {
+    const s = getSaleItemSummary(item);
+    totalTaxable += s.taxableValue;
+    totalCgst += s.cgstAmount;
+    totalSgst += s.sgstAmount;
+  });
+  const cgstRate = totalTaxable > 0 ? (totalCgst / totalTaxable) * 100 : 0;
+  const sgstRate = totalTaxable > 0 ? (totalSgst / totalTaxable) * 100 : 0;
+  return {
+    totalTaxable: Math.round(totalTaxable * 100) / 100,
+    totalCgst: Math.round(totalCgst * 100) / 100,
+    totalSgst: Math.round(totalSgst * 100) / 100,
+    totalGst: Math.round((totalCgst + totalSgst) * 100) / 100,
+    cgstRate,
+    sgstRate,
   };
 }
 
@@ -164,6 +217,120 @@ function gstRatesFromRateTp(rateTp: string): { sgst: number; cgst: number } | nu
     Exempt: { sgst: 0, cgst: 0 },
   };
   return map[rateTp] ?? null;
+}
+
+type PurchaseLineLookup = {
+  purchase_rate: number;
+  sgst: number;
+  cgst: number;
+  hsn_code: string;
+  unit: string;
+  s_rate: number;
+  mrp: number;
+};
+
+const PURCHASE_LOOKUP_PAGE_SIZE = 1000;
+
+function normalizeItemCode(code: unknown): string {
+  return String(code ?? "").trim();
+}
+
+function formatGridNumberValue(value: number | undefined): string | number {
+  if (value === undefined || value === null || Number.isNaN(value)) return "";
+  return value;
+}
+
+function unitOptionsForRow(unit: string): string[] {
+  const u = unit?.trim() || "Nos";
+  return UNITS.includes(u as (typeof UNITS)[number]) ? [...UNITS] : [u, ...UNITS];
+}
+
+function purchaseLineFromRaw(it: Record<string, unknown>): PurchaseLineLookup | null {
+  const code = normalizeItemCode(it.code);
+  if (!code) return null;
+
+  const qty = Number(it.qty ?? 0);
+  const rate = Number(it.rate ?? 0);
+  const amount = Number(it.amount ?? 0);
+  const purchase_rate = rate > 0 ? rate : (qty > 0 && amount > 0 ? amount / qty : 0);
+
+  const gstPercent = Number(it.gst_percent ?? 0);
+  const hasSplitGst = it.sgst != null || it.cgst != null;
+  const sgst = hasSplitGst ? Number(it.sgst ?? 0) : (gstPercent > 0 ? gstPercent / 2 : 9);
+  const cgst = hasSplitGst ? Number(it.cgst ?? 0) : (gstPercent > 0 ? gstPercent / 2 : 9);
+
+  return {
+    purchase_rate: Math.round(purchase_rate * 100) / 100,
+    sgst,
+    cgst,
+    hsn_code: String(it.hsn_code ?? ""),
+    unit: String(it.unit ?? it.uom ?? "Nos"),
+    s_rate: Number(it.s_rate ?? 0),
+    mrp: Number(it.mrp ?? 0),
+  };
+}
+
+function buildPurchaseItemMap(rows: Array<{ items: unknown[] }>): Map<string, PurchaseLineLookup> {
+  const map = new Map<string, PurchaseLineLookup>();
+  for (const row of rows) {
+    if (!Array.isArray(row.items)) continue;
+    for (const raw of row.items as Record<string, unknown>[]) {
+      const parsed = purchaseLineFromRaw(raw);
+      if (!parsed) continue;
+      const code = normalizeItemCode(raw.code);
+      if (!map.has(code)) map.set(code, parsed);
+    }
+  }
+  return map;
+}
+
+function buildItemPriceMapFromBills(billList: B2BSaleRecord[]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const bill of billList) {
+    for (const item of bill.items) {
+      const code = normalizeItemCode(item.code);
+      if (!code || map.has(code)) continue;
+      const price = Number(item.mrp) || Number(item.rate) || 0;
+      if (price > 0) map.set(code, price);
+    }
+  }
+  return map;
+}
+
+function buildItemPriceMapFromSalesRows(rows: Array<{ items: unknown[] }>): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const row of rows) {
+    if (!Array.isArray(row.items)) continue;
+    for (const raw of row.items as Record<string, unknown>[]) {
+      const code = normalizeItemCode(raw.code);
+      if (!code || map.has(code)) continue;
+      const mrp = Number(raw.mrp ?? raw.rate ?? 0);
+      if (mrp > 0) map.set(code, mrp);
+    }
+  }
+  return map;
+}
+
+function resolveSellingUnitPrice(purchaseData?: PurchaseLineLookup, priorPrice?: number): number {
+  if (purchaseData) {
+    if (purchaseData.s_rate > 0) return purchaseData.s_rate;
+    if (purchaseData.mrp > 0) return purchaseData.mrp;
+    if (purchaseData.purchase_rate > 0) return purchaseData.purchase_rate;
+  }
+  if (priorPrice && priorPrice > 0) return priorPrice;
+  return 0;
+}
+
+function resolveLineGstRates(
+  rateTp: string,
+  purchaseData?: PurchaseLineLookup,
+): { sgst: number; cgst: number } {
+  const fromRateTp = gstRatesFromRateTp(rateTp);
+  if (fromRateTp) return fromRateTp;
+  return {
+    sgst: purchaseData?.sgst ?? 9,
+    cgst: purchaseData?.cgst ?? 9,
+  };
 }
 
 function compareBillNo(a: string, b: string): number {
@@ -214,9 +381,11 @@ function normalizeBuyer(raw: Record<string, unknown>): B2BBuyer {
 }
 
 function normalizeSaleItem(raw: Record<string, unknown>): SaleItem {
-  const item = blankItem();
-  return {
-    ...item,
+  const gstPercent = toDbNumber(raw.gst_percent);
+  const hasSplitGst = raw.sgst != null || raw.cgst != null;
+  const sgst = hasSplitGst ? toDbNumber(raw.sgst) : (gstPercent > 0 ? gstPercent / 2 : 9);
+  const cgst = hasSplitGst ? toDbNumber(raw.cgst) : (gstPercent > 0 ? gstPercent / 2 : 9);
+  const item: SaleItem = {
     code: String(raw.code ?? ""),
     name: String(raw.name ?? ""),
     hsn_code: String(raw.hsn_code ?? ""),
@@ -226,10 +395,801 @@ function normalizeSaleItem(raw: Record<string, unknown>): SaleItem {
     amount: toDbNumber(raw.amount),
     disc_pct: toDbNumber(raw.disc_pct),
     mrp: toDbNumber(raw.mrp ?? raw.rate),
-    sgst: toDbNumber(raw.sgst) || 9,
-    cgst: toDbNumber(raw.cgst) || 9,
+    sgst,
+    cgst,
     line_total: toDbNumber(raw.line_total),
   };
+  const autos = computeLineAutos(item);
+  return { ...item, ...autos, line_total: toDbNumber(raw.line_total) || autos.line_total || 0 };
+}
+
+function enrichB2BBill(rec: B2BSaleRecord): B2BSaleRecord {
+  const items = (rec.items ?? []).map((it) => {
+    const normalized = normalizeSaleItem(it as unknown as Record<string, unknown>);
+    return { ...normalized, ...computeLineAutos(normalized) };
+  });
+  return { ...rec, items };
+}
+
+function buyerFromBill(rec: B2BSaleRecord): B2BBuyer {
+  return {
+    id: rec.buyer_id ?? `snapshot-${rec.bill_no}`,
+    legal_name: rec.buyer_legal_name,
+    trade_name: rec.buyer_trade_name,
+    gstin: rec.buyer_gstin,
+    pan: rec.buyer_pan,
+    contact_person: rec.buyer_contact_person,
+    phone: rec.buyer_phone ?? rec.customer_phone,
+    email: rec.buyer_email,
+    billing_address: rec.buyer_billing_address,
+    ship_to_address: rec.buyer_ship_to ?? rec.ship_to,
+    city: rec.buyer_city,
+    state: rec.buyer_state ?? "Kerala",
+    state_code: rec.buyer_state_code ?? "32",
+    pincode: rec.buyer_pincode,
+    business_type: "Business",
+    is_active: true,
+  };
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatDocDate(value: string): string {
+  return formatTableDate(value);
+}
+
+type B2BDocOptions = {
+  renderMode?: "print" | "pdf";
+  helperText?: string;
+};
+
+function buildB2BInvoiceHtml(rec: B2BSaleRecord, options: B2BDocOptions = {}): string {
+  const store = B2B_STORE_DETAILS;
+  const bill = enrichB2BBill(rec);
+  const isPdfMode = options.renderMode === "pdf";
+  const shipAddress = bill.ship_to || bill.buyer_ship_to || bill.buyer_billing_address;
+  const placeOfSupply = `${bill.buyer_state_code ?? "32"}-${(bill.buyer_state ?? "Kerala").toUpperCase()}`;
+  const gstTotals = getBillGstTotals(bill.items);
+
+  const rowMarkup = bill.items.map((item, index) => {
+    const summary = getSaleItemSummary(item);
+    return `<tr>
+      <td class="col-index">${index + 1}</td>
+      <td class="col-item">
+        <strong>${escapeHtml(item.name || "—")}</strong>
+        ${item.code ? `<span class="item-meta">Code: ${escapeHtml(item.code)}</span>` : ""}
+      </td>
+      <td class="col-hsn">${escapeHtml(item.hsn_code || "—")}</td>
+      <td class="col-qty align-center">${summary.quantity} ${escapeHtml(item.unit || "Nos")}</td>
+      <td class="col-rate align-right">${escapeHtml(formatCurrency(summary.rate))}</td>
+      <td class="col-disc align-center">${item.disc_pct ? `${item.disc_pct}%` : "—"}</td>
+      <td class="col-taxable align-right">${escapeHtml(formatCurrency(summary.taxableValue))}</td>
+      <td class="col-gst align-right">${summary.sgstRate}%<br/>${escapeHtml(formatCurrency(summary.sgstAmount))}</td>
+      <td class="col-gst align-right">${summary.cgstRate}%<br/>${escapeHtml(formatCurrency(summary.cgstAmount))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(summary.total))}</td>
+    </tr>`;
+  }).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>B2B Tax Invoice ${escapeHtml(bill.bill_no)}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "8px" : "12px"};
+          line-height: 1.35;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .b2b-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .b2b-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "14px" : "18px"};
+          font-weight: 700;
+          color: #5b21b6;
+          letter-spacing: 0.05em;
+          padding: ${isPdfMode ? "8px" : "12px"};
+          border-bottom: 1px solid #000;
+        }
+        .doc-subtitle {
+          text-align: center;
+          font-size: ${isPdfMode ? "8px" : "10px"};
+          color: #555;
+          padding: 6px 10px;
+          border-bottom: 1px solid #000;
+          background: #f5f3ff;
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: 8px 10px;
+          border-right: 1px solid #000;
+          vertical-align: top;
+        }
+        .meta-grid > div:last-child { border-right: 0; }
+        .meta-label { font-weight: 700; font-size: ${isPdfMode ? "7px" : "9px"}; text-transform: uppercase; color: #555; margin-bottom: 3px; }
+        .items-table { width: 100%; border-collapse: collapse; }
+        .items-table th, .items-table td { border: 1px solid #000; padding: ${isPdfMode ? "4px 5px" : "6px 8px"}; }
+        .items-table th { background: #f5f3ff; font-size: ${isPdfMode ? "7px" : "9px"}; text-transform: uppercase; }
+        .col-index { width: 24px; text-align: center; }
+        .col-item { min-width: 140px; }
+        .col-hsn { width: 56px; text-align: center; }
+        .col-qty { width: 56px; }
+        .col-rate, .col-amt, .col-taxable { width: 58px; }
+        .col-disc { width: 40px; }
+        .col-gst { width: 52px; font-size: ${isPdfMode ? "6.5px" : "9px"}; }
+        .align-right { text-align: right; }
+        .align-center { text-align: center; }
+        .item-meta { display: block; font-size: ${isPdfMode ? "6.5px" : "9px"}; color: #666; margin-top: 2px; }
+        .totals-wrap { display: flex; justify-content: flex-end; border-top: 1px solid #000; }
+        .totals { width: 280px; border-left: 1px solid #000; }
+        .total-row { display: flex; justify-content: space-between; padding: 5px 10px; border-bottom: 1px solid #ddd; }
+        .total-row.grand { font-weight: 700; font-size: ${isPdfMode ? "9px" : "12px"}; background: #f5f3ff; }
+        .footer { padding: 10px; border-top: 1px solid #000; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .b2b-toolbar { display: none !important; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="b2b-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText ?? "B2B tax invoice preview")}</p>
+      </div>
+      <div class="b2b-sheet">
+        <div class="doc-title">${escapeHtml(bill.form_type.toUpperCase())} · B2B</div>
+        <div class="doc-subtitle">${escapeHtml(store.storeName)} · GSTIN: ${escapeHtml(store.gstin)} · ${escapeHtml(store.location)}</div>
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">Seller</div>
+            <div><strong>${escapeHtml(store.storeName)}</strong></div>
+            <div>GSTIN: ${escapeHtml(store.gstin)}</div>
+            <div>Ph: ${escapeHtml(store.phone)}</div>
+          </div>
+          <div>
+            <div class="meta-label">Buyer (GST Registered)</div>
+            <div><strong>${escapeHtml(bill.buyer_legal_name)}</strong></div>
+            ${bill.buyer_trade_name ? `<div>Trade: ${escapeHtml(bill.buyer_trade_name)}</div>` : ""}
+            <div>GSTIN: ${escapeHtml(bill.buyer_gstin)}</div>
+            ${bill.buyer_pan ? `<div>PAN: ${escapeHtml(bill.buyer_pan)}</div>` : ""}
+            <div>${escapeHtml(bill.buyer_billing_address)}</div>
+            <div>Place of Supply: ${escapeHtml(placeOfSupply)}</div>
+          </div>
+        </div>
+        <div class="meta-grid" style="grid-template-columns: 1fr 1fr 1fr 1fr;">
+          <div><div class="meta-label">Bill No.</div>${escapeHtml(bill.bill_no)}</div>
+          <div><div class="meta-label">Date</div>${escapeHtml(formatDocDate(bill.bill_date))}</div>
+          <div><div class="meta-label">Ship To</div>${escapeHtml(shipAddress)}</div>
+          <div style="border-right:0"><div class="meta-label">Payment</div>${escapeHtml(bill.payment_mode)} · ${escapeHtml(bill.payment_status)}</div>
+        </div>
+        <table class="items-table">
+          <thead>
+            <tr>
+              <th>#</th><th>Description</th><th>HSN</th><th>Qty</th><th>Rate</th><th>Disc</th><th>Taxable</th><th>SGST</th><th>CGST</th><th>Amount</th>
+            </tr>
+          </thead>
+          <tbody>${rowMarkup}</tbody>
+        </table>
+        <div class="totals-wrap">
+          <div class="totals">
+            <div class="total-row"><span>Taxable Subtotal</span><span>${escapeHtml(formatCurrency(gstTotals.totalTaxable || bill.subtotal))}</span></div>
+            ${bill.discount > 0 ? `<div class="total-row"><span>Discount</span><span>−${escapeHtml(formatCurrency(bill.discount))}</span></div>` : ""}
+            <div class="total-row"><span>CGST ${gstTotals.cgstRate.toFixed(1)}%</span><span>${escapeHtml(formatCurrency(gstTotals.totalCgst))}</span></div>
+            <div class="total-row"><span>SGST ${gstTotals.sgstRate.toFixed(1)}%</span><span>${escapeHtml(formatCurrency(gstTotals.totalSgst))}</span></div>
+            <div class="total-row"><span>Total GST</span><span>${escapeHtml(formatCurrency(gstTotals.totalGst || bill.total_gst))}</span></div>
+            ${bill.f_cess > 0 ? `<div class="total-row"><span>F. Cess</span><span>${escapeHtml(formatCurrency(bill.f_cess))}</span></div>` : ""}
+            ${bill.commission > 0 ? `<div class="total-row"><span>Commission</span><span>${escapeHtml(formatCurrency(bill.commission))}</span></div>` : ""}
+            ${bill.postage > 0 ? `<div class="total-row"><span>Postage</span><span>${escapeHtml(formatCurrency(bill.postage))}</span></div>` : ""}
+            ${bill.round_off !== 0 ? `<div class="total-row"><span>Round Off</span><span>${escapeHtml(formatCurrency(bill.round_off))}</span></div>` : ""}
+            <div class="total-row grand"><span>Grand Total</span><span>${escapeHtml(formatCurrency(bill.grand_total))}</span></div>
+            <div class="total-row"><span>Payment Received</span><span>${escapeHtml(formatCurrency(bill.payment_amount))}</span></div>
+            <div class="total-row"><span>Balance</span><span>${escapeHtml(formatCurrency(bill.balance))}</span></div>
+          </div>
+        </div>
+        <div class="footer">
+          <div>${escapeHtml(store.signatureCompany)}</div>
+          <div>${escapeHtml(store.signatureRole)}</div>
+        </div>
+      </div>
+    </body>
+  </html>`;
+}
+
+// ─── B2B Statement & Buyer Profile ───────────────────────────────────────────
+
+type B2BReportMode = "full" | "date" | "month" | "range" | "current";
+
+type B2BStatementMeta = {
+  reportTitle: string;
+  periodLabel: string;
+  reportType: string;
+  statusFilter: string;
+  generatedOn: string;
+  totalBills: number;
+  totalTaxable: number;
+  totalSgst: number;
+  totalCgst: number;
+  totalGst: number;
+  totalSales: number;
+  totalCollected: number;
+  totalOutstanding: number;
+};
+
+function b2bBillDate(bill: B2BSaleRecord): string | null {
+  if (!bill.bill_date) return null;
+  return bill.bill_date.slice(0, 10);
+}
+
+function filterB2BBillsByBuyer(billList: B2BSaleRecord[], buyer: B2BBuyer): B2BSaleRecord[] {
+  const gstin = buyer.gstin.toUpperCase();
+  return billList.filter(
+    (b) => b.buyer_id === buyer.id || b.buyer_gstin.toUpperCase() === gstin,
+  );
+}
+
+function filterB2BBillsByDate(billList: B2BSaleRecord[], date: string): B2BSaleRecord[] {
+  return billList.filter((b) => b2bBillDate(b) === date);
+}
+
+function filterB2BBillsByMonth(billList: B2BSaleRecord[], monthYm: string): B2BSaleRecord[] {
+  return billList.filter((b) => b2bBillDate(b)?.slice(0, 7) === monthYm);
+}
+
+function filterB2BBillsByRange(billList: B2BSaleRecord[], from: string, to: string): B2BSaleRecord[] {
+  return billList.filter((b) => {
+    const d = b2bBillDate(b);
+    if (!d) return false;
+    return d >= from && d <= to;
+  });
+}
+
+function formatB2BMonthLabel(monthYm: string): string {
+  const [year, month] = monthYm.split("-").map(Number);
+  if (!year || !month) return monthYm;
+  return new Date(year, month - 1, 1).toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+}
+
+function formatB2BGeneratedOn(): string {
+  return formatTableDate(new Date().toISOString());
+}
+
+function resolveRegistryBuyer(buyerId: string, buyerList: B2BBuyer[]): B2BBuyer | null {
+  return buyerList.find((b) => b.id === buyerId) ?? null;
+}
+
+function buildB2BBuyerDetailsLines(buyer: B2BBuyer): string {
+  const placeOfSupply = `${buyer.state_code}-${buyer.state.toUpperCase()}`;
+  const shipTo = buyer.ship_to_address?.trim() || "Same as billing address";
+  const lines = [
+    `<div class="buyer-name"><strong>${escapeHtml(buyer.legal_name)}</strong></div>`,
+    buyer.trade_name?.trim()
+      ? `<div class="buyer-line"><b>Trade Name:</b> ${escapeHtml(buyer.trade_name)}</div>`
+      : "",
+    `<div class="buyer-line"><b>GSTIN:</b> ${escapeHtml(buyer.gstin)}</div>`,
+    buyer.pan?.trim()
+      ? `<div class="buyer-line"><b>PAN:</b> ${escapeHtml(buyer.pan)}</div>`
+      : "",
+    `<div class="buyer-line"><b>Business Type:</b> ${escapeHtml(buyer.business_type)}</div>`,
+    buyer.contact_person?.trim()
+      ? `<div class="buyer-line"><b>Contact:</b> ${escapeHtml(buyer.contact_person)}</div>`
+      : "",
+    buyer.phone?.trim() || buyer.email?.trim()
+      ? `<div class="buyer-line"><b>Phone / Email:</b> ${escapeHtml([buyer.phone, buyer.email].filter(Boolean).join(" · "))}</div>`
+      : "",
+    `<div class="buyer-line"><b>Billing Address:</b> ${escapeHtml(buyer.billing_address)}</div>`,
+    `<div class="buyer-line"><b>Ship-To:</b> ${escapeHtml(shipTo)}</div>`,
+    buyer.city?.trim() || buyer.pincode?.trim()
+      ? `<div class="buyer-line"><b>City / Pin:</b> ${escapeHtml([buyer.city, buyer.pincode].filter(Boolean).join(" · "))}</div>`
+      : "",
+    `<div class="buyer-line"><b>State:</b> ${escapeHtml(buyer.state)} (${escapeHtml(buyer.state_code)})</div>`,
+    `<div class="buyer-line"><b>Place of Supply:</b> ${escapeHtml(placeOfSupply)}</div>`,
+    buyer.notes?.trim()
+      ? `<div class="buyer-line"><b>Notes:</b> ${escapeHtml(buyer.notes)}</div>`
+      : "",
+  ];
+  return lines.filter(Boolean).join("");
+}
+
+function buildB2BStatementMeta(
+  billList: B2BSaleRecord[],
+  reportType: string,
+  periodLabel: string,
+  statusFilter: string,
+): B2BStatementMeta {
+  let totalTaxable = 0;
+  let totalSgst = 0;
+  let totalCgst = 0;
+  billList.forEach((bill) => {
+    const gst = getBillGstTotals(bill.items);
+    totalTaxable += gst.totalTaxable || bill.subtotal;
+    totalSgst += gst.totalSgst;
+    totalCgst += gst.totalCgst;
+  });
+  return {
+    reportTitle: "B2B ACCOUNT STATEMENT / BILLING REGISTER",
+    periodLabel,
+    reportType,
+    statusFilter,
+    generatedOn: formatB2BGeneratedOn(),
+    totalBills: billList.length,
+    totalTaxable: Math.round(totalTaxable * 100) / 100,
+    totalSgst: Math.round(totalSgst * 100) / 100,
+    totalCgst: Math.round(totalCgst * 100) / 100,
+    totalGst: Math.round((totalSgst + totalCgst) * 100) / 100,
+    totalSales: billList.reduce((sum, b) => sum + b.grand_total, 0),
+    totalCollected: billList.reduce((sum, b) => sum + b.payment_amount, 0),
+    totalOutstanding: billList.reduce((sum, b) => sum + b.balance, 0),
+  };
+}
+
+function buildB2BStatementHtml(
+  billList: B2BSaleRecord[],
+  buyer: B2BBuyer,
+  meta: B2BStatementMeta,
+  options: B2BDocOptions = {},
+): string {
+  const store = B2B_STORE_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+
+  const rowMarkup = billList.map((bill, index) => {
+    const gst = getBillGstTotals(bill.items);
+    return `<tr>
+      <td class="col-index">${index + 1}</td>
+      <td class="col-date">${escapeHtml(b2bBillDate(bill) ? formatTableDate(b2bBillDate(bill)!) : "—")}</td>
+      <td class="col-bill">${escapeHtml(bill.bill_no)}</td>
+      <td class="col-type">${escapeHtml(bill.form_type)}</td>
+      <td class="col-items align-center">${bill.items.length}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(gst.totalTaxable || bill.subtotal))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(gst.totalSgst))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(gst.totalCgst))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(bill.grand_total))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(bill.payment_amount))}</td>
+      <td class="col-amt align-right">${escapeHtml(formatCurrency(bill.balance))}</td>
+      <td class="col-status">${escapeHtml(bill.payment_status)}</td>
+    </tr>`;
+  }).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>${escapeHtml(meta.reportTitle)} — ${escapeHtml(buyerDisplayName(buyer))}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "7.5px" : "11px"};
+          line-height: 1.28;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .b2b-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+          align-items: center;
+          justify-content: space-between;
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .b2b-statement-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "13px" : "16px"};
+          font-weight: 700;
+          color: #5b21b6;
+          letter-spacing: 0.05em;
+          padding: ${isPdfMode ? "7px 8px" : "10px"};
+          border-bottom: 1px solid #000;
+        }
+        .period-banner {
+          text-align: center;
+          font-weight: 700;
+          padding: ${isPdfMode ? "5px 8px" : "8px 12px"};
+          border-bottom: 1px solid #000;
+          background: #f5f3ff;
+          font-size: ${isPdfMode ? "9px" : "12px"};
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+          vertical-align: top;
+        }
+        .meta-grid > div:last-child { border-right: none; }
+        .meta-label {
+          font-weight: 700;
+          margin-bottom: 3px;
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          text-transform: uppercase;
+          color: #5b21b6;
+        }
+        .meta-line, .buyer-line { margin-bottom: 1px; }
+        .buyer-name { font-size: ${isPdfMode ? "9px" : "12px"}; margin-bottom: 4px; }
+        .buyer-block {
+          border-bottom: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          background: #faf5ff;
+        }
+        .statement-table { width: 100%; border-collapse: collapse; }
+        .statement-table th, .statement-table td {
+          border: 1px solid #000;
+          padding: ${isPdfMode ? "2px 3px" : "4px 5px"};
+          vertical-align: top;
+        }
+        .statement-table thead th {
+          background: #f5f3ff;
+          font-weight: 700;
+          text-align: center;
+        }
+        .col-index { width: 20px; text-align: center; }
+        .col-date { width: 52px; text-align: center; white-space: nowrap; }
+        .col-bill { width: 58px; font-family: monospace; }
+        .col-type { width: 48px; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .col-items { width: 28px; }
+        .col-amt { width: 48px; white-space: nowrap; }
+        .col-status { width: 40px; text-align: center; }
+        .align-right { text-align: right; }
+        .align-center { text-align: center; }
+        .summary-grid {
+          display: grid;
+          grid-template-columns: repeat(4, 1fr);
+          border-top: 1px solid #000;
+        }
+        .summary-box {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+          font-weight: 600;
+        }
+        .summary-box:last-child { border-right: none; }
+        .summary-box b { display: block; font-size: ${isPdfMode ? "9px" : "12px"}; margin-top: 2px; }
+        .footer-note {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          color: #444;
+        }
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          text-align: right;
+          font-weight: 700;
+          font-size: ${isPdfMode ? "8px" : "11px"};
+        }
+        @page { size: A4 landscape; margin: 8mm; }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .b2b-toolbar { display: none !important; }
+          .b2b-statement-sheet { width: 100%; border: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="b2b-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText ?? "B2B account statement preview")}</p>
+      </div>
+      <div class="b2b-statement-sheet">
+        <div class="doc-title">${escapeHtml(meta.reportTitle)}</div>
+        <div class="period-banner">Statement Period: ${escapeHtml(meta.periodLabel)}</div>
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">Seller</div>
+            <div class="meta-line"><strong>${escapeHtml(store.storeName)}</strong></div>
+            <div class="meta-line">${escapeHtml(store.location)}</div>
+            <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+            <div class="meta-line"><b>Phone:</b> ${escapeHtml(store.phone)}</div>
+            <div class="meta-line"><b>Email:</b> ${escapeHtml(store.email)}</div>
+          </div>
+          <div>
+            <div class="meta-label">Report Details</div>
+            <div class="meta-line"><b>Type:</b> ${escapeHtml(meta.reportType)}</div>
+            <div class="meta-line"><b>Status Filter:</b> ${escapeHtml(meta.statusFilter)}</div>
+            <div class="meta-line"><b>Generated:</b> ${escapeHtml(meta.generatedOn)}</div>
+            <div class="meta-line"><b>Bills:</b> ${meta.totalBills}</div>
+          </div>
+        </div>
+        <div class="buyer-block">
+          <div class="meta-label">Registered Business (Buyer)</div>
+          ${buildB2BBuyerDetailsLines(buyer)}
+        </div>
+        <table class="statement-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Bill Date</th>
+              <th>Bill No</th>
+              <th>Type</th>
+              <th>Items</th>
+              <th>Taxable</th>
+              <th>SGST</th>
+              <th>CGST</th>
+              <th>Grand Total</th>
+              <th>Paid</th>
+              <th>Balance</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${rowMarkup || `<tr><td colspan="12" style="text-align:center;padding:12px;">No B2B bills for this statement period.</td></tr>`}</tbody>
+        </table>
+        <div class="summary-grid">
+          <div class="summary-box">Total Bills<b>${meta.totalBills}</b></div>
+          <div class="summary-box">Total Taxable<b>${escapeHtml(formatCurrency(meta.totalTaxable))}</b></div>
+          <div class="summary-box">Total SGST<b>${escapeHtml(formatCurrency(meta.totalSgst))}</b></div>
+          <div class="summary-box">Total CGST<b>${escapeHtml(formatCurrency(meta.totalCgst))}</b></div>
+        </div>
+        <div class="summary-grid" style="border-top:0;">
+          <div class="summary-box">Total GST<b>${escapeHtml(formatCurrency(meta.totalGst))}</b></div>
+          <div class="summary-box">Grand Total<b>${escapeHtml(formatCurrency(meta.totalSales))}</b></div>
+          <div class="summary-box">Total Collected<b>${escapeHtml(formatCurrency(meta.totalCollected))}</b></div>
+          <div class="summary-box">Outstanding<b>${escapeHtml(formatCurrency(meta.totalOutstanding))}</b></div>
+        </div>
+        <div class="footer-note">
+          B2B account statement for ${escapeHtml(buyerDisplayName(buyer))} (${escapeHtml(buyer.gstin)}).
+          Amounts are computed from saved tax invoices including SGST/CGST split per bill line.
+        </div>
+        <div class="signatory">
+          <div>${escapeHtml(store.signatureCompany)}</div>
+          <div>${escapeHtml(store.signatureRole)}</div>
+        </div>
+      </div>
+    </body>
+  </html>`;
+}
+
+function buildB2BBuyerProfileHtml(buyer: B2BBuyer, options: B2BDocOptions = {}): string {
+  const store = B2B_STORE_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>Registered Business — ${escapeHtml(buyerDisplayName(buyer))}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "9px" : "12px"};
+          line-height: 1.4;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .b2b-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .b2b-buyer-profile-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "14px" : "18px"};
+          font-weight: 700;
+          color: #5b21b6;
+          padding: ${isPdfMode ? "8px" : "12px"};
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: ${isPdfMode ? "8px 10px" : "12px 14px"};
+          border-right: 1px solid #000;
+        }
+        .meta-grid > div:last-child { border-right: none; }
+        .meta-label {
+          font-weight: 700;
+          font-size: ${isPdfMode ? "8px" : "10px"};
+          text-transform: uppercase;
+          color: #5b21b6;
+          margin-bottom: 6px;
+        }
+        .buyer-line { margin-bottom: 4px; }
+        .buyer-name { font-size: ${isPdfMode ? "11px" : "14px"}; margin-bottom: 8px; }
+        .footer {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "8px 10px" : "12px 14px"};
+          text-align: right;
+          font-weight: 700;
+        }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .b2b-toolbar { display: none !important; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="b2b-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText ?? "Registered business profile")}</p>
+      </div>
+      <div class="b2b-buyer-profile-sheet">
+        <div class="doc-title">REGISTERED BUSINESS PROFILE · B2B</div>
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">Issued By (Seller)</div>
+            <div><strong>${escapeHtml(store.storeName)}</strong></div>
+            <div>${escapeHtml(store.location)}</div>
+            <div><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+            <div><b>Phone:</b> ${escapeHtml(store.phone)}</div>
+            <div><b>Email:</b> ${escapeHtml(store.email)}</div>
+            <div style="margin-top:8px"><b>Generated:</b> ${escapeHtml(formatB2BGeneratedOn())}</div>
+          </div>
+          <div>
+            <div class="meta-label">Registered Business Details</div>
+            ${buildB2BBuyerDetailsLines(buyer)}
+          </div>
+        </div>
+        <div class="footer">
+          <div>${escapeHtml(store.signatureCompany)}</div>
+          <div>${escapeHtml(store.signatureRole)}</div>
+        </div>
+      </div>
+    </body>
+  </html>`;
+}
+
+async function waitForB2BFrame(html: string, sheetSelector = ".b2b-sheet"): Promise<HTMLIFrameElement> {
+  const iframe = document.createElement("iframe");
+  Object.assign(iframe.style, B2B_FRAME_STYLE);
+  iframe.setAttribute("aria-hidden", "true");
+  document.body.appendChild(iframe);
+  const frameDocument = iframe.contentDocument;
+  if (!frameDocument) {
+    iframe.remove();
+    throw new Error("Unable to prepare the B2B document.");
+  }
+  frameDocument.open();
+  frameDocument.write(html);
+  frameDocument.close();
+  await new Promise<void>((resolve, reject) => {
+    const startedAt = Date.now();
+    const checkReady = () => {
+      const readyState = iframe.contentDocument?.readyState;
+      if (readyState === "interactive" || readyState === "complete") {
+        resolve();
+        return;
+      }
+      if (Date.now() - startedAt > 5000) {
+        reject(new Error("B2B document preview took too long to load."));
+        return;
+      }
+      window.setTimeout(checkReady, 50);
+    };
+    checkReady();
+  });
+  const sheet = iframe.contentDocument?.querySelector(sheetSelector);
+  if (sheet instanceof HTMLElement) {
+    iframe.style.height = `${sheet.scrollHeight + 40}px`;
+  }
+  await new Promise((resolve) => window.setTimeout(resolve, 120));
+  return iframe;
+}
+
+async function exportB2BDocPdf(
+  html: string,
+  filename: string,
+  sheetSelector: string,
+  multiPage = false,
+): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForB2BFrame(html, sheetSelector);
+    const sheet = iframe.contentDocument?.querySelector(sheetSelector);
+    if (!(sheet instanceof HTMLElement)) {
+      throw new Error("Unable to prepare the B2B document layout for PDF export.");
+    }
+    const canvas = await html2canvas(sheet, { scale: 2, useCORS: true, backgroundColor: "#ffffff" });
+    const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const margin = 12;
+    const imgWidth = pageWidth - margin * 2;
+    const imgHeight = (canvas.height * imgWidth) / canvas.width;
+    const imgData = canvas.toDataURL("image/png");
+
+    if (multiPage) {
+      let heightLeft = imgHeight;
+      let position = margin;
+      pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+      heightLeft -= pageHeight - margin * 2;
+      while (heightLeft > 0) {
+        pdf.addPage();
+        position = margin - (imgHeight - heightLeft);
+        pdf.addImage(imgData, "PNG", margin, position, imgWidth, imgHeight);
+        heightLeft -= pageHeight - margin * 2;
+      }
+    } else {
+      const maxHeight = pageHeight - margin * 2;
+      const scale = Math.min(imgWidth / canvas.width, maxHeight / canvas.height);
+      pdf.addImage(
+        imgData,
+        "PNG",
+        margin,
+        margin,
+        canvas.width * scale,
+        canvas.height * scale,
+        undefined,
+        "FAST",
+      );
+    }
+    pdf.save(filename);
+  } finally {
+    iframe?.remove();
+  }
+}
+
+async function exportB2BPdf(html: string, filename: string): Promise<void> {
+  await exportB2BDocPdf(html, filename, ".b2b-sheet", false);
+}
+
+async function printB2BHtml(html: string, sheetSelector = ".b2b-sheet"): Promise<void> {
+  let iframe: HTMLIFrameElement | null = null;
+  try {
+    iframe = await waitForB2BFrame(html, sheetSelector);
+    const printWindow = iframe.contentWindow;
+    if (!printWindow) throw new Error("Unable to open the print dialog.");
+    printWindow.focus();
+    printWindow.print();
+  } finally {
+    window.setTimeout(() => iframe?.remove(), 1200);
+  }
 }
 
 function normalizeB2BSale(raw: Record<string, unknown>): B2BSaleRecord {
@@ -238,7 +1198,7 @@ function normalizeB2BSale(raw: Record<string, unknown>): B2BSaleRecord {
     items = (raw.items as Record<string, unknown>[]).map(normalizeSaleItem);
   }
   const grandTotal = toDbNumber(raw.grand_total);
-  return {
+  const base: B2BSaleRecord = {
     bill_no: String(raw.bill_no ?? ""),
     buyer_id: raw.buyer_id ? String(raw.buyer_id) : undefined,
     buyer_legal_name: String(raw.buyer_legal_name ?? raw.customer_name ?? ""),
@@ -278,6 +1238,7 @@ function normalizeB2BSale(raw: Record<string, unknown>): B2BSaleRecord {
     payment_status: String(raw.payment_status ?? "Credit"),
     created_at: raw.created_at ? String(raw.created_at) : undefined,
   };
+  return enrichB2BBill(base);
 }
 
 function buyerDisplayName(b: B2BBuyer): string {
@@ -405,12 +1366,12 @@ function SearchableProductSelect({
   const [search, setSearch] = useState("");
   const [dropStyle, setDropStyle] = useState<{ top: number; left: number; width: number } | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
-  const selected = items.find((i) => i.code === value);
+  const selected = items.find((i) => normalizeItemCode(i.code) === normalizeItemCode(value));
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
     return items.filter((i) =>
-      (i.name ?? "").toLowerCase().includes(q) ||
-      (i.code ?? "").toLowerCase().includes(q)
+      String(i.name ?? "").toLowerCase().includes(q) ||
+      String(i.code ?? "").toLowerCase().includes(q)
     );
   }, [items, search]);
 
@@ -474,6 +1435,16 @@ export default function SalesB2BPage() {
   const [viewingBill, setViewingBill] = useState<B2BSaleRecord | null>(null);
   const [buyerToDelete, setBuyerToDelete] = useState<B2BBuyer | null>(null);
 
+  const [isStatementModalOpen, setIsStatementModalOpen] = useState(false);
+  const [statementBuyerId, setStatementBuyerId] = useState("");
+  const [statementMode, setStatementMode] = useState<B2BReportMode>("full");
+  const [statementDate, setStatementDate] = useState(todayIso());
+  const [statementMonth, setStatementMonth] = useState(() => todayIso().slice(0, 7));
+  const [statementFrom, setStatementFrom] = useState(() => `${todayIso().slice(0, 7)}-01`);
+  const [statementTo, setStatementTo] = useState(todayIso());
+  const [statementStatusFilter, setStatementStatusFilter] = useState("All");
+  const [statementError, setStatementError] = useState<string | null>(null);
+
   const [formError, setFormError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
@@ -511,11 +1482,28 @@ export default function SalesB2BPage() {
   const [postage, setPostage] = useState("");
   const [paymentAmount, setPaymentAmount] = useState("");
   const [paymentMode, setPaymentMode] = useState("Bank Transfer");
+  const [purchaseItemMap, setPurchaseItemMap] = useState<Map<string, PurchaseLineLookup>>(new Map());
+  const [retailPriceMap, setRetailPriceMap] = useState<Map<string, number>>(new Map());
+
+  const b2bItemPriceMap = useMemo(() => buildItemPriceMapFromBills(bills), [bills]);
 
   const activeBuyers = useMemo(() => buyers.filter((b) => b.is_active), [buyers]);
+
+  const buyersForBillForm = useMemo(() => {
+    const list = [...activeBuyers];
+    if (editingBill) {
+      const found = list.some(
+        (b) => b.id === editingBill.buyer_id
+          || b.gstin.toUpperCase() === editingBill.buyer_gstin.toUpperCase(),
+      );
+      if (!found) list.unshift(buyerFromBill(editingBill));
+    }
+    return list;
+  }, [activeBuyers, editingBill]);
+
   const selectedBuyer = useMemo(
-    () => activeBuyers.find((b) => b.id === selectedBuyerId) ?? null,
-    [activeBuyers, selectedBuyerId],
+    () => buyersForBillForm.find((b) => b.id === selectedBuyerId) ?? null,
+    [buyersForBillForm, selectedBuyerId],
   );
 
   const loadLocalBuyers = useCallback(() => {
@@ -626,11 +1614,67 @@ export default function SalesB2BPage() {
     }
   }, []);
 
+  const fetchProductLookups = useCallback(async () => {
+    try {
+      const purchaseRows: Array<{ items: unknown[] }> = [];
+      let from = 0;
+      while (true) {
+        const { data, error } = await supabase
+          .from("purchases")
+          .select("items, created_at")
+          .order("created_at", { ascending: false })
+          .range(from, from + PURCHASE_LOOKUP_PAGE_SIZE - 1);
+        if (error) throw error;
+        if (!data?.length) break;
+        purchaseRows.push(...(data as Array<{ items: unknown[] }>));
+        if (data.length < PURCHASE_LOOKUP_PAGE_SIZE) break;
+        from += PURCHASE_LOOKUP_PAGE_SIZE;
+      }
+      setPurchaseItemMap(buildPurchaseItemMap(purchaseRows));
+
+      const salesRows: Array<{ items: unknown[] }> = [];
+      from = 0;
+      while (true) {
+        const { data, error } = await supabase
+          .from("sales")
+          .select("items, created_at")
+          .order("created_at", { ascending: false })
+          .range(from, from + PURCHASE_LOOKUP_PAGE_SIZE - 1);
+        if (error) break;
+        if (!data?.length) break;
+        salesRows.push(...(data as Array<{ items: unknown[] }>));
+        if (data.length < PURCHASE_LOOKUP_PAGE_SIZE) break;
+        from += PURCHASE_LOOKUP_PAGE_SIZE;
+      }
+      if (salesRows.length > 0) {
+        setRetailPriceMap(buildItemPriceMapFromSalesRows(salesRows));
+      }
+    } catch {
+      const localPurchases = localStorage.getItem("kaniyamparambil_purchases");
+      if (localPurchases) {
+        try {
+          setPurchaseItemMap(buildPurchaseItemMap(JSON.parse(localPurchases) as Array<{ items: unknown[] }>));
+        } catch { /* ignore */ }
+      }
+      const localSales = localStorage.getItem("kaniyamparambil_sales_v2");
+      if (localSales) {
+        try {
+          setRetailPriceMap(buildItemPriceMapFromSalesRows(JSON.parse(localSales) as Array<{ items: unknown[] }>));
+        } catch { /* ignore */ }
+      }
+    }
+  }, []);
+
   useEffect(() => {
     fetchBuyers();
     fetchBills();
     fetchInventory();
-  }, [fetchBuyers, fetchBills, fetchInventory]);
+    fetchProductLookups();
+  }, [fetchBuyers, fetchBills, fetchInventory, fetchProductLookups]);
+
+  useEffect(() => {
+    if (isBillFormOpen) fetchProductLookups();
+  }, [isBillFormOpen, fetchProductLookups]);
 
   useEffect(() => {
     if (!editingBill) {
@@ -640,21 +1684,30 @@ export default function SalesB2BPage() {
 
   const calc = useMemo(() => {
     let sub = 0;
-    let totalGst = 0;
+    let totalCgst = 0;
+    let totalSgst = 0;
     let linesTotal = 0;
     gridItems.forEach((item) => {
       const s = getSaleItemSummary(item);
       sub += s.taxableValue;
-      totalGst += s.cgstAmount + s.sgstAmount;
+      totalCgst += s.cgstAmount;
+      totalSgst += s.sgstAmount;
       linesTotal += s.total;
     });
     const discNum = Number(discount) || 0;
     const rawTotal = linesTotal - discNum + (Number(fCess) || 0) + (Number(commission) || 0) + (Number(postage) || 0);
     const roundOff = Math.round(rawTotal) - rawTotal;
     const grandTotal = rawTotal + roundOff;
+    const totalGst = totalCgst + totalSgst;
+    const cgstRate = sub > 0 ? (totalCgst / sub) * 100 : 0;
+    const sgstRate = sub > 0 ? (totalSgst / sub) * 100 : 0;
     return {
       subtotal: Math.round(sub * 100) / 100,
+      totalCgst: Math.round(totalCgst * 100) / 100,
+      totalSgst: Math.round(totalSgst * 100) / 100,
       totalGst: Math.round(totalGst * 100) / 100,
+      cgstRate,
+      sgstRate,
       roundOff: Math.round(roundOff * 100) / 100,
       grandTotal: Math.round(grandTotal * 100) / 100,
     };
@@ -681,6 +1734,11 @@ export default function SalesB2BPage() {
       b.gstin.toLowerCase().includes(q)
     );
   }, [buyers, buyerSearch]);
+
+  const viewingBillGst = useMemo(
+    () => (viewingBill ? getBillGstTotals(viewingBill.items) : null),
+    [viewingBill],
+  );
 
   const resetBuyerForm = () => {
     setEditingBuyer(null);
@@ -839,23 +1897,50 @@ export default function SalesB2BPage() {
     setGridItems((prev) => prev.map((item, i) => {
       if (i !== idx) return item;
       const updated = { ...item, [field]: value };
-      return { ...updated, ...computeLineAutos(updated) };
+      if (["qty", "mrp", "disc_pct", "sgst", "cgst"].includes(field)) {
+        return { ...updated, ...computeLineAutos(updated) };
+      }
+      return updated;
     }));
   };
 
-  const handleProductSelect = (idx: number, prod: InventoryItem) => {
-    setGridItems((prev) => prev.map((item, i) => {
-      if (i !== idx) return item;
-      const updated: SaleItem = {
-        ...item,
-        code: prod.code,
-        name: prod.name,
-        hsn_code: prod.hsn_code || item.hsn_code,
-        unit: prod.uom || item.unit,
-      };
-      return { ...updated, ...computeLineAutos(updated) };
-    }));
+  const applyProductToLine = (item: SaleItem, prod: InventoryItem): SaleItem => {
+    const code = normalizeItemCode(prod.code);
+    const purchaseData = purchaseItemMap.get(code);
+    const priorPrice = b2bItemPriceMap.get(code) ?? retailPriceMap.get(code);
+    const gst = resolveLineGstRates(rateTp, purchaseData);
+    const updated: SaleItem = {
+      ...item,
+      code: prod.code,
+      name: prod.name,
+      hsn_code: purchaseData?.hsn_code || prod.hsn_code || "",
+      unit: purchaseData?.unit || prod.uom || "Nos",
+      rate: purchaseData?.purchase_rate ?? 0,
+      mrp: resolveSellingUnitPrice(purchaseData, priorPrice),
+      sgst: gst.sgst,
+      cgst: gst.cgst,
+    };
+    return { ...updated, ...computeLineAutos(updated) };
   };
+
+  const handleProductSelect = (idx: number, prod: InventoryItem) => {
+    setGridItems((prev) => prev.map((item, i) => (i === idx ? applyProductToLine(item, prod) : item)));
+  };
+
+  useEffect(() => {
+    if (!isBillFormOpen) return;
+    setGridItems((prev) => {
+      let changed = false;
+      const next = prev.map((item) => {
+        if (!item.code || item.mrp > 0) return item;
+        const inv = inventory.find((p) => normalizeItemCode(p.code) === normalizeItemCode(item.code));
+        if (!inv) return item;
+        changed = true;
+        return applyProductToLine(item, inv);
+      });
+      return changed ? next : prev;
+    });
+  }, [isBillFormOpen, purchaseItemMap, b2bItemPriceMap, retailPriceMap, inventory, rateTp]);
 
   const handleRateTpChange = (next: string) => {
     setRateTp(next);
@@ -883,7 +1968,7 @@ export default function SalesB2BPage() {
 
     const payload: B2BSaleRecord = {
       bill_no: billNo,
-      buyer_id: selectedBuyer.id,
+      buyer_id: selectedBuyer.id.startsWith("snapshot-") ? editingBill?.buyer_id : selectedBuyer.id,
       buyer_legal_name: selectedBuyer.legal_name,
       buyer_trade_name: selectedBuyer.trade_name,
       buyer_gstin: selectedBuyer.gstin,
@@ -977,6 +2062,215 @@ export default function SalesB2BPage() {
     }
   };
 
+  const handleStartEdit = (rec: B2BSaleRecord) => {
+    const bill = enrichB2BBill(rec);
+    setEditingBill(bill);
+    setBillNo(bill.bill_no);
+    setFormType(bill.form_type);
+    setBillDate(bill.bill_date.slice(0, 10));
+    const buyer = buyers.find(
+      (b) => b.id === bill.buyer_id
+        || b.gstin.toUpperCase() === bill.buyer_gstin.toUpperCase(),
+    );
+    setSelectedBuyerId(buyer?.id ?? buyerFromBill(bill).id);
+    setShipTo(bill.ship_to ?? bill.buyer_ship_to ?? buyer?.ship_to_address ?? buyer?.billing_address ?? "");
+    setBranchGodown(bill.branch_godown);
+    setRateTp(bill.rate_tp);
+    setSalesman(bill.salesman ?? "Manager");
+    setVehicleNo(bill.vehicle_no ?? "");
+    setGridItems(bill.items.length > 0 ? bill.items : [blankItem()]);
+    setFCess(String(bill.f_cess || ""));
+    setDiscount(String(bill.discount || ""));
+    setCommission(String(bill.commission || ""));
+    setPostage(String(bill.postage || ""));
+    setPaymentAmount(String(bill.payment_amount));
+    setPaymentMode(bill.payment_mode);
+    setFormError(null);
+    setViewingBill(null);
+    setIsBillFormOpen(true);
+  };
+
+  const handlePrintBill = async (rec: B2BSaleRecord) => {
+    try {
+      await printB2BHtml(buildB2BInvoiceHtml(enrichB2BBill(rec), {
+        renderMode: "pdf",
+        helperText: "B2B tax invoice — print or save as PDF.",
+      }));
+    } catch (err) {
+      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
+  const handleDownloadBill = async (rec: B2BSaleRecord) => {
+    try {
+      await exportB2BPdf(
+        buildB2BInvoiceHtml(enrichB2BBill(rec), { renderMode: "pdf" }),
+        `b2b_tax_invoice_${rec.bill_no}.pdf`,
+      );
+    } catch (err) {
+      alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
+  const openStatementModal = (prefillBuyerId?: string) => {
+    setStatementError(null);
+    if (prefillBuyerId) {
+      setStatementBuyerId(prefillBuyerId);
+    } else if (!statementBuyerId && activeBuyers.length > 0) {
+      setStatementBuyerId(activeBuyers[0].id);
+    }
+    setIsStatementModalOpen(true);
+  };
+
+  const resolveB2BStatementReport = (): {
+    records: B2BSaleRecord[];
+    buyer: B2BBuyer;
+    reportType: string;
+    periodLabel: string;
+    filenameSuffix: string;
+  } | null => {
+    const buyer = resolveRegistryBuyer(statementBuyerId, buyers);
+    if (!buyer) {
+      setStatementError("Select a registered business for the statement.");
+      return null;
+    }
+
+    const buyerBills = filterB2BBillsByBuyer(bills, buyer);
+    const applyStatus = (list: B2BSaleRecord[]) =>
+      statementStatusFilter === "All"
+        ? list
+        : list.filter((b) => b.payment_status === statementStatusFilter);
+
+    switch (statementMode) {
+      case "full":
+        return {
+          records: applyStatus([...buyerBills]),
+          buyer,
+          reportType: "Complete B2B Register (Buyer)",
+          periodLabel: `All Bills — ${buyerDisplayName(buyer)}`,
+          filenameSuffix: `buyer_${buyer.gstin}_full_${todayIso()}`,
+        };
+      case "current": {
+        const q = billSearch.toLowerCase();
+        const filtered = buyerBills.filter((b) =>
+          b.bill_no.toLowerCase().includes(q)
+          || b.buyer_legal_name.toLowerCase().includes(q)
+          || b.buyer_gstin.toLowerCase().includes(q),
+        );
+        return {
+          records: applyStatus(filtered),
+          buyer,
+          reportType: "Current Table Filter (Buyer)",
+          periodLabel: `${buyerDisplayName(buyer)} — Search: ${billSearch.trim() || "—"}`,
+          filenameSuffix: `buyer_${buyer.gstin}_filtered_${todayIso()}`,
+        };
+      }
+      case "date": {
+        const dated = applyStatus(filterB2BBillsByDate(buyerBills, statementDate));
+        return {
+          records: dated,
+          buyer,
+          reportType: "Daily B2B Statement",
+          periodLabel: `${formatTableDate(statementDate)} — ${buyerDisplayName(buyer)}`,
+          filenameSuffix: `buyer_${buyer.gstin}_date_${statementDate}`,
+        };
+      }
+      case "month": {
+        const monthly = applyStatus(filterB2BBillsByMonth(buyerBills, statementMonth));
+        return {
+          records: monthly,
+          buyer,
+          reportType: "Monthly B2B Statement",
+          periodLabel: `${formatB2BMonthLabel(statementMonth)} — ${buyerDisplayName(buyer)}`,
+          filenameSuffix: `buyer_${buyer.gstin}_month_${statementMonth}`,
+        };
+      }
+      case "range": {
+        if (statementFrom > statementTo) {
+          setStatementError("From date cannot be after To date.");
+          return null;
+        }
+        const ranged = applyStatus(filterB2BBillsByRange(buyerBills, statementFrom, statementTo));
+        return {
+          records: ranged,
+          buyer,
+          reportType: "Date Range B2B Statement",
+          periodLabel: `${formatTableDate(statementFrom)} to ${formatTableDate(statementTo)} — ${buyerDisplayName(buyer)}`,
+          filenameSuffix: `buyer_${buyer.gstin}_${statementFrom}_to_${statementTo}`,
+        };
+      }
+      default:
+        return null;
+    }
+  };
+
+  const buildB2BStatementDocument = () => {
+    const report = resolveB2BStatementReport();
+    if (!report) return null;
+    if (report.records.length === 0) {
+      setStatementError("No B2B bills match the selected business and statement period.");
+      return null;
+    }
+    setStatementError(null);
+    return buildB2BStatementHtml(
+      report.records,
+      report.buyer,
+      buildB2BStatementMeta(
+        report.records,
+        report.reportType,
+        report.periodLabel,
+        statementStatusFilter,
+      ),
+      { renderMode: "pdf", helperText: "Generating B2B account statement..." },
+    );
+  };
+
+  const handlePrintB2BStatement = async () => {
+    const html = buildB2BStatementDocument();
+    if (!html) return;
+    try {
+      await printB2BHtml(html, ".b2b-statement-sheet");
+    } catch (err) {
+      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
+  const handleDownloadB2BStatement = async () => {
+    const report = resolveB2BStatementReport();
+    if (!report) return;
+    const html = buildB2BStatementDocument();
+    if (!html) return;
+    try {
+      await exportB2BDocPdf(html, `b2b_statement_${report.filenameSuffix}.pdf`, ".b2b-statement-sheet", true);
+    } catch (err) {
+      alert(`Statement PDF failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
+  const handlePrintBuyerProfile = async (buyer: B2BBuyer) => {
+    try {
+      await printB2BHtml(
+        buildB2BBuyerProfileHtml(buyer, { helperText: "Registered business profile — print or save as PDF." }),
+        ".b2b-buyer-profile-sheet",
+      );
+    } catch (err) {
+      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
+  const handleDownloadBuyerProfile = async (buyer: B2BBuyer) => {
+    try {
+      await exportB2BDocPdf(
+        buildB2BBuyerProfileHtml(buyer, { renderMode: "pdf" }),
+        `b2b_business_${buyer.gstin}.pdf`,
+        ".b2b-buyer-profile-sheet",
+        false,
+      );
+    } catch (err) {
+      alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
   const handleStateChange = (stateName: string) => {
     setState(stateName);
     const found = INDIAN_STATES.find((s) => s.name === stateName);
@@ -1015,6 +2309,10 @@ export default function SalesB2BPage() {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
+          <button type="button" onClick={() => openStatementModal()}
+            className="btn-secondary flex items-center gap-1.5 text-xs font-bold border-violet-200 text-violet-800 hover:bg-violet-50">
+            <FileText className="w-4 h-4" /> B2B Statement
+          </button>
           <button type="button" onClick={() => openNewBill()}
             className="btn-primary flex items-center gap-1.5 text-xs font-bold">
             <Receipt className="w-4 h-4" /> Generate B2B Bill
@@ -1092,11 +2390,20 @@ export default function SalesB2BPage() {
                       }`}>{b.payment_status}</span>
                     </td>
                     <td className="px-4 py-2.5">
-                      <div className="flex items-center justify-center gap-1">
-                        <button type="button" onClick={() => setViewingBill(b)} className="p-1.5 rounded hover:bg-slate-100" title="View">
-                          <Eye className="w-3.5 h-3.5" />
-                        </button>
-                        <button type="button" onClick={() => handleDeleteBill(b.bill_no)} className="p-1.5 rounded hover:bg-red-50 text-red-600" title="Delete">
+                      <div className="flex items-center justify-center gap-1.5">
+                        {[
+                          { icon: Eye, title: "View", fn: () => setViewingBill(enrichB2BBill(b)) },
+                          { icon: Edit, title: "Edit", fn: () => handleStartEdit(b) },
+                          { icon: Printer, title: "Print", fn: () => handlePrintBill(b) },
+                          { icon: Download, title: "Download", fn: () => handleDownloadBill(b) },
+                        ].map(({ icon: Icon, title, fn }) => (
+                          <button key={title} type="button" onClick={fn} title={title}
+                            className="text-slate-500 hover:text-slate-900 hover:bg-slate-100 p-1.5 rounded transition-all">
+                            <Icon className="w-3.5 h-3.5" />
+                          </button>
+                        ))}
+                        <button type="button" onClick={() => handleDeleteBill(b.bill_no)} title="Delete"
+                          className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1.5 rounded transition-all">
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
@@ -1135,6 +2442,10 @@ export default function SalesB2BPage() {
                     <p className="text-[10px] text-slate-500 mt-1">{b.business_type}</p>
                   </div>
                   <div className="flex gap-1 shrink-0">
+                    <button type="button" onClick={() => handlePrintBuyerProfile(b)} title="Print business profile"
+                      className="p-1.5 rounded hover:bg-slate-100 text-slate-600"><Printer className="w-3.5 h-3.5" /></button>
+                    <button type="button" onClick={() => handleDownloadBuyerProfile(b)} title="Download business profile"
+                      className="p-1.5 rounded hover:bg-slate-100 text-slate-600"><Download className="w-3.5 h-3.5" /></button>
                     <button type="button" onClick={() => openEditBuyer(b)} className="p-1.5 rounded hover:bg-slate-100"><Edit className="w-3.5 h-3.5" /></button>
                     <button type="button" onClick={() => setBuyerToDelete(b)} className="p-1.5 rounded hover:bg-red-50 text-red-600"><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
@@ -1144,6 +2455,10 @@ export default function SalesB2BPage() {
                 <button type="button" onClick={() => openNewBill(b)}
                   className="mt-3 w-full text-[10px] font-bold text-primary border border-primary/20 rounded py-1.5 hover:bg-primary/5">
                   Generate Bill for this Buyer
+                </button>
+                <button type="button" onClick={() => openStatementModal(b.id)}
+                  className="mt-2 w-full text-[10px] font-bold text-violet-800 border border-violet-200 rounded py-1.5 hover:bg-violet-50">
+                  View Bill Statement
                 </button>
               </div>
             ))}
@@ -1249,7 +2564,7 @@ export default function SalesB2BPage() {
       {/* B2B bill modal */}
       {isBillFormOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
-          <div className="bg-white rounded-xl shadow-2xl max-w-6xl w-full max-h-[92vh] overflow-y-auto flex flex-col">
+          <div className="bg-white rounded-xl shadow-2xl w-[min(100rem,98vw)] max-w-none max-h-[92vh] overflow-y-auto flex flex-col">
             <div className="bg-slate-950 px-6 py-4 text-white flex items-center justify-between sticky top-0 z-20">
               <div>
                 <h2 className="text-sm font-bold">{editingBill ? "Edit B2B Bill" : "New B2B Tax Invoice"}</h2>
@@ -1266,7 +2581,7 @@ export default function SalesB2BPage() {
 
               <div className="bg-violet-50 border border-violet-100 rounded-xl p-4 space-y-3">
                 <h3 className="text-xs font-bold uppercase text-violet-800">Buyer (GST Registered) *</h3>
-                <SearchableBuyerSelect buyers={activeBuyers} value={selectedBuyerId}
+                <SearchableBuyerSelect buyers={buyersForBillForm} value={selectedBuyerId}
                   onChange={applyBuyerToBill} />
                 {selectedBuyer && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px] bg-white rounded-lg border border-violet-100 p-3">
@@ -1333,23 +2648,33 @@ export default function SalesB2BPage() {
                   <table className="w-full text-[11px]">
                     <thead>
                       <tr className="bg-slate-50 text-left font-semibold">
-                        <th className="p-2 w-[180px]">Item</th>
+                        <th className="p-2 w-[200px]">Item</th>
+                        <th className="p-2 w-[72px] text-center">HSN</th>
                         <th className="p-2 w-12 text-center">Qty</th>
                         <th className="p-2 w-16 text-center">Unit</th>
-                        <th className="p-2 w-20 text-right">Price</th>
-                        <th className="p-2 w-16 text-center">Dis%</th>
-                        <th className="p-2 w-14 text-center">SGST</th>
-                        <th className="p-2 w-14 text-center">CGST</th>
-                        <th className="p-2 w-20 text-right">Total</th>
+                        <th className="p-2 w-20 text-right">Price (₹)</th>
+                        <th className="p-2 w-20 text-right">Amount (₹)</th>
+                        <th className="p-2 w-14 text-center">Dis%</th>
+                        <th className="p-2 w-14 text-center">SGST%</th>
+                        <th className="p-2 w-20 text-right">SGST (₹)</th>
+                        <th className="p-2 w-14 text-center">CGST%</th>
+                        <th className="p-2 w-20 text-right">CGST (₹)</th>
+                        <th className="p-2 w-24 text-right">Line Total</th>
                         <th className="p-2 w-8" />
                       </tr>
                     </thead>
                     <tbody>
-                      {gridItems.map((item, idx) => (
+                      {gridItems.map((item, idx) => {
+                        const lineGst = getSaleItemSummary(item);
+                        return (
                         <tr key={idx} className="border-t border-slate-100">
                           <td className="p-1">
                             <SearchableProductSelect items={inventory} value={item.code}
                               onChange={(p) => handleProductSelect(idx, p)} />
+                          </td>
+                          <td className="p-1">
+                            <input type="text" value={item.hsn_code || ""} readOnly tabIndex={-1}
+                              className="w-full text-center border border-slate-200 rounded py-1 text-[10px] font-mono bg-slate-50 text-slate-600" />
                           </td>
                           <td className="p-1">
                             <input type="number" min={1} value={item.qty} onChange={(e) => updateGridRow(idx, "qty", parseFloat(e.target.value) || 0)}
@@ -1357,26 +2682,41 @@ export default function SalesB2BPage() {
                           </td>
                           <td className="p-1">
                             <select value={item.unit} onChange={(e) => updateGridRow(idx, "unit", e.target.value)} className="w-full border rounded py-1 text-[11px] bg-white">
-                              {UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
+                              {unitOptionsForRow(item.unit).map((u) => <option key={u} value={u}>{u}</option>)}
                             </select>
                           </td>
                           <td className="p-1">
-                            <input type="number" min={0} step="any" value={item.mrp || ""} onChange={(e) => updateGridRow(idx, "mrp", parseFloat(e.target.value) || 0)}
-                              className="w-full text-right border rounded py-1 text-[11px]" />
+                            <input type="number" min={0} step="any" value={formatGridNumberValue(item.mrp)}
+                              onChange={(e) => updateGridRow(idx, "mrp", parseFloat(e.target.value) || 0)}
+                              className="w-full text-right border border-green-400 rounded py-1 text-[11px] font-semibold" />
+                          </td>
+                          <td className="p-1">
+                            <input readOnly tabIndex={-1} value={(item.amount ?? 0).toFixed(2)}
+                              className="w-full text-right border border-slate-200 rounded py-1 text-[11px] font-mono bg-slate-50 text-slate-600" />
                           </td>
                           <td className="p-1">
                             <input type="number" min={0} value={item.disc_pct || ""} onChange={(e) => updateGridRow(idx, "disc_pct", parseFloat(e.target.value) || 0)}
                               className="w-full text-center border rounded py-1 text-[11px]" />
                           </td>
                           <td className="p-1">
-                            <input type="number" min={0} value={item.sgst} onChange={(e) => updateGridRow(idx, "sgst", parseFloat(e.target.value) || 0)}
+                            <input type="number" min={0} step="0.5" value={item.sgst}
+                              onChange={(e) => updateGridRow(idx, "sgst", parseFloat(e.target.value) || 0)}
                               className="w-full text-center border rounded py-1 text-[11px]" />
+                          </td>
+                          <td className="p-1 text-right font-mono text-[10px] text-slate-600 pr-1">
+                            {formatCurrency(lineGst.sgstAmount)}
                           </td>
                           <td className="p-1">
-                            <input type="number" min={0} value={item.cgst} onChange={(e) => updateGridRow(idx, "cgst", parseFloat(e.target.value) || 0)}
+                            <input type="number" min={0} step="0.5" value={item.cgst}
+                              onChange={(e) => updateGridRow(idx, "cgst", parseFloat(e.target.value) || 0)}
                               className="w-full text-center border rounded py-1 text-[11px]" />
                           </td>
-                          <td className="p-1 text-right font-semibold pr-2">{formatCurrency(item.line_total)}</td>
+                          <td className="p-1 text-right font-mono text-[10px] text-slate-600 pr-1">
+                            {formatCurrency(lineGst.cgstAmount)}
+                          </td>
+                          <td className="p-1 text-right font-semibold font-mono text-green-800 pr-2">
+                            {formatCurrency(item.line_total || 0)}
+                          </td>
                           <td className="p-1">
                             {gridItems.length > 1 && (
                               <button type="button" onClick={() => setGridItems((p) => p.filter((_, i) => i !== idx))} className="text-red-500 p-1">
@@ -1385,7 +2725,8 @@ export default function SalesB2BPage() {
                             )}
                           </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -1411,8 +2752,10 @@ export default function SalesB2BPage() {
                   </div>
                 </div>
                 <div className="bg-slate-50 rounded-xl p-4 space-y-1 text-xs">
-                  <div className="flex justify-between"><span>Subtotal</span><span>{formatCurrency(calc.subtotal)}</span></div>
-                  <div className="flex justify-between"><span>Total GST</span><span>{formatCurrency(calc.totalGst)}</span></div>
+                  <div className="flex justify-between"><span>Taxable Subtotal</span><span>{formatCurrency(calc.subtotal)}</span></div>
+                  <div className="flex justify-between"><span>CGST ({calc.cgstRate.toFixed(1)}%)</span><span>{formatCurrency(calc.totalCgst)}</span></div>
+                  <div className="flex justify-between"><span>SGST ({calc.sgstRate.toFixed(1)}%)</span><span>{formatCurrency(calc.totalSgst)}</span></div>
+                  <div className="flex justify-between font-medium"><span>Total GST</span><span>{formatCurrency(calc.totalGst)}</span></div>
                   <div className="flex justify-between"><span>Round Off</span><span>{formatCurrency(calc.roundOff)}</span></div>
                   <div className="flex justify-between font-bold text-base border-t border-slate-200 pt-2 mt-2">
                     <span>Grand Total</span><span>{formatCurrency(calc.grandTotal)}</span>
@@ -1446,36 +2789,246 @@ export default function SalesB2BPage() {
       {/* View bill detail */}
       {viewingBill && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
-          <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[85vh] overflow-y-auto">
-            <div className="px-6 py-4 border-b flex justify-between items-center sticky top-0 bg-white">
+          <div className="bg-white rounded-xl shadow-2xl w-[min(100rem,98vw)] max-w-none max-h-[92vh] overflow-y-auto">
+            <div className="px-6 py-4 border-b flex justify-between items-center sticky top-0 bg-white z-10">
               <h2 className="font-bold text-sm">B2B Bill {viewingBill.bill_no}</h2>
               <button type="button" onClick={() => setViewingBill(null)}><X className="w-5 h-5" /></button>
             </div>
             <div className="p-6 space-y-4 text-xs">
               <div className="bg-violet-50 rounded-lg p-3 space-y-1">
                 <p className="font-bold text-violet-900">{viewingBill.buyer_legal_name}</p>
+                {viewingBill.buyer_trade_name && (
+                  <p className="text-violet-800">{viewingBill.buyer_trade_name}</p>
+                )}
                 <p className="font-mono text-violet-700">GSTIN: {viewingBill.buyer_gstin}</p>
                 <p>{viewingBill.buyer_billing_address}</p>
-                {viewingBill.buyer_ship_to && <p className="text-slate-600">Ship: {viewingBill.buyer_ship_to}</p>}
+                {(viewingBill.ship_to || viewingBill.buyer_ship_to) && (
+                  <p className="text-slate-600">Ship: {viewingBill.ship_to || viewingBill.buyer_ship_to}</p>
+                )}
               </div>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                 <div><span className="text-slate-500">Date:</span> {formatTableDate(viewingBill.bill_date)}</div>
                 <div><span className="text-slate-500">Type:</span> {viewingBill.form_type}</div>
+                <div><span className="text-slate-500">Branch:</span> {viewingBill.branch_godown}</div>
+                <div><span className="text-slate-500">Subtotal:</span> {formatCurrency(viewingBill.subtotal)}</div>
+                {viewingBillGst && (
+                  <>
+                    <div><span className="text-slate-500">CGST ({viewingBillGst.cgstRate.toFixed(1)}%):</span> {formatCurrency(viewingBillGst.totalCgst)}</div>
+                    <div><span className="text-slate-500">SGST ({viewingBillGst.sgstRate.toFixed(1)}%):</span> {formatCurrency(viewingBillGst.totalSgst)}</div>
+                    <div><span className="text-slate-500">Total GST:</span> {formatCurrency(viewingBillGst.totalGst || viewingBill.total_gst)}</div>
+                  </>
+                )}
                 <div><span className="text-slate-500">Grand Total:</span> <strong>{formatCurrency(viewingBill.grand_total)}</strong></div>
+                <div><span className="text-slate-500">Paid:</span> {formatCurrency(viewingBill.payment_amount)}</div>
+                <div><span className="text-slate-500">Balance:</span> {formatCurrency(viewingBill.balance)}</div>
                 <div><span className="text-slate-500">Status:</span> {viewingBill.payment_status}</div>
               </div>
               <table className="w-full border text-[11px]">
-                <thead><tr className="bg-slate-50"><th className="p-2 text-left">Item</th><th className="p-2">Qty</th><th className="p-2 text-right">Total</th></tr></thead>
+                <thead>
+                  <tr className="bg-slate-50">
+                    <th className="p-2 text-left">Item</th>
+                    <th className="p-2 text-center">HSN</th>
+                    <th className="p-2 text-center">Qty</th>
+                    <th className="p-2 text-right">Price</th>
+                    <th className="p-2 text-right">Taxable</th>
+                    <th className="p-2 text-right">SGST</th>
+                    <th className="p-2 text-right">CGST</th>
+                    <th className="p-2 text-right">Total</th>
+                  </tr>
+                </thead>
                 <tbody>
-                  {viewingBill.items.map((it, i) => (
+                  {viewingBill.items.map((it, i) => {
+                    const line = getSaleItemSummary(it);
+                    return (
                     <tr key={i} className="border-t">
-                      <td className="p-2">{it.name}</td>
+                      <td className="p-2">
+                        <div className="font-medium">{it.name}</div>
+                        {it.code && <div className="text-[10px] text-slate-500 font-mono">{it.code}</div>}
+                      </td>
+                      <td className="p-2 text-center font-mono">{it.hsn_code || "—"}</td>
                       <td className="p-2 text-center">{it.qty} {it.unit}</td>
-                      <td className="p-2 text-right">{formatCurrency(it.line_total)}</td>
+                      <td className="p-2 text-right font-mono">{formatCurrency(it.mrp)}</td>
+                      <td className="p-2 text-right font-mono">{formatCurrency(line.taxableValue)}</td>
+                      <td className="p-2 text-right font-mono">
+                        <div>{line.sgstRate}%</div>
+                        <div className="text-slate-600">{formatCurrency(line.sgstAmount)}</div>
+                      </td>
+                      <td className="p-2 text-right font-mono">
+                        <div>{line.cgstRate}%</div>
+                        <div className="text-slate-600">{formatCurrency(line.cgstAmount)}</div>
+                      </td>
+                      <td className="p-2 text-right font-mono font-semibold">{formatCurrency(it.line_total)}</td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
+              <div className="flex flex-wrap justify-end gap-2 pt-2 border-t border-slate-100">
+                <button type="button" onClick={() => handleStartEdit(viewingBill)}
+                  className="btn-secondary text-xs flex items-center gap-1.5">
+                  <Edit className="w-3.5 h-3.5" /> Edit
+                </button>
+                <button type="button" onClick={() => handlePrintBill(viewingBill)}
+                  className="btn-secondary text-xs flex items-center gap-1.5">
+                  <Printer className="w-3.5 h-3.5" /> Print
+                </button>
+                <button type="button" onClick={() => handleDownloadBill(viewingBill)}
+                  className="btn-primary text-xs flex items-center gap-1.5">
+                  <Download className="w-3.5 h-3.5" /> Download PDF
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* B2B Statement Modal */}
+      {isStatementModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px]">
+          <div className="absolute inset-0" onClick={() => setIsStatementModalOpen(false)} />
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-lg w-full z-10 flex flex-col font-sans">
+            <div className="bg-violet-800 px-5 py-4 text-white rounded-t-xl flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-bold tracking-tight flex items-center gap-2">
+                  <FileText className="w-4 h-4" />
+                  B2B Bill Statement
+                </h2>
+                <p className="text-[10px] text-violet-200 mt-0.5">Account-style register for a registered business</p>
+              </div>
+              <button type="button" onClick={() => setIsStatementModalOpen(false)}
+                className="text-violet-200 hover:text-white p-1.5 rounded-lg hover:bg-white/10">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+              {statementError && (
+                <div className="bg-red-50 border border-red-200 text-red-800 text-xs px-3 py-2 rounded-md flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>{statementError}</span>
+                </div>
+              )}
+
+              <div>
+                <label className="form-label text-xs font-semibold text-slate-700 mb-2 block">Registered Business *</label>
+                <select value={statementBuyerId} onChange={(e) => { setStatementBuyerId(e.target.value); setStatementError(null); }}
+                  className="input-enterprise bg-white cursor-pointer text-xs w-full">
+                  <option value="">Select business...</option>
+                  {activeBuyers.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {buyerDisplayName(b)} — {b.gstin}
+                    </option>
+                  ))}
+                </select>
+                {statementBuyerId && resolveRegistryBuyer(statementBuyerId, buyers) && (
+                  <div className="mt-2 text-[10px] text-slate-600 bg-violet-50 border border-violet-100 rounded-lg p-2.5 space-y-0.5">
+                    {(() => {
+                      const b = resolveRegistryBuyer(statementBuyerId, buyers)!;
+                      return (
+                        <>
+                          <p className="font-semibold text-violet-900">{b.legal_name}</p>
+                          {b.trade_name && <p>{b.trade_name}</p>}
+                          <p className="font-mono">{b.gstin}{b.pan ? ` · PAN: ${b.pan}` : ""}</p>
+                          <p>{b.billing_address}</p>
+                          <p>{b.city ? `${b.city}, ` : ""}{b.state} {b.pincode ?? ""}</p>
+                          {(b.contact_person || b.phone) && (
+                            <p>{[b.contact_person, b.phone].filter(Boolean).join(" · ")}</p>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="form-label text-xs font-semibold text-slate-700 mb-2 block">Statement Type</label>
+                <div className="space-y-2">
+                  {([
+                    ["full", "All Bills (Buyer)", "Every B2B bill for the selected business"],
+                    ["date", "By Bill Date", "Bills on a specific date"],
+                    ["month", "By Month", "Bills in a calendar month"],
+                    ["range", "Date Range", "Bills between two dates"],
+                    ["current", "Current Table Search", "Uses the bills tab search filter for this buyer"],
+                  ] as const).map(([mode, title, desc]) => (
+                    <label key={mode}
+                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                        statementMode === mode ? "border-violet-600 bg-violet-50" : "border-slate-200 hover:bg-slate-50"
+                      }`}>
+                      <input type="radio" name="b2bStatementMode" value={mode} checked={statementMode === mode}
+                        onChange={() => { setStatementMode(mode); setStatementError(null); }}
+                        className="mt-0.5" />
+                      <span>
+                        <span className="text-xs font-bold text-slate-800 block">{title}</span>
+                        <span className="text-[10px] text-slate-500">{desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {statementMode === "date" && (
+                <div>
+                  <label className="form-label text-xs">Bill Date</label>
+                  <input type="date" value={statementDate} onChange={(e) => setStatementDate(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {statementMode === "month" && (
+                <div>
+                  <label className="form-label text-xs">Month</label>
+                  <input type="month" value={statementMonth} onChange={(e) => setStatementMonth(e.target.value)}
+                    className="input-enterprise font-mono text-xs w-full" />
+                </div>
+              )}
+
+              {statementMode === "range" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="form-label text-xs">From Date</label>
+                    <input type="date" value={statementFrom} onChange={(e) => setStatementFrom(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                  <div>
+                    <label className="form-label text-xs">To Date</label>
+                    <input type="date" value={statementTo} min={statementFrom} onChange={(e) => setStatementTo(e.target.value)}
+                      className="input-enterprise font-mono text-xs w-full" />
+                  </div>
+                </div>
+              )}
+
+              {statementMode !== "current" && (
+                <div>
+                  <label className="form-label text-xs">Payment Status Filter</label>
+                  <select value={statementStatusFilter} onChange={(e) => setStatementStatusFilter(e.target.value)}
+                    className="input-enterprise bg-white cursor-pointer text-xs w-full">
+                    <option value="All">All Bills</option>
+                    <option value="Paid">Paid</option>
+                    <option value="Partial">Partial</option>
+                    <option value="Credit">Credit</option>
+                  </select>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Statement prints full registered business details (GSTIN, PAN, addresses, contact) for the selected buyer,
+                then lists all matching bills with taxable value, SGST, CGST, totals, paid amount, balance, and status.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-200 bg-slate-50 rounded-b-xl">
+              <button type="button" onClick={() => setIsStatementModalOpen(false)} className="btn-secondary px-4 text-xs">
+                Cancel
+              </button>
+              <button type="button" onClick={handlePrintB2BStatement}
+                className="btn-secondary px-4 text-xs flex items-center gap-1.5">
+                <Printer className="w-3.5 h-3.5" /> Print
+              </button>
+              <button type="button" onClick={handleDownloadB2BStatement}
+                className="btn-primary px-4 text-xs flex items-center gap-1.5">
+                <Download className="w-3.5 h-3.5" /> Download PDF
+              </button>
             </div>
           </div>
         </div>
