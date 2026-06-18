@@ -21,6 +21,12 @@ import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatTableDate } from "@/lib/utils";
+import {
+  buildPurchaseGstMaps,
+  isGstApplicable,
+  normalizeProductName,
+  resolveLineGstRates,
+} from "@/lib/itemGst";
 
 interface InventoryItem {
   code: string;
@@ -33,6 +39,7 @@ interface InventoryItem {
   hsn_code: string;
   uom: string;
   enable_batch: string;
+  gst_applicable?: boolean;
   stock_qty?: number;
   created_at?: string;
 }
@@ -844,6 +851,18 @@ function filterPurchasesByRange(list: PurchaseRecord[], from: string, to: string
   });
 }
 
+function purchaseMatchesSearch(purchase: PurchaseRecord, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  if ((purchase.invoice_no ?? "").toLowerCase().includes(q)) return true;
+  if ((purchase.supplier_name ?? "").toLowerCase().includes(q)) return true;
+  return (purchase.items ?? []).some(
+    (item) =>
+      (item.code ?? "").toLowerCase().includes(q) ||
+      (item.name ?? "").toLowerCase().includes(q),
+  );
+}
+
 function buildPurchaseStatementMeta(
   list: PurchaseRecord[],
   reportType: string,
@@ -1321,7 +1340,12 @@ function SearchableProductSelect({
                     }`}
                   >
                     <div className="font-semibold">{item.code}</div>
-                    <div className="text-[10px] text-slate-500 truncate mt-0.5">{item.name}</div>
+                    <div className="text-[10px] text-slate-500 truncate mt-0.5 flex items-center gap-1.5">
+                      <span className="truncate">{item.name}</span>
+                      {!isGstApplicable(item) && (
+                        <span className="shrink-0 text-[9px] font-bold uppercase text-amber-700 bg-amber-50 px-1 rounded">No GST</span>
+                      )}
+                    </div>
                   </li>
                 ))
               )}
@@ -1405,6 +1429,7 @@ export default function PurchasePage() {
   const inventoryHsnMap = useMemo(() => buildInventoryHsnMap(inventoryItems), [inventoryItems]);
   const inventoryHsnByNameMap = useMemo(() => buildInventoryHsnByNameMap(inventoryItems), [inventoryItems]);
   const purchaseHsnMap = useMemo(() => buildPurchaseHsnMap(purchases), [purchases]);
+  const purchaseGstMaps = useMemo(() => buildPurchaseGstMaps(purchases), [purchases]);
 
   const loadLocalPurchases = useCallback(() => {
     const local = localStorage.getItem("kaniyamparambil_purchases");
@@ -1587,6 +1612,8 @@ export default function PurchasePage() {
 
   const handleProductSelect = (index: number, product: InventoryItem) => {
     const code = normalizeItemCode(product.code);
+    const codeKey = inventoryLookupKey(code);
+    const nameKey = normalizeProductName(product.name);
     const hsn = resolveItemHsnCode(
       code,
       product.name,
@@ -1596,6 +1623,11 @@ export default function PurchasePage() {
       inventoryHsnByNameMap,
       inventoryItems,
     );
+    const gst = resolveLineGstRates({
+      inventoryItem: product,
+      purchaseByCode: purchaseGstMaps.byCode.get(codeKey),
+      purchaseByName: purchaseGstMaps.byName.get(nameKey),
+    });
     const updated = gridItems.map((item, idx) => {
       if (idx === index) {
         return {
@@ -1606,8 +1638,8 @@ export default function PurchasePage() {
           unit: product.uom,
           rate: 0,
           disc: 0,
-          sgst: 9,
-          cgst: 9,
+          sgst: gst.sgst,
+          cgst: gst.cgst,
         };
       }
       return item;
@@ -2030,10 +2062,7 @@ export default function PurchasePage() {
   };
 
   const filteredPurchases = purchases.filter((p) => {
-    const q = searchQuery.toLowerCase();
-    const matchesSearch =
-      (p.invoice_no ?? "").toLowerCase().includes(q) ||
-      (p.supplier_name ?? "").toLowerCase().includes(q);
+    const matchesSearch = purchaseMatchesSearch(p, searchQuery);
     const matchesStatus = statusFilter === "All" || p.payment_status === statusFilter;
     return matchesSearch && matchesStatus;
   });
@@ -2818,7 +2847,7 @@ export default function PurchasePage() {
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search Supplier, Wholesaler or Invoice No..."
+            placeholder="Search supplier, invoice no., product name or code..."
             className="input-enterprise pl-9"
           />
         </div>

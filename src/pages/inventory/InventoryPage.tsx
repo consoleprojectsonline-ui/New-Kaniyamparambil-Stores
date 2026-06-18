@@ -19,6 +19,7 @@ import {
   FileText,
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
+import { isGstApplicable } from "@/lib/itemGst";
 
 interface InventoryItem {
   code: string;
@@ -31,6 +32,7 @@ interface InventoryItem {
   hsn_code: string;
   uom: string;
   enable_batch: string;
+  gst_applicable?: boolean;
   stock_qty?: number;
   created_at?: string;
 }
@@ -762,6 +764,7 @@ export default function InventoryPage() {
   const [customUom, setCustomUom] = useState("");
   const [isCustomUom, setIsCustomUom] = useState(false);
   const [enableBatch, setEnableBatch] = useState("N");
+  const [gstApplicable, setGstApplicable] = useState(true);
 
   const [formError, setFormError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -907,6 +910,7 @@ export default function InventoryPage() {
       hsn_code: hsnCode.trim(),
       uom: itemUom,
       enable_batch: enableBatch,
+      gst_applicable: gstApplicable,
     };
 
     if (editingItem) {
@@ -1010,6 +1014,7 @@ export default function InventoryPage() {
     }
 
     setEnableBatch(item.enable_batch || "N");
+    setGstApplicable(item.gst_applicable !== false);
     setIsFormOpen(true);
   };
 
@@ -1030,6 +1035,7 @@ export default function InventoryPage() {
     setCustomUom("");
     setIsCustomUom(false);
     setEnableBatch("N");
+    setGstApplicable(true);
     setEditingItem(null);
     setTimeout(() => {
       setSuccessMsg(null);
@@ -1496,6 +1502,21 @@ export default function InventoryPage() {
                   </div>
 
                   <div>
+                    <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer pt-1">
+                      <input
+                        type="checkbox"
+                        checked={gstApplicable}
+                        onChange={(e) => setGstApplicable(e.target.checked)}
+                        className="rounded border-slate-300"
+                      />
+                      GST applicable on this item
+                    </label>
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Uncheck for GST-exempt products (e.g. certain agricultural hand tools).
+                    </p>
+                  </div>
+
+                  <div>
                     <div className="flex items-center justify-between mb-1">
                       <label className="form-label text-xs text-slate-700 font-semibold mb-0 block">Unit-UOM *</label>
                       <button
@@ -1655,6 +1676,12 @@ export default function InventoryPage() {
                 <div className="border-b border-slate-100 pb-2">
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Unit of Measurement</span>
                   <span className="font-semibold text-slate-900">{viewingItem.uom}</span>
+                </div>
+                <div className="border-b border-slate-100 pb-2">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">GST</span>
+                  <span className={`font-semibold ${isGstApplicable(viewingItem) ? "text-emerald-700" : "text-amber-700"}`}>
+                    {isGstApplicable(viewingItem) ? "Applicable" : "Not applicable (exempt)"}
+                  </span>
                 </div>
                 <div className="border-b border-slate-100 pb-2">
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Batch Tracking Status</span>

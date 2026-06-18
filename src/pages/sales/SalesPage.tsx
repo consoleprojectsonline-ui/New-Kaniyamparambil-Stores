@@ -8,6 +8,13 @@ import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatTableDate, numberToWordsIndian, reverseChargeLabel, validateGstin } from "@/lib/utils";
+import {
+  buildPurchaseGstMaps,
+  isGstApplicable,
+  normalizeProductName,
+  parsePurchaseGstLine,
+  resolveLineGstRates,
+} from "@/lib/itemGst";
 import upiQrUrl from "@/assets/upi-qr.png";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -1517,9 +1524,9 @@ function purchaseLineFromRaw(it: Record<string, unknown>): PurchaseLineLookup | 
     : (qty > 0 && amount > 0 ? amount / qty : 0);
 
   const gstPercent = Number(it.gst_percent ?? 0);
-  const hasSplitGst = it.sgst != null || it.cgst != null;
-  const sgst = hasSplitGst ? Number(it.sgst ?? 0) : (gstPercent > 0 ? gstPercent / 2 : 9);
-  const cgst = hasSplitGst ? Number(it.cgst ?? 0) : (gstPercent > 0 ? gstPercent / 2 : 9);
+  const parsedGst = parsePurchaseGstLine(it);
+  const sgst = parsedGst?.sgst ?? (gstPercent > 0 ? gstPercent / 2 : 9);
+  const cgst = parsedGst?.cgst ?? (gstPercent > 0 ? gstPercent / 2 : 9);
 
   return {
     purchase_rate: Math.round(purchase_rate * 100) / 100,
@@ -1620,6 +1627,7 @@ interface InventoryItem {
   code: string; name: string; hsn_code: string; uom: string;
   company_code?: string; group?: string; sub_group?: string;
   brand?: string; type?: string; enable_batch?: string; stock_qty?: number;
+  gst_applicable?: boolean;
 }
 
 function SearchableProductSelect({
@@ -1847,6 +1855,7 @@ export default function SalesPage() {
   // ── Purchase item lookup: code → latest PurchaseItem data ──
   // Used to pre-fill unit, purchase cost, selling price, sgst, cgst, hsn from latest purchase bill.
   const [purchaseItemMap, setPurchaseItemMap] = useState<Map<string, PurchaseLineLookup>>(new Map());
+  const [purchaseGstMaps, setPurchaseGstMaps] = useState(() => buildPurchaseGstMaps([]));
 
   const salesItemPriceMap = useMemo(() => buildSalesItemPriceMap(sales), [sales]);
 
@@ -1930,6 +1939,7 @@ export default function SalesPage() {
   const fetchPurchaseItemMap = useCallback(async () => {
     const applyRows = (rows: Array<{ items: unknown[] }>) => {
       setPurchaseItemMap(buildPurchaseItemMap(rows));
+      setPurchaseGstMaps(buildPurchaseGstMaps(rows));
     };
 
     try {
@@ -2059,11 +2069,19 @@ export default function SalesPage() {
 
   const handleProductSelect = (i: number, prod: InventoryItem) => {
     const code = normalizeItemCode(prod.code);
+    const codeKey = code.toUpperCase();
+    const nameKey = normalizeProductName(prod.name);
     const purchaseData = purchaseItemMap.get(code);
     const salesMrp = salesItemPriceMap.get(code);
     const unitVal = purchaseData?.unit || prod.uom || "Nos";
     const costRate = purchaseData?.purchase_rate ?? 0;
     const sellingUnitPrice = resolveSellingUnitPrice(purchaseData, salesMrp);
+    const gst = resolveLineGstRates({
+      inventoryItem: prod,
+      purchaseByCode: purchaseGstMaps.byCode.get(codeKey),
+      purchaseByName: purchaseGstMaps.byName.get(nameKey),
+      rateTpOverride: gstRatesFromRateTp(rateTp),
+    });
 
     setGridItems((prev) => prev.map((item, idx) => {
       if (idx !== i) return item;
@@ -2075,8 +2093,8 @@ export default function SalesPage() {
         unit: unitVal,
         rate: costRate,
         mrp: sellingUnitPrice,
-        sgst: purchaseData?.sgst ?? 9,
-        cgst: purchaseData?.cgst ?? 9,
+        sgst: gst.sgst,
+        cgst: gst.cgst,
       };
       return { ...updated, ...computeLineAutos(updated) };
     }));
@@ -2097,12 +2115,19 @@ export default function SalesPage() {
         if (sellingUnitPrice <= 0) return item;
         changed = true;
         const purchaseData = purchaseItemMap.get(code);
+        const inv = inventory.find((p) => normalizeItemCode(p.code) === code);
+        const gst = resolveLineGstRates({
+          inventoryItem: inv,
+          purchaseByCode: purchaseGstMaps.byCode.get(code.toUpperCase()),
+          purchaseByName: purchaseGstMaps.byName.get(normalizeProductName(item.name)),
+          rateTpOverride: gstRatesFromRateTp(rateTp),
+        });
         const updated: SaleItem = {
           ...item,
           rate: purchaseData?.purchase_rate ?? item.rate,
           mrp: sellingUnitPrice,
-          sgst: purchaseData?.sgst ?? item.sgst,
-          cgst: purchaseData?.cgst ?? item.cgst,
+          sgst: gst.sgst,
+          cgst: gst.cgst,
           hsn_code: purchaseData?.hsn_code || item.hsn_code,
           unit: purchaseData?.unit || item.unit,
         };
@@ -2110,13 +2135,18 @@ export default function SalesPage() {
       });
       return changed ? next : prev;
     });
-  }, [isFormOpen, purchaseItemMap, salesItemPriceMap]);
+  }, [isFormOpen, purchaseItemMap, purchaseGstMaps, salesItemPriceMap, inventory, rateTp]);
 
   const handleRateTpChange = (nextRateTp: string) => {
     setRateTp(nextRateTp);
     const rates = gstRatesFromRateTp(nextRateTp);
     if (!rates) return;
     setGridItems((prev) => prev.map((item) => {
+      const inv = inventory.find((p) => normalizeItemCode(p.code) === normalizeItemCode(item.code));
+      if (inv && !isGstApplicable(inv)) {
+        const exempt = { ...item, sgst: 0, cgst: 0 };
+        return { ...exempt, ...computeLineAutos(exempt) };
+      }
       const updated = { ...item, sgst: rates.sgst, cgst: rates.cgst };
       return { ...updated, ...computeLineAutos(updated) };
     }));

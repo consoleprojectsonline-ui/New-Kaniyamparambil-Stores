@@ -7,6 +7,13 @@ import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatTableDate, numberToWordsIndian, reverseChargeLabel, validateGstin } from "@/lib/utils";
+import {
+  buildPurchaseGstMaps,
+  inventoryLookupKey,
+  isGstApplicable,
+  normalizeProductName,
+  resolveLineGstRates,
+} from "@/lib/itemGst";
 import type { SaleItem } from "@/pages/sales/SalesPage";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -82,6 +89,7 @@ interface InventoryItem {
   name: string;
   hsn_code: string;
   uom: string;
+  gst_applicable?: boolean;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -335,18 +343,6 @@ function resolveSellingUnitPrice(purchaseData?: PurchaseLineLookup, priorPrice?:
   }
   if (priorPrice && priorPrice > 0) return priorPrice;
   return 0;
-}
-
-function resolveLineGstRates(
-  rateTp: string,
-  purchaseData?: PurchaseLineLookup,
-): { sgst: number; cgst: number } {
-  const fromRateTp = gstRatesFromRateTp(rateTp);
-  if (fromRateTp) return fromRateTp;
-  return {
-    sgst: purchaseData?.sgst ?? 9,
-    cgst: purchaseData?.cgst ?? 9,
-  };
 }
 
 function compareBillNo(a: string, b: string): number {
@@ -1845,6 +1841,7 @@ export default function SalesB2BPage() {
     hasTotalIgst: false,
   });
   const [purchaseItemMap, setPurchaseItemMap] = useState<Map<string, PurchaseLineLookup>>(new Map());
+  const [purchaseGstMaps, setPurchaseGstMaps] = useState(() => buildPurchaseGstMaps([]));
   const [retailPriceMap, setRetailPriceMap] = useState<Map<string, number>>(new Map());
 
   const b2bItemPriceMap = useMemo(() => buildItemPriceMapFromBills(bills), [bills]);
@@ -1995,6 +1992,7 @@ export default function SalesB2BPage() {
         from += PURCHASE_LOOKUP_PAGE_SIZE;
       }
       setPurchaseItemMap(buildPurchaseItemMap(purchaseRows));
+      setPurchaseGstMaps(buildPurchaseGstMaps(purchaseRows));
 
       const salesRows: Array<{ items: unknown[] }> = [];
       from = 0;
@@ -2018,6 +2016,7 @@ export default function SalesB2BPage() {
       if (localPurchases) {
         try {
           setPurchaseItemMap(buildPurchaseItemMap(JSON.parse(localPurchases) as Array<{ items: unknown[] }>));
+          setPurchaseGstMaps(buildPurchaseGstMaps(JSON.parse(localPurchases) as Array<{ items: unknown[] }>));
         } catch { /* ignore */ }
       }
       const localSales = localStorage.getItem("kaniyamparambil_sales_v2");
@@ -2281,9 +2280,16 @@ export default function SalesB2BPage() {
 
   const applyProductToLine = (item: SaleItem, prod: InventoryItem): SaleItem => {
     const code = normalizeItemCode(prod.code);
+    const codeKey = inventoryLookupKey(code);
+    const nameKey = normalizeProductName(prod.name);
     const purchaseData = purchaseItemMap.get(code);
     const priorPrice = b2bItemPriceMap.get(code) ?? retailPriceMap.get(code);
-    const gst = resolveLineGstRates(rateTp, purchaseData);
+    const gst = resolveLineGstRates({
+      inventoryItem: prod,
+      purchaseByCode: purchaseGstMaps.byCode.get(codeKey),
+      purchaseByName: purchaseGstMaps.byName.get(nameKey),
+      rateTpOverride: gstRatesFromRateTp(rateTp),
+    });
     const updated: SaleItem = {
       ...item,
       code: prod.code,
@@ -2315,13 +2321,18 @@ export default function SalesB2BPage() {
       });
       return changed ? next : prev;
     });
-  }, [isBillFormOpen, purchaseItemMap, b2bItemPriceMap, retailPriceMap, inventory, rateTp]);
+  }, [isBillFormOpen, purchaseItemMap, purchaseGstMaps, b2bItemPriceMap, retailPriceMap, inventory, rateTp]);
 
   const handleRateTpChange = (next: string) => {
     setRateTp(next);
     const rates = gstRatesFromRateTp(next);
     if (!rates) return;
     setGridItems((prev) => prev.map((item) => {
+      const inv = inventory.find((p) => normalizeItemCode(p.code) === normalizeItemCode(item.code));
+      if (inv && !isGstApplicable(inv)) {
+        const exempt = { ...item, sgst: 0, cgst: 0 };
+        return { ...exempt, ...computeLineAutos(exempt) };
+      }
       const updated = { ...item, sgst: rates.sgst, cgst: rates.cgst };
       return { ...updated, ...computeLineAutos(updated) };
     }));

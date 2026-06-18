@@ -21,15 +21,16 @@ async function probe(table, column) {
   return !error;
 }
 
-const columns = [
-  ["sales", "customer_gstin"],
-  ["sales", "reverse_charge"],
-  ["sales", "total_igst"],
-  ["sales_b2b", "reverse_charge"],
-  ["sales_b2b", "total_sgst"],
-  ["sales_b2b", "total_cgst"],
-  ["sales_b2b", "total_igst"],
-];
+  const columns = [
+    ["sales", "customer_gstin"],
+    ["sales", "reverse_charge"],
+    ["sales", "total_igst"],
+    ["sales_b2b", "reverse_charge"],
+    ["sales_b2b", "total_sgst"],
+    ["sales_b2b", "total_cgst"],
+    ["sales_b2b", "total_igst"],
+    ["inventory", "gst_applicable"],
+  ];
 
 let missing = 0;
 for (const [table, column] of columns) {

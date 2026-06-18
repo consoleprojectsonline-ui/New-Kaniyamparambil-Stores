@@ -10,6 +10,7 @@ create table if not exists public.inventory (
   hsn_code text,
   uom text not null,
   enable_batch text default 'N' not null,
+  gst_applicable boolean default true not null,
   created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
 
