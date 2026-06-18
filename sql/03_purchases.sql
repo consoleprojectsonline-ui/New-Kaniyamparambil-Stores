@@ -20,6 +20,7 @@ create table public.purchases (
   total_discount  numeric not null default 0,
   total_sgst      numeric not null default 0,
   total_cgst      numeric not null default 0,
+  round_off       numeric not null default 0,
   net_amount      numeric not null default 0,
   paid_amount     numeric not null default 0,
   payment_status  text not null default 'Pending',

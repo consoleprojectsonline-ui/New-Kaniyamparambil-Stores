@@ -3086,7 +3086,7 @@ export default function SalesPage() {
       ══════════════════════════════════════════════════════════════════ */}
       {isFormOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
-          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-6xl w-full max-h-[92vh] overflow-y-auto flex flex-col font-sans animate-in zoom-in-95 duration-150">
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative w-[min(100rem,98vw)] max-w-none max-h-[92vh] overflow-y-auto flex flex-col font-sans animate-in zoom-in-95 duration-150">
 
             {/* Modal Header */}
             <div className="bg-slate-950 px-6 py-4 text-white flex items-center justify-between sticky top-0 z-20 shadow-md">

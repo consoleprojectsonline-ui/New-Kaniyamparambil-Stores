@@ -44,9 +44,14 @@ export interface PurchaseItem {
   qty: number;
   unit: string;
   rate: number;
+  amount?: number;  // qty × rate (before discount)
   disc: number;   // trade discount amount (₹)
   sgst: number;  // SGST tax percentage
   cgst: number;  // CGST tax percentage
+  taxable_value?: number;
+  sgst_amount?: number;
+  cgst_amount?: number;
+  line_total?: number;
   s_rate?: number; // selling price
   mrp?: number;    // MRP
 }
@@ -216,24 +221,21 @@ const BRANCHES_GODOWNS = [
  *   amount           -> net_amount (subtotal = same)
  *   tax_amount       -> absorbed into net_amount already
  */
+function purchaseHasStoredFinancials(raw: Record<string, unknown>): boolean {
+  const net = Number(raw.net_amount ?? raw.amount ?? 0);
+  if (net <= 0) return false;
+  return (
+    Number(raw.subtotal ?? 0) > 0 ||
+    Number(raw.total_sgst ?? 0) > 0 ||
+    Number(raw.total_cgst ?? 0) > 0
+  );
+}
+
 function normalizePurchase(raw: Record<string, unknown>): PurchaseRecord {
   // Normalise items: migrate legacy 'gst' → sgst/cgst split
   let items: PurchaseItem[];
   if (Array.isArray(raw.items) && raw.items.length > 0) {
-    items = (raw.items as Record<string, unknown>[]).map((it) => ({
-      code: String(it.code ?? ""),
-      name: String(it.name ?? ""),
-      hsn_code: String(it.hsn_code ?? ""),
-      qty: Number(it.qty ?? 1),
-      unit: String(it.unit ?? "Nos"),
-      rate: Number(it.rate ?? 0),
-      disc: Number(it.disc ?? 0),
-      // If already has sgst/cgst use them; otherwise halve legacy gst
-      sgst: it.sgst !== undefined ? Number(it.sgst) : Number(it.gst ?? 0) / 2,
-      cgst: it.cgst !== undefined ? Number(it.cgst) : Number(it.gst ?? 0) / 2,
-      s_rate: it.s_rate !== undefined ? Number(it.s_rate) : undefined,
-      mrp: it.mrp !== undefined ? Number(it.mrp) : undefined,
-    }));
+    items = (raw.items as Record<string, unknown>[]).map(normalizePurchaseItem);
   } else {
     items = [{
       code: "LEGACY",
@@ -248,34 +250,12 @@ function normalizePurchase(raw: Record<string, unknown>): PurchaseRecord {
     }];
   }
 
-  // Derive totals for legacy records that lack them
-  let totalSgst = Number(raw.total_sgst ?? 0);
-  let totalCgst = Number(raw.total_cgst ?? 0);
-  if (!raw.total_sgst && !raw.total_cgst) {
-    items.forEach((it) => {
-      const summary = getPurchaseItemLineSummary(it);
-      totalSgst += summary.sgstAmt;
-      totalCgst += summary.cgstAmt;
-    });
-  }
-
   const expenses = Number(raw.expenses ?? 0);
-  const storedRoundOff = raw.round_off !== undefined ? Number(raw.round_off) : undefined;
-  const computed = computePurchaseTotals(items, expenses, storedRoundOff);
   const storedNet = Number(raw.net_amount ?? raw.amount ?? 0);
-  const storedSubtotal = Number(raw.subtotal ?? raw.amount ?? 0);
-  const hasItemTax = purchaseHasLineTax(items);
-  const grossOnly = purchaseStoredAsGrossOnly(storedNet, computed.subtotal);
-  const useComputed = hasItemTax || grossOnly || (storedNet > 0 && storedNet < computed.net_amount - 0.5);
-
   const paidAmount = Number(raw.paid_amount ?? 0);
   const paymentStatus = String(raw.payment_status ?? "Pending");
-  const resolvedNet = useComputed ? computed.net_amount : (storedNet || computed.net_amount);
-  const resolvedPaid = paymentStatus === "Paid" && grossOnly
-    ? resolvedNet
-    : (useComputed && paymentStatus === "Paid" ? resolvedNet : paidAmount);
 
-  return {
+  const baseRecord = {
     invoice_no: String(raw.invoice_no ?? raw.bill_no ?? ""),
     serial_no: raw.serial_no ? String(raw.serial_no) : undefined,
     supplier_name: String(raw.supplier_name ?? ""),
@@ -286,6 +266,49 @@ function normalizePurchase(raw: Record<string, unknown>): PurchaseRecord {
     vehicle_no: raw.vehicle_no ? String(raw.vehicle_no) : "",
     items,
     expenses,
+    payment_status: paymentStatus,
+    created_at: raw.created_at ? String(raw.created_at) : undefined,
+  };
+
+  // Supabase saved totals are authoritative — do not recompute from line items
+  if (purchaseHasStoredFinancials(raw)) {
+    return {
+      ...baseRecord,
+      subtotal: Number(raw.subtotal ?? 0),
+      total_discount: Number(raw.total_discount ?? 0),
+      total_sgst: Number(raw.total_sgst ?? 0),
+      total_cgst: Number(raw.total_cgst ?? 0),
+      round_off: Number(raw.round_off ?? 0),
+      net_amount: storedNet,
+      paid_amount: paidAmount,
+    };
+  }
+
+  // Legacy records: derive totals from line items when bill-level fields are missing
+  let totalSgst = Number(raw.total_sgst ?? 0);
+  let totalCgst = Number(raw.total_cgst ?? 0);
+  if (!raw.total_sgst && !raw.total_cgst) {
+    items.forEach((it) => {
+      const summary = getPurchaseItemLineSummary(it);
+      totalSgst += summary.sgstAmt;
+      totalCgst += summary.cgstAmt;
+    });
+  }
+
+  const storedRoundOff = raw.round_off !== undefined ? Number(raw.round_off) : undefined;
+  const computed = computePurchaseTotals(items, expenses, storedRoundOff);
+  const storedSubtotal = Number(raw.subtotal ?? raw.amount ?? 0);
+  const hasItemTax = purchaseHasLineTax(items);
+  const grossOnly = purchaseStoredAsGrossOnly(storedNet, computed.subtotal);
+  const useComputed = hasItemTax || grossOnly || (storedNet > 0 && storedNet < computed.net_amount - 0.5);
+
+  const resolvedNet = useComputed ? computed.net_amount : (storedNet || computed.net_amount);
+  const resolvedPaid = paymentStatus === "Paid" && grossOnly
+    ? resolvedNet
+    : (useComputed && paymentStatus === "Paid" ? resolvedNet : paidAmount);
+
+  return {
+    ...baseRecord,
     subtotal: useComputed ? computed.subtotal : (storedSubtotal || computed.subtotal),
     total_discount: useComputed ? computed.total_discount : Number(raw.total_discount ?? computed.total_discount),
     total_sgst: useComputed ? computed.total_sgst : Math.round(totalSgst * 100) / 100,
@@ -293,8 +316,6 @@ function normalizePurchase(raw: Record<string, unknown>): PurchaseRecord {
     round_off: useComputed ? computed.round_off : Number(raw.round_off ?? 0),
     net_amount: resolvedNet,
     paid_amount: resolvedPaid,
-    payment_status: paymentStatus,
-    created_at: raw.created_at ? String(raw.created_at) : undefined,
   };
 }
 
@@ -352,15 +373,128 @@ function formatMonthLabel(monthYm: string): string {
 }
 
 function getPurchaseItemLineSummary(item: PurchaseItem) {
-  const taxable = Math.max(0, item.qty * item.rate - (item.disc || 0));
+  const amount = item.qty * item.rate;
+  const taxable = Math.max(0, amount - (item.disc || 0));
   const sgstAmt = taxable * ((item.sgst ?? 0) / 100);
   const cgstAmt = taxable * ((item.cgst ?? 0) / 100);
   return {
+    amount,
     taxable,
     sgstAmt,
     cgstAmt,
     lineTotal: taxable + sgstAmt + cgstAmt,
   };
+}
+
+function computePurchaseLineAutos(item: PurchaseItem): Partial<PurchaseItem> {
+  const summary = getPurchaseItemLineSummary(item);
+  return {
+    amount: Math.round(summary.amount * 100) / 100,
+    taxable_value: Math.round(summary.taxable * 100) / 100,
+    sgst_amount: Math.round(summary.sgstAmt * 100) / 100,
+    cgst_amount: Math.round(summary.cgstAmt * 100) / 100,
+    line_total: Math.round(summary.lineTotal * 100) / 100,
+  };
+}
+
+function normalizePurchaseItem(raw: Record<string, unknown>): PurchaseItem {
+  const gstLegacy = Number(raw.gst ?? 0);
+  const hasSplitGst = raw.sgst != null || raw.cgst != null;
+  const sgst = hasSplitGst ? Number(raw.sgst ?? 0) : gstLegacy / 2;
+  const cgst = hasSplitGst ? Number(raw.cgst ?? 0) : gstLegacy / 2;
+  const item: PurchaseItem = {
+    code: String(raw.code ?? ""),
+    name: String(raw.name ?? ""),
+    hsn_code: String(raw.hsn_code ?? ""),
+    qty: Number(raw.qty ?? 1),
+    unit: String(raw.unit ?? "Nos"),
+    rate: Number(raw.rate ?? 0),
+    disc: Number(raw.disc ?? 0),
+    sgst,
+    cgst,
+    s_rate: raw.s_rate !== undefined ? Number(raw.s_rate) : undefined,
+    mrp: raw.mrp !== undefined ? Number(raw.mrp) : undefined,
+  };
+  const summary = getPurchaseItemLineSummary(item);
+  return {
+    ...item,
+    amount: Number(raw.amount ?? 0) || Math.round(summary.amount * 100) / 100,
+    taxable_value: Number(raw.taxable_value ?? 0) || Math.round(summary.taxable * 100) / 100,
+    sgst_amount: Number(raw.sgst_amount ?? 0) || Math.round(summary.sgstAmt * 100) / 100,
+    cgst_amount: Number(raw.cgst_amount ?? 0) || Math.round(summary.cgstAmt * 100) / 100,
+    line_total: Number(raw.line_total ?? 0) || Math.round(summary.lineTotal * 100) / 100,
+  };
+}
+
+async function detectPurchaseDbColumns(): Promise<{
+  hasRoundOff: boolean;
+  hasTotalSgst: boolean;
+  hasTotalCgst: boolean;
+  hasTotalDiscount: boolean;
+  hasExpenses: boolean;
+  hasVehicleNo: boolean;
+  hasSerialNo: boolean;
+}> {
+  const probe = async (column: string) => {
+    const { error } = await supabase.from("purchases").select(column).limit(1);
+    return !error;
+  };
+  const [
+    hasRoundOff,
+    hasTotalSgst,
+    hasTotalCgst,
+    hasTotalDiscount,
+    hasExpenses,
+    hasVehicleNo,
+    hasSerialNo,
+  ] = await Promise.all([
+    probe("round_off"),
+    probe("total_sgst"),
+    probe("total_cgst"),
+    probe("total_discount"),
+    probe("expenses"),
+    probe("vehicle_no"),
+    probe("serial_no"),
+  ]);
+  return {
+    hasRoundOff,
+    hasTotalSgst,
+    hasTotalCgst,
+    hasTotalDiscount,
+    hasExpenses,
+    hasVehicleNo,
+    hasSerialNo,
+  };
+}
+
+const OPTIONAL_PURCHASE_DB_COLUMNS = [
+  "round_off",
+  "total_sgst",
+  "total_cgst",
+  "total_discount",
+  "expenses",
+  "vehicle_no",
+  "serial_no",
+] as const;
+
+function buildSupabasePurchaseRow(
+  payload: PurchaseRecord,
+  schema: Awaited<ReturnType<typeof detectPurchaseDbColumns>>,
+): Record<string, unknown> {
+  const row: Record<string, unknown> = { ...payload };
+  const availability: Record<(typeof OPTIONAL_PURCHASE_DB_COLUMNS)[number], boolean> = {
+    round_off: schema.hasRoundOff,
+    total_sgst: schema.hasTotalSgst,
+    total_cgst: schema.hasTotalCgst,
+    total_discount: schema.hasTotalDiscount,
+    expenses: schema.hasExpenses,
+    vehicle_no: schema.hasVehicleNo,
+    serial_no: schema.hasSerialNo,
+  };
+  for (const column of OPTIONAL_PURCHASE_DB_COLUMNS) {
+    if (!availability[column]) delete row[column];
+  }
+  return row;
 }
 
 /** Recompute purchase bill totals from line items (discount + GST + round-off). */
@@ -386,10 +520,16 @@ function computePurchaseTotals(
 
   const extra = Number(expenses) || 0;
   const rawNet = subtotal - totalDiscount + totalSgst + totalCgst + extra;
-  const roundOff = explicitRoundOff !== undefined
-    ? explicitRoundOff
-    : Math.round(rawNet * 100) / 100 - rawNet;
-  const netAmount = rawNet + roundOff;
+  const rawNetPaise = Math.round(rawNet * 100) / 100;
+  let roundOff: number;
+  let netAmount: number;
+  if (explicitRoundOff !== undefined) {
+    roundOff = explicitRoundOff;
+    netAmount = Math.round((rawNetPaise + roundOff) * 100) / 100;
+  } else {
+    netAmount = Math.round(rawNetPaise);
+    roundOff = Math.round((netAmount - rawNetPaise) * 100) / 100;
+  }
 
   return {
     subtotal: Math.round(subtotal * 100) / 100,
@@ -1200,6 +1340,15 @@ export default function PurchasePage() {
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [dbStatus, setDbStatus] = useState<"connected" | "local">("connected");
   const [editingPurchase, setEditingPurchase] = useState<PurchaseRecord | null>(null);
+  const purchasesDbColumnsRef = useRef<Awaited<ReturnType<typeof detectPurchaseDbColumns>>>({
+    hasRoundOff: false,
+    hasTotalSgst: false,
+    hasTotalCgst: false,
+    hasTotalDiscount: false,
+    hasExpenses: false,
+    hasVehicleNo: false,
+    hasSerialNo: false,
+  });
 
   // Search & Filter state
   const [searchQuery, setSearchQuery] = useState("");
@@ -1361,6 +1510,8 @@ export default function PurchasePage() {
         setDbStatus("local");
         loadLocalPurchases();
       } else if (data) {
+        const schema = await detectPurchaseDbColumns();
+        purchasesDbColumnsRef.current = schema;
         setPurchases(
           (data as Record<string, unknown>[]).map((r) => normalizePurchase(r))
         );
@@ -1545,6 +1696,8 @@ export default function PurchasePage() {
 
     status = paidNum >= calculatedTotals.netAmount ? "Paid" : paidNum > 0 ? "Partial" : "Pending";
 
+    const itemsFinal = gridItems.map((item) => ({ ...item, ...computePurchaseLineAutos(item) }));
+
     const payload: PurchaseRecord = {
       invoice_no: invoiceNumClean,
       serial_no: serialNo.trim() || undefined,
@@ -1554,12 +1707,13 @@ export default function PurchasePage() {
       entry_date: entryDate,
       invoice_date: invoiceDate,
       vehicle_no: vehicleNo.trim() || undefined,
-      items: gridItems,
+      items: itemsFinal,
       expenses: expensesNum,
       subtotal: calculatedTotals.subtotal,
       total_discount: calculatedTotals.discount,
       total_sgst: calculatedTotals.totalSgst,
       total_cgst: calculatedTotals.totalCgst,
+      round_off: calculatedTotals.roundOff,
       net_amount: calculatedTotals.netAmount,
       paid_amount: paidNum,
       payment_status: status,
@@ -1577,9 +1731,10 @@ export default function PurchasePage() {
             .single();
 
           // 2. Perform DB Updates
+          const row = buildSupabasePurchaseRow(payload, purchasesDbColumnsRef.current);
           const { error } = await supabase
             .from("purchases")
-            .update(payload)
+            .update(row)
             .eq("invoice_no", editingPurchase.invoice_no);
           if (error) throw error;
 
@@ -1666,7 +1821,8 @@ export default function PurchasePage() {
 
       if (dbStatus === "connected") {
         try {
-          const { error } = await supabase.from("purchases").insert([payload]);
+          const row = buildSupabasePurchaseRow(payload, purchasesDbColumnsRef.current);
+          const { error } = await supabase.from("purchases").insert([row]);
           if (error) throw error;
 
           // Increment stock counts
@@ -2068,6 +2224,7 @@ export default function PurchasePage() {
   total_discount  numeric NOT NULL DEFAULT 0,
   total_sgst      numeric NOT NULL DEFAULT 0,
   total_cgst      numeric NOT NULL DEFAULT 0,
+  round_off       numeric NOT NULL DEFAULT 0,
   net_amount      numeric NOT NULL DEFAULT 0,
   paid_amount     numeric NOT NULL DEFAULT 0,
   payment_status  text NOT NULL DEFAULT 'Pending',
