@@ -630,6 +630,8 @@ function buildB2BInvoiceHtml(rec: B2BSaleRecord, options: B2BDocOptions = {}): s
 // ─── B2B Statement & Buyer Profile ───────────────────────────────────────────
 
 type B2BReportMode = "full" | "date" | "month" | "range" | "current";
+type BuyerPrintMode = "individual" | "group" | "conditions";
+type BuyerPrintGroupScope = "all" | "active" | "selected";
 
 type B2BStatementMeta = {
   reportTitle: string;
@@ -971,6 +973,251 @@ function buildB2BStatementHtml(
         <div class="footer-note">
           B2B account statement for ${escapeHtml(buyerDisplayName(buyer))} (${escapeHtml(buyer.gstin)}).
           Amounts are computed from saved tax invoices including SGST/CGST split per bill line.
+        </div>
+        <div class="signatory">
+          <div>${escapeHtml(store.signatureCompany)}</div>
+          <div>${escapeHtml(store.signatureRole)}</div>
+        </div>
+      </div>
+    </body>
+  </html>`;
+}
+
+type BuyersDirectoryMeta = {
+  reportTitle: string;
+  scopeLabel: string;
+  reportType: string;
+  generatedOn: string;
+  totalBusinesses: number;
+};
+
+function buyerMatchesSearch(buyer: B2BBuyer, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return (
+    buyer.legal_name.toLowerCase().includes(q)
+    || (buyer.trade_name ?? "").toLowerCase().includes(q)
+    || buyer.gstin.toLowerCase().includes(q)
+    || (buyer.city ?? "").toLowerCase().includes(q)
+    || buyer.state.toLowerCase().includes(q)
+  );
+}
+
+function buyerHasBills(buyer: B2BBuyer, billList: B2BSaleRecord[]): boolean {
+  const gstin = buyer.gstin.toUpperCase();
+  return billList.some(
+    (b) => b.buyer_id === buyer.id || b.buyer_gstin.toUpperCase() === gstin,
+  );
+}
+
+function buildB2BBuyersDirectoryHtml(
+  buyerList: B2BBuyer[],
+  meta: BuyersDirectoryMeta,
+  options: B2BDocOptions = {},
+): string {
+  const store = B2B_STORE_DETAILS;
+  const isPdfMode = options.renderMode === "pdf";
+
+  const summaryRows = buyerList.map((buyer, index) => `
+    <tr>
+      <td class="col-index">${index + 1}</td>
+      <td class="col-name">${escapeHtml(buyer.legal_name)}</td>
+      <td class="col-trade">${escapeHtml(buyer.trade_name?.trim() || "—")}</td>
+      <td class="col-gstin">${escapeHtml(buyer.gstin)}</td>
+      <td class="col-type">${escapeHtml(buyer.business_type)}</td>
+      <td class="col-state">${escapeHtml(buyer.state)}</td>
+      <td class="col-phone">${escapeHtml(buyer.phone?.trim() || "—")}</td>
+      <td class="col-status">${buyer.is_active ? "Active" : "Inactive"}</td>
+    </tr>
+  `).join("");
+
+  const detailBlocks = buyerList.map((buyer, index) => `
+    <div class="buyer-detail-block">
+      <div class="buyer-detail-head">
+        <span class="buyer-detail-index">#${index + 1}</span>
+        <strong>${escapeHtml(buyerDisplayName(buyer))}</strong>
+        <span class="buyer-detail-gstin">${escapeHtml(buyer.gstin)}</span>
+      </div>
+      ${buildB2BBuyerDetailsLines(buyer)}
+    </div>
+  `).join("");
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>${escapeHtml(meta.reportTitle)}</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          background: ${isPdfMode ? "#fff" : "#f3f4f6"};
+          font-family: Arial, Helvetica, sans-serif;
+          color: #111;
+          font-size: ${isPdfMode ? "8px" : "11px"};
+          line-height: 1.35;
+          padding: ${isPdfMode ? "0" : "20px"};
+        }
+        .b2b-toolbar {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto 12px;
+          padding: 12px 16px;
+          border: 1px solid #ccc;
+          background: #fff;
+          display: ${isPdfMode ? "none" : "flex"};
+        }
+        .toolbar-text { margin: 0; color: #555; font-size: 12px; }
+        .b2b-buyers-directory-sheet {
+          width: ${isPdfMode ? "794px" : "860px"};
+          margin: 0 auto;
+          background: #fff;
+          border: 1px solid #000;
+        }
+        .doc-title {
+          text-align: center;
+          font-size: ${isPdfMode ? "13px" : "16px"};
+          font-weight: 700;
+          color: #5b21b6;
+          padding: ${isPdfMode ? "7px 8px" : "10px"};
+          border-bottom: 1px solid #000;
+        }
+        .period-banner {
+          text-align: center;
+          font-weight: 700;
+          padding: ${isPdfMode ? "5px 8px" : "8px 12px"};
+          border-bottom: 1px solid #000;
+          background: #f5f3ff;
+          font-size: ${isPdfMode ? "9px" : "12px"};
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr;
+          border-bottom: 1px solid #000;
+        }
+        .meta-grid > div {
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          border-right: 1px solid #000;
+        }
+        .meta-grid > div:last-child { border-right: none; }
+        .meta-label {
+          font-weight: 700;
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          text-transform: uppercase;
+          color: #5b21b6;
+          margin-bottom: 3px;
+        }
+        .meta-line { margin-bottom: 1px; }
+        .directory-table { width: 100%; border-collapse: collapse; }
+        .directory-table th, .directory-table td {
+          border: 1px solid #000;
+          padding: ${isPdfMode ? "2px 3px" : "4px 5px"};
+          vertical-align: top;
+        }
+        .directory-table thead th {
+          background: #f5f3ff;
+          font-weight: 700;
+          text-align: center;
+        }
+        .col-index { width: 22px; text-align: center; }
+        .col-name { min-width: 90px; }
+        .col-trade { width: 70px; }
+        .col-gstin { width: 78px; font-family: monospace; font-size: ${isPdfMode ? "7px" : "10px"}; }
+        .col-type { width: 52px; }
+        .col-state { width: 48px; }
+        .col-phone { width: 58px; }
+        .col-status { width: 40px; text-align: center; }
+        .details-title {
+          font-weight: 700;
+          text-transform: uppercase;
+          font-size: ${isPdfMode ? "8px" : "10px"};
+          color: #5b21b6;
+          padding: ${isPdfMode ? "5px 8px" : "8px 10px"};
+          border-top: 1px solid #000;
+          border-bottom: 1px solid #000;
+          background: #faf5ff;
+        }
+        .buyer-detail-block {
+          border-bottom: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          page-break-inside: avoid;
+        }
+        .buyer-detail-head {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: baseline;
+          gap: 6px;
+          margin-bottom: 4px;
+          font-size: ${isPdfMode ? "9px" : "12px"};
+        }
+        .buyer-detail-index { color: #5b21b6; font-weight: 700; }
+        .buyer-detail-gstin { font-family: monospace; font-size: ${isPdfMode ? "8px" : "10px"}; color: #444; }
+        .buyer-line { margin-bottom: 2px; }
+        .buyer-name { margin-bottom: 4px; }
+        .footer-note {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "5px 7px" : "8px 10px"};
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          color: #444;
+        }
+        .signatory {
+          border-top: 1px solid #000;
+          padding: ${isPdfMode ? "6px 8px" : "10px 12px"};
+          text-align: right;
+          font-weight: 700;
+          font-size: ${isPdfMode ? "8px" : "11px"};
+        }
+        @page { size: A4; margin: 8mm; }
+        @media print {
+          body { background: #fff; padding: 0; }
+          .b2b-toolbar { display: none !important; }
+          .b2b-buyers-directory-sheet { width: 100%; border: none; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="b2b-toolbar">
+        <p class="toolbar-text">${escapeHtml(options.helperText ?? "Registered businesses directory")}</p>
+      </div>
+      <div class="b2b-buyers-directory-sheet">
+        <div class="doc-title">${escapeHtml(meta.reportTitle)}</div>
+        <div class="period-banner">${escapeHtml(meta.scopeLabel)}</div>
+        <div class="meta-grid">
+          <div>
+            <div class="meta-label">Issued By</div>
+            <div class="meta-line"><strong>${escapeHtml(store.storeName)}</strong></div>
+            <div class="meta-line">${escapeHtml(store.location)}</div>
+            <div class="meta-line"><b>GSTIN:</b> ${escapeHtml(store.gstin)}</div>
+          </div>
+          <div>
+            <div class="meta-label">Report</div>
+            <div class="meta-line"><b>Type:</b> ${escapeHtml(meta.reportType)}</div>
+            <div class="meta-line"><b>Businesses:</b> ${meta.totalBusinesses}</div>
+          </div>
+          <div>
+            <div class="meta-label">Generated</div>
+            <div class="meta-line"><b>Date:</b> ${escapeHtml(meta.generatedOn)}</div>
+          </div>
+        </div>
+        <table class="directory-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Legal Name</th>
+              <th>Trade Name</th>
+              <th>GSTIN</th>
+              <th>Type</th>
+              <th>State</th>
+              <th>Phone</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${summaryRows}</tbody>
+        </table>
+        <div class="details-title">Full Business Details</div>
+        ${detailBlocks}
+        <div class="footer-note">
+          Registered GST business directory generated from B2B buyer records.
+          Each entry includes legal name, GSTIN, PAN, addresses, contact, and place of supply.
         </div>
         <div class="signatory">
           <div>${escapeHtml(store.signatureCompany)}</div>
@@ -1444,6 +1691,18 @@ export default function SalesB2BPage() {
   const [statementTo, setStatementTo] = useState(todayIso());
   const [statementStatusFilter, setStatementStatusFilter] = useState("All");
   const [statementError, setStatementError] = useState<string | null>(null);
+
+  const [isBuyerPrintModalOpen, setIsBuyerPrintModalOpen] = useState(false);
+  const [buyerPrintMode, setBuyerPrintMode] = useState<BuyerPrintMode>("individual");
+  const [buyerPrintIndividualId, setBuyerPrintIndividualId] = useState("");
+  const [buyerPrintGroupScope, setBuyerPrintGroupScope] = useState<BuyerPrintGroupScope>("active");
+  const [buyerPrintSelectedIds, setBuyerPrintSelectedIds] = useState<string[]>([]);
+  const [buyerPrintBusinessType, setBuyerPrintBusinessType] = useState("All");
+  const [buyerPrintStateFilter, setBuyerPrintStateFilter] = useState("All");
+  const [buyerPrintActiveFilter, setBuyerPrintActiveFilter] = useState<"all" | "active" | "inactive">("all");
+  const [buyerPrintBillFilter, setBuyerPrintBillFilter] = useState<"all" | "with_bills" | "without_bills">("all");
+  const [buyerPrintUseSearch, setBuyerPrintUseSearch] = useState(true);
+  const [buyerPrintError, setBuyerPrintError] = useState<string | null>(null);
 
   const [formError, setFormError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -2247,17 +2506,6 @@ export default function SalesB2BPage() {
     }
   };
 
-  const handlePrintBuyerProfile = async (buyer: B2BBuyer) => {
-    try {
-      await printB2BHtml(
-        buildB2BBuyerProfileHtml(buyer, { helperText: "Registered business profile — print or save as PDF." }),
-        ".b2b-buyer-profile-sheet",
-      );
-    } catch (err) {
-      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
-    }
-  };
-
   const handleDownloadBuyerProfile = async (buyer: B2BBuyer) => {
     try {
       await exportB2BDocPdf(
@@ -2265,6 +2513,187 @@ export default function SalesB2BPage() {
         `b2b_business_${buyer.gstin}.pdf`,
         ".b2b-buyer-profile-sheet",
         false,
+      );
+    } catch (err) {
+      alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
+  const openBuyerPrintModal = (prefillBuyerId?: string) => {
+    setBuyerPrintError(null);
+    if (prefillBuyerId) {
+      setBuyerPrintMode("individual");
+      setBuyerPrintIndividualId(prefillBuyerId);
+    } else if (!buyerPrintIndividualId && activeBuyers.length > 0) {
+      setBuyerPrintIndividualId(activeBuyers[0].id);
+    }
+    if (buyerPrintSelectedIds.length === 0 && activeBuyers.length > 0) {
+      setBuyerPrintSelectedIds(activeBuyers.map((b) => b.id));
+    }
+    setIsBuyerPrintModalOpen(true);
+  };
+
+  const toggleBuyerPrintSelection = (buyerId: string) => {
+    setBuyerPrintSelectedIds((prev) =>
+      prev.includes(buyerId)
+        ? prev.filter((id) => id !== buyerId)
+        : [...prev, buyerId],
+    );
+  };
+
+  const resolveBuyersForPrint = (): {
+    buyers: B2BBuyer[];
+    scopeLabel: string;
+    reportType: string;
+    filenameSuffix: string;
+  } | null => {
+    const sortBuyers = (list: B2BBuyer[]) =>
+      [...list].sort((a, b) => a.legal_name.localeCompare(b.legal_name, undefined, { sensitivity: "base" }));
+
+    if (buyerPrintMode === "individual") {
+      const buyer = resolveRegistryBuyer(buyerPrintIndividualId, buyers);
+      if (!buyer) {
+        setBuyerPrintError("Select a business to print.");
+        return null;
+      }
+      return {
+        buyers: [buyer],
+        scopeLabel: `Individual — ${buyerDisplayName(buyer)} (${buyer.gstin})`,
+        reportType: "Individual Business Profile",
+        filenameSuffix: `business_${buyer.gstin}`,
+      };
+    }
+
+    if (buyerPrintMode === "group") {
+      let list: B2BBuyer[];
+      let scopeLabel: string;
+      if (buyerPrintGroupScope === "all") {
+        list = sortBuyers(buyers);
+        scopeLabel = `All Registered Businesses (${list.length})`;
+      } else if (buyerPrintGroupScope === "active") {
+        list = sortBuyers(activeBuyers);
+        scopeLabel = `All Active Businesses (${list.length})`;
+      } else {
+        list = sortBuyers(buyers.filter((b) => buyerPrintSelectedIds.includes(b.id)));
+        scopeLabel = `Selected Group (${list.length} businesses)`;
+        if (list.length === 0) {
+          setBuyerPrintError("Select at least one business for group print.");
+          return null;
+        }
+      }
+      return {
+        buyers: list,
+        scopeLabel,
+        reportType: "Business Group Directory",
+        filenameSuffix: `businesses_group_${todayIso()}`,
+      };
+    }
+
+    let list = sortBuyers([...buyers]);
+    if (buyerPrintBusinessType !== "All") {
+      list = list.filter((b) => b.business_type === buyerPrintBusinessType);
+    }
+    if (buyerPrintStateFilter !== "All") {
+      list = list.filter((b) => b.state === buyerPrintStateFilter);
+    }
+    if (buyerPrintActiveFilter === "active") {
+      list = list.filter((b) => b.is_active);
+    } else if (buyerPrintActiveFilter === "inactive") {
+      list = list.filter((b) => !b.is_active);
+    }
+    if (buyerPrintBillFilter === "with_bills") {
+      list = list.filter((b) => buyerHasBills(b, bills));
+    } else if (buyerPrintBillFilter === "without_bills") {
+      list = list.filter((b) => !buyerHasBills(b, bills));
+    }
+    if (buyerPrintUseSearch && buyerSearch.trim()) {
+      list = list.filter((b) => buyerMatchesSearch(b, buyerSearch));
+    }
+
+    const filters: string[] = [];
+    if (buyerPrintBusinessType !== "All") filters.push(`Type: ${buyerPrintBusinessType}`);
+    if (buyerPrintStateFilter !== "All") filters.push(`State: ${buyerPrintStateFilter}`);
+    if (buyerPrintActiveFilter !== "all") {
+      filters.push(buyerPrintActiveFilter === "active" ? "Active only" : "Inactive only");
+    }
+    if (buyerPrintBillFilter === "with_bills") filters.push("With B2B bills");
+    if (buyerPrintBillFilter === "without_bills") filters.push("Without B2B bills");
+    if (buyerPrintUseSearch && buyerSearch.trim()) filters.push(`Search: ${buyerSearch.trim()}`);
+
+    return {
+      buyers: list,
+      scopeLabel: filters.length > 0
+        ? `Filtered — ${filters.join(" · ")} (${list.length})`
+        : `All Businesses by Conditions (${list.length})`,
+      reportType: "Conditional Business Directory",
+      filenameSuffix: `businesses_filtered_${todayIso()}`,
+    };
+  };
+
+  const buildBuyerPrintDocument = (): {
+    html: string;
+    sheetSelector: string;
+    multiPage: boolean;
+  } | null => {
+    const resolved = resolveBuyersForPrint();
+    if (!resolved) return null;
+    if (resolved.buyers.length === 0) {
+      setBuyerPrintError("No businesses match the selected print options.");
+      return null;
+    }
+    setBuyerPrintError(null);
+
+    if (resolved.buyers.length === 1) {
+      return {
+        html: buildB2BBuyerProfileHtml(resolved.buyers[0], {
+          renderMode: "pdf",
+          helperText: "Registered business profile",
+        }),
+        sheetSelector: ".b2b-buyer-profile-sheet",
+        multiPage: false,
+      };
+    }
+
+    return {
+      html: buildB2BBuyersDirectoryHtml(
+        resolved.buyers,
+        {
+          reportTitle: "REGISTERED BUSINESSES DIRECTORY · B2B",
+          scopeLabel: resolved.scopeLabel,
+          reportType: resolved.reportType,
+          generatedOn: formatB2BGeneratedOn(),
+          totalBusinesses: resolved.buyers.length,
+        },
+        { renderMode: "pdf", helperText: "Generating business directory..." },
+      ),
+      sheetSelector: ".b2b-buyers-directory-sheet",
+      multiPage: true,
+    };
+  };
+
+  const handlePrintBuyersDirectory = async () => {
+    const resolved = resolveBuyersForPrint();
+    if (!resolved) return;
+    const doc = buildBuyerPrintDocument();
+    if (!doc) return;
+    try {
+      await printB2BHtml(doc.html, doc.sheetSelector);
+    } catch (err) {
+      alert(`Print failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  };
+
+  const handleDownloadBuyersDirectory = async () => {
+    const resolved = resolveBuyersForPrint();
+    if (!resolved) return;
+    const doc = buildBuyerPrintDocument();
+    if (!doc) return;
+    try {
+      await exportB2BDocPdf(
+        doc.html,
+        `b2b_${resolved.filenameSuffix}.pdf`,
+        doc.sheetSelector,
+        doc.multiPage,
       );
     } catch (err) {
       alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
@@ -2312,6 +2741,10 @@ export default function SalesB2BPage() {
           <button type="button" onClick={() => openStatementModal()}
             className="btn-secondary flex items-center gap-1.5 text-xs font-bold border-violet-200 text-violet-800 hover:bg-violet-50">
             <FileText className="w-4 h-4" /> B2B Statement
+          </button>
+          <button type="button" onClick={() => openBuyerPrintModal()}
+            className="btn-secondary flex items-center gap-1.5 text-xs font-bold border-violet-200 text-violet-800 hover:bg-violet-50">
+            <Printer className="w-4 h-4" /> Print Businesses
           </button>
           <button type="button" onClick={() => openNewBill()}
             className="btn-primary flex items-center gap-1.5 text-xs font-bold">
@@ -2418,11 +2851,17 @@ export default function SalesB2BPage() {
 
       {activeTab === "buyers" && (
         <div className="space-y-4">
-          <div className="relative max-w-md">
-            <Search className="w-4 h-4 text-text-secondary absolute left-3 top-2.5" />
-            <input value={buyerSearch} onChange={(e) => setBuyerSearch(e.target.value)}
-              placeholder="Search company, trade name, GSTIN..."
-              className="input-enterprise pl-9 text-xs w-full" />
+          <div className="flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
+            <div className="relative max-w-md flex-1">
+              <Search className="w-4 h-4 text-text-secondary absolute left-3 top-2.5" />
+              <input value={buyerSearch} onChange={(e) => setBuyerSearch(e.target.value)}
+                placeholder="Search company, trade name, GSTIN..."
+                className="input-enterprise pl-9 text-xs w-full" />
+            </div>
+            <button type="button" onClick={() => openBuyerPrintModal()}
+              className="btn-secondary flex items-center justify-center gap-1.5 text-xs font-bold border-violet-200 text-violet-800 hover:bg-violet-50 shrink-0">
+              <Printer className="w-3.5 h-3.5" /> Print Business Details
+            </button>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {filteredBuyersList.length === 0 ? (
@@ -2442,7 +2881,7 @@ export default function SalesB2BPage() {
                     <p className="text-[10px] text-slate-500 mt-1">{b.business_type}</p>
                   </div>
                   <div className="flex gap-1 shrink-0">
-                    <button type="button" onClick={() => handlePrintBuyerProfile(b)} title="Print business profile"
+                    <button type="button" onClick={() => openBuyerPrintModal(b.id)} title="Print business profile"
                       className="p-1.5 rounded hover:bg-slate-100 text-slate-600"><Printer className="w-3.5 h-3.5" /></button>
                     <button type="button" onClick={() => handleDownloadBuyerProfile(b)} title="Download business profile"
                       className="p-1.5 rounded hover:bg-slate-100 text-slate-600"><Download className="w-3.5 h-3.5" /></button>
@@ -2877,6 +3316,186 @@ export default function SalesB2BPage() {
                   <Download className="w-3.5 h-3.5" /> Download PDF
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Print Business Details Modal */}
+      {isBuyerPrintModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px]">
+          <div className="absolute inset-0" onClick={() => setIsBuyerPrintModalOpen(false)} />
+          <div className="bg-white border border-slate-200 rounded-xl shadow-2xl relative max-w-lg w-full z-10 flex flex-col font-sans max-h-[92vh]">
+            <div className="bg-violet-800 px-5 py-4 text-white rounded-t-xl flex items-center justify-between shrink-0">
+              <div>
+                <h2 className="text-sm font-bold tracking-tight flex items-center gap-2">
+                  <Printer className="w-4 h-4" />
+                  Print Business Details
+                </h2>
+                <p className="text-[10px] text-violet-200 mt-0.5">Individual, group, or filtered directory</p>
+              </div>
+              <button type="button" onClick={() => setIsBuyerPrintModalOpen(false)}
+                className="text-violet-200 hover:text-white p-1.5 rounded-lg hover:bg-white/10">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 overflow-y-auto flex-1">
+              {buyerPrintError && (
+                <div className="bg-red-50 border border-red-200 text-red-800 text-xs px-3 py-2 rounded-md flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>{buyerPrintError}</span>
+                </div>
+              )}
+
+              <div>
+                <label className="form-label text-xs font-semibold text-slate-700 mb-2 block">Print Scope</label>
+                <div className="space-y-2">
+                  {([
+                    ["individual", "Individual Business", "One registered business with full GST details"],
+                    ["group", "Group", "All, all active, or hand-picked businesses"],
+                    ["conditions", "By Conditions", "Filter by type, state, status, bills, and search"],
+                  ] as const).map(([mode, title, desc]) => (
+                    <label key={mode}
+                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                        buyerPrintMode === mode ? "border-violet-600 bg-violet-50" : "border-slate-200 hover:bg-slate-50"
+                      }`}>
+                      <input type="radio" name="buyerPrintMode" value={mode} checked={buyerPrintMode === mode}
+                        onChange={() => { setBuyerPrintMode(mode); setBuyerPrintError(null); }}
+                        className="mt-0.5" />
+                      <span>
+                        <span className="text-xs font-bold text-slate-800 block">{title}</span>
+                        <span className="text-[10px] text-slate-500">{desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {buyerPrintMode === "individual" && (
+                <div>
+                  <label className="form-label text-xs">Select Business</label>
+                  <select value={buyerPrintIndividualId}
+                    onChange={(e) => { setBuyerPrintIndividualId(e.target.value); setBuyerPrintError(null); }}
+                    className="input-enterprise bg-white cursor-pointer text-xs w-full">
+                    <option value="">Choose business...</option>
+                    {buyers.map((b) => (
+                      <option key={b.id} value={b.id}>
+                        {buyerDisplayName(b)} — {b.gstin}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {buyerPrintMode === "group" && (
+                <div className="space-y-3">
+                  <div>
+                    <label className="form-label text-xs font-semibold text-slate-700 mb-2 block">Group Type</label>
+                    <div className="space-y-2">
+                      {([
+                        ["all", "All Registered", "Every business in the registry"],
+                        ["active", "All Active", "Only active businesses"],
+                        ["selected", "Selected Businesses", "Pick specific businesses below"],
+                      ] as const).map(([scope, title, desc]) => (
+                        <label key={scope}
+                          className={`flex items-start gap-3 p-2.5 rounded-lg border cursor-pointer ${
+                            buyerPrintGroupScope === scope ? "border-violet-600 bg-violet-50" : "border-slate-200"
+                          }`}>
+                          <input type="radio" name="buyerPrintGroup" value={scope}
+                            checked={buyerPrintGroupScope === scope}
+                            onChange={() => { setBuyerPrintGroupScope(scope); setBuyerPrintError(null); }}
+                            className="mt-0.5" />
+                          <span>
+                            <span className="text-xs font-bold text-slate-800 block">{title}</span>
+                            <span className="text-[10px] text-slate-500">{desc}</span>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  {buyerPrintGroupScope === "selected" && (
+                    <div className="border border-slate-200 rounded-lg max-h-44 overflow-y-auto p-2 space-y-1">
+                      {buyers.map((b) => (
+                        <label key={b.id} className="flex items-center gap-2 p-1.5 rounded hover:bg-slate-50 cursor-pointer text-xs">
+                          <input type="checkbox" checked={buyerPrintSelectedIds.includes(b.id)}
+                            onChange={() => toggleBuyerPrintSelection(b.id)} />
+                          <span className="truncate">{buyerDisplayName(b)}</span>
+                          <span className="text-[10px] font-mono text-slate-500 shrink-0">{b.gstin}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {buyerPrintMode === "conditions" && (
+                <div className="space-y-3">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="form-label text-xs">Business Type</label>
+                      <select value={buyerPrintBusinessType} onChange={(e) => setBuyerPrintBusinessType(e.target.value)}
+                        className="input-enterprise bg-white text-xs w-full">
+                        <option value="All">All Types</option>
+                        {BUSINESS_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="form-label text-xs">State</label>
+                      <select value={buyerPrintStateFilter} onChange={(e) => setBuyerPrintStateFilter(e.target.value)}
+                        className="input-enterprise bg-white text-xs w-full">
+                        <option value="All">All States</option>
+                        {INDIAN_STATES.map((s) => <option key={s.code} value={s.name}>{s.name}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="form-label text-xs">Active Status</label>
+                      <select value={buyerPrintActiveFilter}
+                        onChange={(e) => setBuyerPrintActiveFilter(e.target.value as "all" | "active" | "inactive")}
+                        className="input-enterprise bg-white text-xs w-full">
+                        <option value="all">All</option>
+                        <option value="active">Active only</option>
+                        <option value="inactive">Inactive only</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="form-label text-xs">B2B Bills</label>
+                      <select value={buyerPrintBillFilter}
+                        onChange={(e) => setBuyerPrintBillFilter(e.target.value as "all" | "with_bills" | "without_bills")}
+                        className="input-enterprise bg-white text-xs w-full">
+                        <option value="all">All businesses</option>
+                        <option value="with_bills">With B2B bills</option>
+                        <option value="without_bills">Without B2B bills</option>
+                      </select>
+                    </div>
+                  </div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input type="checkbox" checked={buyerPrintUseSearch}
+                      onChange={(e) => setBuyerPrintUseSearch(e.target.checked)} />
+                    <span>Apply current search from Registered Businesses tab{buyerSearch.trim() ? `: "${buyerSearch.trim()}"` : ""}</span>
+                  </label>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Single business prints a profile sheet. Multiple businesses print a summary table plus full GST-registered details for each entry.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-200 bg-slate-50 rounded-b-xl shrink-0">
+              <button type="button" onClick={() => setIsBuyerPrintModalOpen(false)} className="btn-secondary px-4 text-xs">
+                Cancel
+              </button>
+              <button type="button" onClick={handlePrintBuyersDirectory}
+                className="btn-secondary px-4 text-xs flex items-center gap-1.5">
+                <Printer className="w-3.5 h-3.5" /> Print
+              </button>
+              <button type="button" onClick={handleDownloadBuyersDirectory}
+                className="btn-primary px-4 text-xs flex items-center gap-1.5">
+                <Download className="w-3.5 h-3.5" /> Download PDF
+              </button>
             </div>
           </div>
         </div>
