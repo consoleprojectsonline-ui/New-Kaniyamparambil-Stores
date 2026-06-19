@@ -20,6 +20,9 @@ import {
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { isGstApplicable } from "@/lib/itemGst";
+import { HsnCodeInput } from "@/components/HsnCodeInput";
+import { useHsnRegistry } from "@/hooks/useHsnRegistry";
+import { hsnFormatError, normalizeHsnCode } from "@/lib/hsn";
 
 interface InventoryItem {
   code: string;
@@ -732,6 +735,7 @@ export default function InventoryPage() {
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [dbStatus, setDbStatus] = useState<"connected" | "local">("connected");
   const [editingItem, setEditingItem] = useState<InventoryItem | null>(null);
+  const hsnRegistry = useHsnRegistry();
 
   // Search & Filter state
   const [searchQuery, setSearchQuery] = useState("");
@@ -870,6 +874,10 @@ export default function InventoryPage() {
     return () => clearTimeout(timer);
   }, [fetchItems]);
 
+  useEffect(() => {
+    if (isFormOpen) void hsnRegistry.refresh();
+  }, [isFormOpen, hsnRegistry.refresh]);
+
   // Add Item
   // Add / Edit Item Submit Handler
   const handleSubmitForm = async (e: React.FormEvent) => {
@@ -899,6 +907,13 @@ export default function InventoryPage() {
       return;
     }
 
+    const hsnNormalized = normalizeHsnCode(hsnCode);
+    const hsnErr = hsnFormatError(hsnNormalized);
+    if (hsnErr) {
+      setFormError(hsnErr);
+      return;
+    }
+
     const newItem: InventoryItem = {
       code: code.trim(),
       name: name.trim(),
@@ -907,11 +922,15 @@ export default function InventoryPage() {
       sub_group: itemSubGroup,
       brand: brand.trim(),
       type: type,
-      hsn_code: hsnCode.trim(),
+      hsn_code: hsnNormalized,
       uom: itemUom,
       enable_batch: enableBatch,
       gst_applicable: gstApplicable,
     };
+
+    const registerItemHsn = () => hsnRegistry.upsertCodes([
+      { code: hsnNormalized, description: newItem.name },
+    ]);
 
     if (editingItem) {
       // UPDATE MODE
@@ -922,7 +941,8 @@ export default function InventoryPage() {
             .update(newItem)
             .eq("code", editingItem.code);
           if (error) throw error;
-          
+
+          await registerItemHsn();
           setConfirmedItem({ name: newItem.name, code: newItem.code });
           setIsConfirmOpen(true);
           fetchItems();
@@ -937,6 +957,7 @@ export default function InventoryPage() {
         const updated = items.map((i) => (i.code === editingItem.code ? newItem : i));
         localStorage.setItem("kaniyamparambil_inventory", JSON.stringify(updated));
         setItems(updated);
+        await registerItemHsn();
         setConfirmedItem({ name: newItem.name, code: newItem.code });
         setIsConfirmOpen(true);
         resetForm();
@@ -952,7 +973,8 @@ export default function InventoryPage() {
         try {
           const { error } = await supabase.from("inventory").insert([newItem]);
           if (error) throw error;
-          
+
+          await registerItemHsn();
           setConfirmedItem({ name: newItem.name, code: newItem.code });
           setIsConfirmOpen(true);
           fetchItems();
@@ -966,6 +988,7 @@ export default function InventoryPage() {
         const updated = [newItem, ...items];
         localStorage.setItem("kaniyamparambil_inventory", JSON.stringify(updated));
         setItems(updated);
+        await registerItemHsn();
         setConfirmedItem({ name: newItem.name, code: newItem.code });
         setIsConfirmOpen(true);
         resetForm();
@@ -1491,13 +1514,18 @@ export default function InventoryPage() {
                     </div>
                     <div>
                       <label className="form-label text-xs text-slate-700 font-semibold mb-1 block">HSN Code</label>
-                      <input
-                        type="text"
+                      <HsnCodeInput
                         value={hsnCode}
-                        onChange={(e) => setHsnCode(e.target.value.replace(/\D/g, ""))}
-                        placeholder="e.g. 8544"
-                        className="input-enterprise font-mono border-slate-300 focus:ring-2 focus:ring-blue-500/10 focus:border-blue-500 text-xs"
+                        onChange={setHsnCode}
+                        registry={hsnRegistry.records}
+                        registryLoaded={hsnRegistry.loaded && hsnRegistry.tableAvailable}
+                        allowCreate
+                        placeholder="Search or add HSN…"
+                        className="w-full"
                       />
+                      <p className="text-[10px] text-slate-400 mt-1">
+                        Pick from the master list, or type a new 4–8 digit code — new codes are saved to Supabase when you register the item.
+                      </p>
                     </div>
                   </div>
 

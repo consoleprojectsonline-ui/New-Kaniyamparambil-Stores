@@ -1785,6 +1785,7 @@ export default function SalesB2BPage() {
   const [editingBill, setEditingBill] = useState<B2BSaleRecord | null>(null);
   const [viewingBill, setViewingBill] = useState<B2BSaleRecord | null>(null);
   const [buyerToDelete, setBuyerToDelete] = useState<B2BBuyer | null>(null);
+  const [sampleGstinBuyer, setSampleGstinBuyer] = useState<B2BBuyer | null>(null);
 
   const [isStatementModalOpen, setIsStatementModalOpen] = useState(false);
   const [statementBuyerId, setStatementBuyerId] = useState("");
@@ -2269,9 +2270,32 @@ export default function SalesB2BPage() {
       openAddBuyer();
       return;
     }
+    if (preselectBuyer && isSampleGstin(preselectBuyer.gstin)) {
+      setSampleGstinBuyer(preselectBuyer);
+      return;
+    }
     resetBillForm();
     if (preselectBuyer) applyBuyerToBill(preselectBuyer);
     setIsBillFormOpen(true);
+  };
+
+  const handleBillBuyerSelect = (b: B2BBuyer) => {
+    if (isSampleGstin(b.gstin)) {
+      setSampleGstinBuyer(b);
+      setSelectedBuyerId("");
+      setShipTo("");
+      return;
+    }
+    applyBuyerToBill(b);
+  };
+
+  const openEditBuyerFromSampleGstinWarning = () => {
+    const buyer = sampleGstinBuyer;
+    if (!buyer) return;
+    setSampleGstinBuyer(null);
+    resetBillForm();
+    setActiveTab("buyers");
+    openEditBuyer(buyer);
   };
 
   const applyBuyerToBill = (b: B2BBuyer) => {
@@ -2354,6 +2378,10 @@ export default function SalesB2BPage() {
     e.preventDefault();
     setFormError(null);
     if (!selectedBuyer) { setFormError("Select a GST-registered buyer."); return; }
+    if (isSampleGstin(selectedBuyer.gstin)) {
+      setSampleGstinBuyer(selectedBuyer);
+      return;
+    }
     if (gridItems.some((i) => !i.name.trim() || i.qty <= 0 || i.mrp <= 0)) {
       setFormError("All items need name, quantity, and unit price.");
       return;
@@ -3173,7 +3201,7 @@ export default function SalesB2BPage() {
               <div className="bg-violet-50 border border-violet-100 rounded-xl p-4 space-y-3">
                 <h3 className="text-xs font-bold uppercase text-violet-800">Buyer (GST Registered) *</h3>
                 <SearchableBuyerSelect buyers={buyersForBillForm} value={selectedBuyerId}
-                  onChange={applyBuyerToBill} />
+                  onChange={handleBillBuyerSelect} />
                 {selectedBuyer && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px] bg-white rounded-lg border border-violet-100 p-3">
                     <div><span className="text-slate-500">Legal Name:</span> <span className="font-semibold">{selectedBuyer.legal_name}</span></div>
@@ -3833,6 +3861,53 @@ export default function SalesB2BPage() {
               <button type="button" onClick={handleDownloadB2BStatement}
                 className="btn-primary px-4 text-xs flex items-center gap-1.5">
                 <Download className="w-3.5 h-3.5" /> Download PDF
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sample / placeholder GSTIN — cannot generate tax invoice */}
+      {sampleGstinBuyer && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div
+            className="bg-white rounded-xl shadow-2xl max-w-md w-full border border-border overflow-hidden"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="sample-gstin-title"
+          >
+            <div className="px-6 py-4 border-b border-border flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5 text-amber-600" />
+              </div>
+              <div className="min-w-0">
+                <h2 id="sample-gstin-title" className="text-sm font-bold text-slate-900">
+                  GSTIN is not valid for billing
+                </h2>
+                <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                  <span className="font-semibold text-slate-900">&quot;{buyerDisplayName(sampleGstinBuyer)}&quot;</span>{" "}
+                  is registered with a sample placeholder GSTIN. Update the correct 15-character GST number before
+                  generating a B2B tax invoice.
+                </p>
+                <p className="text-[10px] font-mono text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-2">
+                  {sampleGstinBuyer.gstin}
+                </p>
+              </div>
+            </div>
+            <div className="px-6 py-4 flex justify-end gap-2 bg-slate-50">
+              <button
+                type="button"
+                onClick={() => setSampleGstinBuyer(null)}
+                className="btn-secondary text-xs"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                onClick={openEditBuyerFromSampleGstinWarning}
+                className="text-xs font-bold px-4 py-2 rounded-md bg-primary text-white hover:bg-primary/90 transition-colors"
+              >
+                Update GSTIN
               </button>
             </div>
           </div>

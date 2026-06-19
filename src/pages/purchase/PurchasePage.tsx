@@ -21,6 +21,9 @@ import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatTableDate } from "@/lib/utils";
+import { HsnCodeInput } from "@/components/HsnCodeInput";
+import { useHsnRegistry } from "@/hooks/useHsnRegistry";
+import { normalizeHsnCode } from "@/lib/hsn";
 import {
   buildPurchaseGstMaps,
   isGstApplicable,
@@ -1358,6 +1361,7 @@ function SearchableProductSelect({
 }
 
 export default function PurchasePage() {
+  const hsnRegistry = useHsnRegistry();
   const [purchases, setPurchases] = useState<PurchaseRecord[]>([]);
   const [inventoryItems, setInventoryItems] = useState<InventoryItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1563,6 +1567,10 @@ export default function PurchasePage() {
     if (viewingPurchase) fetchInventory();
   }, [viewingPurchase, fetchInventory]);
 
+  useEffect(() => {
+    if (isFormOpen) void hsnRegistry.refresh();
+  }, [isFormOpen, hsnRegistry.refresh]);
+
   // Back-fill HSN from inventory catalog (or prior purchase bills) when the form opens
   useEffect(() => {
     if (!isFormOpen) return;
@@ -1713,6 +1721,15 @@ export default function PurchasePage() {
       return;
     }
 
+    for (let i = 0; i < gridItems.length; i += 1) {
+      const item = gridItems[i];
+      const hsnErr = hsnRegistry.validate(item.hsn_code ?? "");
+      if (hsnErr) {
+        setFormError(`Row ${i + 1} (${item.name || item.code}): ${hsnErr}`);
+        return;
+      }
+    }
+
     const expensesNum = Number(expenses) || 0;
     let paidNum = Number(paidAmount) || 0;
     let status: PaymentStatus = paymentStatus;
@@ -1729,6 +1746,13 @@ export default function PurchasePage() {
     status = paidNum >= calculatedTotals.netAmount ? "Paid" : paidNum > 0 ? "Partial" : "Pending";
 
     const itemsFinal = gridItems.map((item) => ({ ...item, ...computePurchaseLineAutos(item) }));
+
+    const registerLineHsn = () => hsnRegistry.upsertCodes(
+      itemsFinal.map((item) => ({
+        code: normalizeHsnCode(item.hsn_code ?? ""),
+        description: item.name || item.code,
+      })),
+    );
 
     const payload: PurchaseRecord = {
       invoice_no: invoiceNumClean,
@@ -1799,6 +1823,7 @@ export default function PurchasePage() {
           }
 
           setSuccessMsg(`Successfully updated Invoice No. "${payload.invoice_no}"!`);
+          await registerLineHsn();
           fetchPurchases();
           fetchInventory();
           resetForm();
@@ -1841,6 +1866,7 @@ export default function PurchasePage() {
 
         setPurchases(updated);
         setSuccessMsg(`Updated Invoice No. "${payload.invoice_no}" in Local Storage!`);
+        await registerLineHsn();
         fetchInventory();
         resetForm();
       }
@@ -1872,6 +1898,7 @@ export default function PurchasePage() {
           }
 
           setSuccessMsg(`Successfully registered Invoice No. "${payload.invoice_no}"!`);
+          await registerLineHsn();
           fetchPurchases();
           fetchInventory();
           resetForm();
@@ -1904,6 +1931,7 @@ export default function PurchasePage() {
 
         setPurchases(updated);
         setSuccessMsg(`Saved Invoice No. "${payload.invoice_no}" to Local Storage!`);
+        await registerLineHsn();
         fetchInventory();
         resetForm();
       }
@@ -2516,12 +2544,13 @@ export default function PurchasePage() {
 
                           {/* HSN Code */}
                           <td className="p-2 text-center">
-                            <input
-                              type="text"
+                            <HsnCodeInput
                               value={item.hsn_code ?? ""}
-                              onChange={(e) => updateGridRow(idx, "hsn_code", e.target.value)}
-                              className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono"
-                              placeholder="HSN"
+                              onChange={(v) => updateGridRow(idx, "hsn_code", v)}
+                              registry={hsnRegistry.records}
+                              registryLoaded={hsnRegistry.loaded && hsnRegistry.tableAvailable}
+                              compact
+                              placeholder="Select HSN…"
                             />
                           </td>
 
