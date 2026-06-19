@@ -3534,13 +3534,13 @@ export default function SalesPage() {
                   {/* Right: live summary panel */}
                   <div className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-4 space-y-2 text-xs">
                     <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-400 pb-1 border-b border-slate-100">Bill Summary</h4>
-                    <div className="flex justify-between text-slate-600 font-semibold border-b border-slate-100 pb-1.5">
-                      <span>Items Total (qty × unit price − line disc + GST):</span>
-                      <span className="font-mono">{formatCurrency(calc.linesTotal)}</span>
-                    </div>
-                    <div className="flex justify-between text-slate-500 text-[10px]">
-                      <span>Taxable subtotal:</span>
+                    <div className="flex justify-between font-semibold text-slate-800 border-b border-slate-100 pb-1.5">
+                      <span>Amount Before Tax:</span>
                       <span className="font-mono">{formatCurrency(calc.subtotal)}</span>
+                    </div>
+                    <div className="flex justify-between text-slate-600 font-semibold">
+                      <span>Items Total (incl. GST):</span>
+                      <span className="font-mono">{formatCurrency(calc.linesTotal)}</span>
                     </div>
                     <div className="flex justify-between text-slate-500">
                       <span>F.Cess (+):</span>

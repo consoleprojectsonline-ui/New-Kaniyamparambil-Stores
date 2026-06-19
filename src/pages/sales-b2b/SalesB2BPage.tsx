@@ -6,7 +6,7 @@ import {
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
-import { formatCurrency, formatTableDate, numberToWordsIndian, reverseChargeLabel, validateGstin } from "@/lib/utils";
+import { formatCurrency, formatTableDate, numberToWordsIndian, isSampleGstin, reverseChargeLabel, validateGstin } from "@/lib/utils";
 import {
   buildPurchaseGstMaps,
   inventoryLookupKey,
@@ -1584,6 +1584,15 @@ function buyerDisplayName(b: B2BBuyer): string {
   return b.trade_name?.trim() || b.legal_name;
 }
 
+function SampleGstinBadge({ gstin }: { gstin: string }) {
+  if (!isSampleGstin(gstin)) return null;
+  return (
+    <span className="inline-flex items-center text-[9px] font-bold uppercase text-sky-700 bg-sky-50 border border-sky-200 px-1.5 py-0.5 rounded">
+      Sample GSTIN
+    </span>
+  );
+}
+
 function seedBuyers(): B2BBuyer[] {
   return [
     {
@@ -1687,7 +1696,10 @@ function SearchableBuyerSelect({
                   <li key={b.id} onClick={() => { onChange(b); setIsOpen(false); setSearch(""); }}
                     className={`px-3 py-2 text-xs cursor-pointer hover:bg-violet-50 border-b border-slate-50 last:border-0 ${b.id === value ? "bg-violet-100/60 font-semibold" : ""}`}>
                     <div className="font-semibold text-slate-800">{buyerDisplayName(b)}</div>
-                    <div className="text-[10px] text-slate-500 font-mono mt-0.5">{b.gstin}</div>
+                    <div className="text-[10px] text-slate-500 font-mono mt-0.5 flex items-center gap-1.5 flex-wrap">
+                      <span>{b.gstin}</span>
+                      <SampleGstinBadge gstin={b.gstin} />
+                    </div>
                   </li>
                 ))}
             </ul>
@@ -2155,7 +2167,7 @@ export default function SalesB2BPage() {
     setFormError(null);
     const gst = gstin.trim().toUpperCase();
     if (!legalName.trim()) { setFormError("Legal / registered company name is required."); return; }
-    if (!validateGstin(gst)) { setFormError("Enter a valid 15-character GSTIN."); return; }
+    if (!validateGstin(gst)) { setFormError("Enter a valid GSTIN (or sample format e.g. 32TESTMR0018A1Z8)."); return; }
     if (!billingAddress.trim()) { setFormError("Billing address is required."); return; }
 
     const duplicate = buyers.find(
@@ -3013,7 +3025,10 @@ export default function SalesB2BPage() {
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <h3 className="font-semibold text-slate-900 truncate">{buyerDisplayName(b)}</h3>
-                    <p className="text-[10px] font-mono text-violet-700 mt-0.5">{b.gstin}</p>
+                    <p className="text-[10px] font-mono text-violet-700 mt-0.5 flex items-center gap-1.5 flex-wrap">
+                      <span>{b.gstin}</span>
+                      <SampleGstinBadge gstin={b.gstin} />
+                    </p>
                     <p className="text-[10px] text-slate-500 mt-1">{b.business_type}</p>
                   </div>
                   <div className="flex gap-1 shrink-0">
@@ -3069,8 +3084,9 @@ export default function SalesB2BPage() {
                 </div>
                 <div>
                   <label className="form-label text-xs">GSTIN *</label>
-                  <input value={gstin} onChange={(e) => setGstin(e.target.value.toUpperCase())} maxLength={15}
-                    className="input-enterprise text-xs font-mono uppercase" required placeholder="22AAAAA0000A1Z5" />
+                  <input value={gstin} onChange={(e) => setGstin(e.target.value.toUpperCase())} maxLength={16}
+                    placeholder="e.g. 32AABCR1234F1Z5 or 32TESTMR0018A1Z8"
+                    className="input-enterprise text-xs font-mono uppercase" required />
                 </div>
                 <div>
                   <label className="form-label text-xs">PAN</label>
@@ -3161,7 +3177,10 @@ export default function SalesB2BPage() {
                 {selectedBuyer && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px] bg-white rounded-lg border border-violet-100 p-3">
                     <div><span className="text-slate-500">Legal Name:</span> <span className="font-semibold">{selectedBuyer.legal_name}</span></div>
-                    <div><span className="text-slate-500">GSTIN:</span> <span className="font-mono font-semibold">{selectedBuyer.gstin}</span></div>
+                    <div><span className="text-slate-500">GSTIN:</span>{" "}
+                      <span className="font-mono font-semibold">{selectedBuyer.gstin}</span>
+                      <SampleGstinBadge gstin={selectedBuyer.gstin} />
+                    </div>
                     <div className="md:col-span-2"><span className="text-slate-500">Billing:</span> {selectedBuyer.billing_address}</div>
                     {selectedBuyer.pan && <div><span className="text-slate-500">PAN:</span> {selectedBuyer.pan}</div>}
                     <div><span className="text-slate-500">State:</span> {selectedBuyer.state} ({selectedBuyer.state_code})</div>
@@ -3341,7 +3360,11 @@ export default function SalesB2BPage() {
                   </div>
                 </div>
                 <div className="bg-slate-50 rounded-xl p-4 space-y-1 text-xs">
-                  <div className="flex justify-between"><span>Taxable Subtotal</span><span>{formatCurrency(calc.subtotal)}</span></div>
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 pb-1 border-b border-slate-200 mb-1">Bill Summary</div>
+                  <div className="flex justify-between font-semibold text-slate-800 border-b border-slate-200 pb-1.5">
+                    <span>Amount Before Tax</span>
+                    <span>{formatCurrency(calc.subtotal)}</span>
+                  </div>
                   {calc.interState ? (
                     <div className="flex justify-between"><span>IGST ({calc.igstRate.toFixed(1)}%)</span><span>{formatCurrency(calc.totalIgst)}</span></div>
                   ) : (
