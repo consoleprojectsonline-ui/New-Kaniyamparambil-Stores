@@ -35,6 +35,7 @@ export interface SaleItem {
   discount_amount?: number;
   sgst_amount?: number;
   cgst_amount?: number;
+  gst_exempt?: boolean;
   line_total: number;   // (qty×mrp − disc) + SGST amount + CGST amount (auto)
 }
 
@@ -1473,6 +1474,10 @@ function normalizeSaleItem(raw: Record<string, unknown>): SaleItem {
     mrp: toDbNumber(raw.mrp),
     sgst,
     cgst,
+    gst_exempt:
+      raw.gst_exempt === true
+      || raw.gst_exempt === "true"
+      || (hasSplitGst && sgst === 0 && cgst === 0),
     line_total: toDbNumber(raw.line_total),
   };
   const summary = getSaleItemSummary(item);
@@ -2059,12 +2064,51 @@ export default function SalesPage() {
   const updateGridRow = (i: number, key: keyof SaleItem, val: string | number) => {
     setGridItems((prev) => prev.map((item, idx) => {
       if (idx !== i) return item;
+      if (item.gst_exempt && (key === "sgst" || key === "cgst")) return item;
       const updated = { ...item, [key]: val };
       if (["qty", "mrp", "disc_pct", "sgst", "cgst"].includes(key)) {
         Object.assign(updated, computeLineAutos(updated));
       }
       return updated;
     }));
+  };
+
+  const restoreRowGstRates = useCallback((item: SaleItem): SaleItem => {
+    const code = normalizeItemCode(item.code);
+    const inv = inventory.find((p) => normalizeItemCode(p.code) === code);
+    const gst = resolveLineGstRates({
+      inventoryItem: inv,
+      purchaseByCode: purchaseGstMaps.byCode.get(code.toUpperCase()),
+      purchaseByName: purchaseGstMaps.byName.get(normalizeProductName(item.name)),
+      rateTpOverride: gstRatesFromRateTp(rateTp),
+    });
+    const updated: SaleItem = {
+      ...item,
+      gst_exempt: false,
+      sgst: gst.sgst,
+      cgst: gst.cgst,
+    };
+    return { ...updated, ...computeLineAutos(updated) };
+  }, [inventory, purchaseGstMaps, rateTp]);
+
+  const applyRowGstExempt = useCallback((item: SaleItem): SaleItem => {
+    const updated: SaleItem = { ...item, gst_exempt: true, sgst: 0, cgst: 0 };
+    return { ...updated, ...computeLineAutos(updated) };
+  }, []);
+
+  const toggleRowGstExempt = (idx: number) => {
+    setGridItems((prev) => prev.map((item, i) => {
+      if (i !== idx) return item;
+      return item.gst_exempt ? restoreRowGstRates(item) : applyRowGstExempt(item);
+    }));
+  };
+
+  const allRowsGstExempt = gridItems.length > 0 && gridItems.every((item) => item.gst_exempt);
+
+  const toggleAllRowsGstExempt = () => {
+    setGridItems((prev) => prev.map((item) => (
+      allRowsGstExempt ? restoreRowGstRates(item) : applyRowGstExempt(item)
+    )));
   };
 
   const handleProductSelect = (i: number, prod: InventoryItem) => {
@@ -2082,6 +2126,7 @@ export default function SalesPage() {
       purchaseByName: purchaseGstMaps.byName.get(nameKey),
       rateTpOverride: gstRatesFromRateTp(rateTp),
     });
+    const gstExempt = gst.sgst === 0 && gst.cgst === 0;
 
     setGridItems((prev) => prev.map((item, idx) => {
       if (idx !== i) return item;
@@ -2095,6 +2140,7 @@ export default function SalesPage() {
         mrp: sellingUnitPrice,
         sgst: gst.sgst,
         cgst: gst.cgst,
+        gst_exempt: gstExempt,
       };
       return { ...updated, ...computeLineAutos(updated) };
     }));
@@ -2107,6 +2153,7 @@ export default function SalesPage() {
       let changed = false;
       const next = prev.map((item) => {
         if (!item.code || item.mrp > 0) return item;
+        if (item.gst_exempt) return item;
         const code = normalizeItemCode(item.code);
         const sellingUnitPrice = resolveSellingUnitPrice(
           purchaseItemMap.get(code),
@@ -2128,6 +2175,7 @@ export default function SalesPage() {
           mrp: sellingUnitPrice,
           sgst: gst.sgst,
           cgst: gst.cgst,
+          gst_exempt: gst.sgst === 0 && gst.cgst === 0,
           hsn_code: purchaseData?.hsn_code || item.hsn_code,
           unit: purchaseData?.unit || item.unit,
         };
@@ -2142,9 +2190,10 @@ export default function SalesPage() {
     const rates = gstRatesFromRateTp(nextRateTp);
     if (!rates) return;
     setGridItems((prev) => prev.map((item) => {
+      if (item.gst_exempt) return item;
       const inv = inventory.find((p) => normalizeItemCode(p.code) === normalizeItemCode(item.code));
       if (inv && !isGstApplicable(inv)) {
-        const exempt = { ...item, sgst: 0, cgst: 0 };
+        const exempt = { ...item, gst_exempt: true, sgst: 0, cgst: 0 };
         return { ...exempt, ...computeLineAutos(exempt) };
       }
       const updated = { ...item, sgst: rates.sgst, cgst: rates.cgst };
@@ -3282,11 +3331,27 @@ export default function SalesPage() {
               <div className="border border-slate-200 rounded-xl p-4 space-y-3">
                 <div className="flex items-center justify-between border-b border-slate-200 pb-2">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">2. Item Grid</h3>
-                  <button type="button" onClick={addGridRow}
-                    className="btn-secondary px-3 py-1 flex items-center gap-1.5 text-xs text-green-700 border-green-200 hover:bg-green-50 font-bold">
-                    <Plus className="w-3.5 h-3.5" /> Add Row
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={toggleAllRowsGstExempt}
+                      className={`px-3 py-1 flex items-center gap-1.5 text-xs font-bold rounded-lg border transition-colors ${
+                        allRowsGstExempt
+                          ? "text-amber-800 bg-amber-100 border-amber-300 hover:bg-amber-200"
+                          : "text-amber-700 bg-amber-50 border-amber-200 hover:bg-amber-100"
+                      }`}
+                    >
+                      {allRowsGstExempt ? "Restore GST on all lines" : "Exempt all lines from GST"}
+                    </button>
+                    <button type="button" onClick={addGridRow}
+                      className="btn-secondary px-3 py-1 flex items-center gap-1.5 text-xs text-green-700 border-green-200 hover:bg-green-50 font-bold">
+                      <Plus className="w-3.5 h-3.5" /> Add Row
+                    </button>
+                  </div>
                 </div>
+                <p className="text-[10px] text-slate-500">
+                  For individual GST-exempt items, use the <span className="font-semibold text-amber-700">Exempt</span> button on the row — SGST/CGST will be set to 0 and locked.
+                </p>
                 <div className="overflow-x-auto">
                   <table className="w-full text-[11px] border-collapse font-sans">
                     <thead>
@@ -3297,6 +3362,7 @@ export default function SalesPage() {
                         <th className="p-2 w-[80px] text-right">Unit Price (₹) *</th>
                         <th className="p-2 w-[85px] text-right">Amount (₹)</th>
                         <th className="p-2 w-[60px] text-center">Dis%</th>
+                        <th className="p-2 w-[72px] text-center">Exempt</th>
                         <th className="p-2 w-[55px] text-center">SGST%</th>
                         <th className="p-2 w-[55px] text-center">CGST%</th>
                         <th className="p-2 w-[80px] text-right">Line Total (₹)</th>
@@ -3348,17 +3414,44 @@ export default function SalesPage() {
                               onChange={(e) => updateGridRow(idx, "disc_pct", parseFloat(e.target.value) || 0)}
                               className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono" placeholder="0" />
                           </td>
+                          {/* GST Exempt toggle */}
+                          <td className="p-1.5 text-center">
+                            <button
+                              type="button"
+                              onClick={() => toggleRowGstExempt(idx)}
+                              title={item.gst_exempt ? "Restore GST on this line" : "Mark this line as exempt from GST"}
+                              className={`w-full px-1 py-1 rounded text-[10px] font-bold border transition-colors ${
+                                item.gst_exempt
+                                  ? "bg-amber-100 text-amber-800 border-amber-300 hover:bg-amber-200"
+                                  : "bg-white text-slate-600 border-slate-300 hover:bg-amber-50 hover:text-amber-700 hover:border-amber-200"
+                              }`}
+                            >
+                              {item.gst_exempt ? "Exempt ✓" : "Exempt"}
+                            </button>
+                          </td>
                           {/* SGST% */}
                           <td className="p-1.5">
-                            <input type="number" min="0" max="50" step="0.5" value={item.sgst ?? 9}
+                            <input type="number" min="0" max="50" step="0.5" value={item.gst_exempt ? 0 : (item.sgst ?? 9)}
                               onChange={(e) => updateGridRow(idx, "sgst", parseFloat(e.target.value) || 0)}
-                              className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono" placeholder="9" />
+                              disabled={item.gst_exempt}
+                              className={`w-full text-center border rounded p-1 text-xs font-mono ${
+                                item.gst_exempt
+                                  ? "border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed"
+                                  : "border-slate-300"
+                              }`}
+                              placeholder="9" />
                           </td>
                           {/* CGST% */}
                           <td className="p-1.5">
-                            <input type="number" min="0" max="50" step="0.5" value={item.cgst ?? 9}
+                            <input type="number" min="0" max="50" step="0.5" value={item.gst_exempt ? 0 : (item.cgst ?? 9)}
                               onChange={(e) => updateGridRow(idx, "cgst", parseFloat(e.target.value) || 0)}
-                              className="w-full text-center border border-slate-300 rounded p-1 text-xs font-mono" placeholder="9" />
+                              disabled={item.gst_exempt}
+                              className={`w-full text-center border rounded p-1 text-xs font-mono ${
+                                item.gst_exempt
+                                  ? "border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed"
+                                  : "border-slate-300"
+                              }`}
+                              placeholder="9" />
                           </td>
                           {/* Line total incl. GST — updates when unit price / qty / disc changes */}
                           <td className="p-1.5">
