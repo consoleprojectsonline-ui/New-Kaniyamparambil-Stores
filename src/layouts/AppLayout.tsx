@@ -28,6 +28,7 @@ import QuotationPage from "@/pages/quotation/QuotationPage";
 import SalesB2BPage from "@/pages/sales-b2b/SalesB2BPage";
 import SupportPage from "@/pages/support/SupportPage";
 import PaymentPage from "@/pages/payment/PaymentPage";
+import { UtilitiesLauncher } from "@/components/utilities/UtilitiesLauncher";
 
 export default function AppLayout() {
   const { user, logout, loading } = useAuthStore();
@@ -225,6 +226,8 @@ export default function AppLayout() {
           </Routes>
         </main>
       </div>
+
+      <UtilitiesLauncher />
     </div>
   );
 }
