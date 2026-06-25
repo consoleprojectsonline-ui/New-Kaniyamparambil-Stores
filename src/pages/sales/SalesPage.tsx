@@ -6,6 +6,8 @@ import {
 } from "lucide-react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
+import { WhatsAppIcon } from "@/components/WhatsAppIcon";
+import { WhatsAppShareModal, type WhatsAppShareConfig } from "@/components/WhatsAppShareModal";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatTableDate, numberToWordsIndian, reverseChargeLabel, validateGstin } from "@/lib/utils";
 import {
@@ -418,8 +420,13 @@ function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): 
         .items-table th,
         .items-table td {
           border: 1px solid #000;
-          padding: ${isPdfMode ? "2px 4px" : "6px 8px"};
+          padding: ${isPdfMode ? "4px 5px" : "6px 8px"};
           vertical-align: top;
+          overflow: visible;
+        }
+
+        .items-table tbody tr {
+          page-break-inside: avoid;
         }
 
         .items-table thead th {
@@ -434,17 +441,28 @@ function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): 
         .col-qty { width: 68px; }
         .col-taxable { width: 82px; }
 
+        .col-item {
+          min-width: 160px;
+          line-height: 1.35;
+          padding-bottom: ${isPdfMode ? "6px" : "8px"} !important;
+        }
+
         .col-item strong {
           display: block;
           font-weight: 700;
+          line-height: 1.3;
+          margin-bottom: ${isPdfMode ? "2px" : "3px"};
         }
 
         .item-meta {
           display: block;
-          margin-top: 1px;
+          margin-top: ${isPdfMode ? "2px" : "3px"};
+          padding-bottom: ${isPdfMode ? "2px" : "3px"};
           color: #444;
-          font-size: ${isPdfMode ? "7px" : "10px"};
-          line-height: 1.2;
+          font-size: ${isPdfMode ? "7.5px" : "10px"};
+          line-height: 1.35;
+          white-space: normal;
+          word-break: break-word;
         }
 
         .align-right { text-align: right; }
@@ -553,7 +571,7 @@ function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): 
         .invoice-fit-wrap {
           width: ${isPdfMode ? "794px" : "860px"};
           margin: 0 auto;
-          overflow: hidden;
+          overflow: visible;
         }
 
         @page { size: A4; margin: 8mm; }
@@ -798,7 +816,75 @@ function buildInvoiceHtml(rec: SaleRecord, options: InvoiceWindowOptions = {}): 
   </html>`;
 }
 
-async function waitForInvoiceFrame(html: string): Promise<HTMLIFrameElement> {
+const INVOICE_EXPORT_HOST_STYLE: Partial<CSSStyleDeclaration> = {
+  position: "fixed",
+  top: "0",
+  left: "-20000px",
+  width: "794px",
+  minHeight: "400px",
+  background: "#ffffff",
+  pointerEvents: "none",
+  zIndex: "-1",
+  overflow: "visible",
+};
+
+function mountInvoiceHtmlForPdfExport(html: string): {
+  host: HTMLDivElement;
+  invoiceRoot: HTMLElement;
+} {
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  if (parsed.querySelector("parsererror")) {
+    throw new Error("Unable to prepare the invoice layout for PDF export.");
+  }
+
+  const exportNode = parsed.querySelector(".invoice-sheet")
+    ?? parsed.querySelector(".invoice-fit-wrap");
+  if (!(exportNode instanceof HTMLElement)) {
+    throw new Error("Unable to prepare the invoice layout for PDF export.");
+  }
+
+  const host = document.createElement("div");
+  host.setAttribute("aria-hidden", "true");
+  Object.assign(host.style, INVOICE_EXPORT_HOST_STYLE);
+
+  parsed.head.querySelectorAll("style").forEach((style) => {
+    const copy = document.createElement("style");
+    copy.textContent = style.textContent;
+    host.appendChild(copy);
+  });
+
+  host.appendChild(document.importNode(exportNode, true));
+  document.body.appendChild(host);
+
+  const invoiceRoot = host.querySelector(".invoice-sheet")
+    ?? host.querySelector(".invoice-fit-wrap");
+  if (!(invoiceRoot instanceof HTMLElement)) {
+    host.remove();
+    throw new Error("Unable to prepare the invoice layout for PDF export.");
+  }
+
+  return { host, invoiceRoot };
+}
+
+async function waitForExportImages(root: HTMLElement): Promise<void> {
+  const images = Array.from(root.querySelectorAll("img"));
+  await Promise.all(
+    images.map(
+      (img) =>
+        new Promise<void>((resolve) => {
+          if (img.complete) {
+            resolve();
+            return;
+          }
+          img.addEventListener("load", () => resolve(), { once: true });
+          img.addEventListener("error", () => resolve(), { once: true });
+        }),
+    ),
+  );
+}
+
+/** Hidden iframe loader used only for browser print — unchanged from the original flow. */
+async function waitForInvoicePrintFrame(html: string): Promise<HTMLIFrameElement> {
   const iframe = document.createElement("iframe");
   Object.assign(iframe.style, INVOICE_FRAME_STYLE);
   iframe.setAttribute("aria-hidden", "true");
@@ -873,6 +959,57 @@ async function waitForInvoiceFrame(html: string): Promise<HTMLIFrameElement> {
 
   await new Promise((resolve) => window.setTimeout(resolve, 80));
   return iframe;
+}
+
+async function invoiceRecordToPdfBlob(
+  rec: SaleRecord,
+  helperText: string,
+): Promise<{ blob: Blob; filename: string }> {
+  let host: HTMLDivElement | null = null;
+  try {
+    const { host: exportHost, invoiceRoot } = mountInvoiceHtmlForPdfExport(
+      buildInvoiceHtml(rec, { helperText, renderMode: "pdf" }),
+    );
+    host = exportHost;
+
+    await waitForExportImages(invoiceRoot);
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+
+    const canvas = await html2canvas(invoiceRoot, {
+      scale: 2,
+      useCORS: true,
+      backgroundColor: "#ffffff",
+      logging: false,
+    });
+
+    const pdf = new jsPDF({
+      orientation: "portrait",
+      unit: "pt",
+      format: "a4",
+    });
+
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const margin = 12;
+    const maxWidth = pageWidth - margin * 2;
+    const maxHeight = pageHeight - margin * 2;
+    const scale = Math.min(maxWidth / canvas.width, maxHeight / canvas.height);
+
+    pdf.addImage(
+      canvas.toDataURL("image/png"),
+      "PNG",
+      margin,
+      margin,
+      canvas.width * scale,
+      canvas.height * scale,
+      undefined,
+      "FAST",
+    );
+
+    return { blob: pdf.output("blob"), filename: `tax_invoice_${rec.bill_no}.pdf` };
+  } finally {
+    host?.remove();
+  }
 }
 
 // ─── Sales Statement (account-style register) ────────────────────────────────
@@ -1849,6 +1986,7 @@ export default function SalesPage() {
   });
   const [editingSale, setEditingSale] = useState<SaleRecord | null>(null);
   const [viewingSale, setViewingSale] = useState<SaleRecord | null>(null);
+  const [whatsappShare, setWhatsappShare] = useState<WhatsAppShareConfig | null>(null);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
   const [reportMode, setReportMode] = useState<SalesReportMode>("full");
   const [reportDate, setReportDate] = useState(todayIso);
@@ -2488,7 +2626,7 @@ export default function SalesPage() {
   const handlePrintInvoice = async (rec: SaleRecord) => {
     let iframe: HTMLIFrameElement | null = null;
     try {
-      iframe = await waitForInvoiceFrame(buildInvoiceHtml(rec, {
+      iframe = await waitForInvoicePrintFrame(buildInvoiceHtml(rec, {
         helperText: "Premium A4 invoice preview. Print directly or switch the destination to Save as PDF.",
         renderMode: "pdf",
       }));
@@ -2505,58 +2643,18 @@ export default function SalesPage() {
     }
   };
 
-  const handleDownloadInvoice = async (rec: SaleRecord) => {
-    let iframe: HTMLIFrameElement | null = null;
-    try {
-      iframe = await waitForInvoiceFrame(buildInvoiceHtml(rec, {
-        helperText: "Generating tax invoice PDF...",
-        renderMode: "pdf",
-      }));
+  const generateInvoicePdfBlob = (rec: SaleRecord) =>
+    invoiceRecordToPdfBlob(rec, "Generating tax invoice PDF...");
 
-      const invoiceRoot = iframe.contentDocument?.querySelector(".invoice-fit-wrap")
-        ?? iframe.contentDocument?.querySelector(".invoice-sheet");
-      if (!(invoiceRoot instanceof HTMLElement)) {
-        throw new Error("Unable to prepare the invoice layout for PDF export.");
-      }
-
-      const canvas = await html2canvas(invoiceRoot, {
-        scale: 2,
-        useCORS: true,
-        backgroundColor: "#ffffff",
-      });
-
-      const pdf = new jsPDF({
-        orientation: "portrait",
-        unit: "pt",
-        format: "a4",
-      });
-
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 12;
-      const maxWidth = pageWidth - margin * 2;
-      const maxHeight = pageHeight - margin * 2;
-      const scale = Math.min(maxWidth / canvas.width, maxHeight / canvas.height);
-      const renderWidth = canvas.width * scale;
-      const renderHeight = canvas.height * scale;
-
-      pdf.addImage(
-        canvas.toDataURL("image/png"),
-        "PNG",
-        margin,
-        margin,
-        renderWidth,
-        renderHeight,
-        undefined,
-        "FAST",
-      );
-
-      pdf.save(`tax_invoice_${rec.bill_no}.pdf`);
-    } catch (err) {
-      alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
-    } finally {
-      iframe?.remove();
-    }
+  const openWhatsAppShare = (rec: SaleRecord) => {
+    setWhatsappShare({
+      recipientLabel: "Customer",
+      recipientName: rec.customer_name,
+      initialPhone: rec.customer_phone,
+      documentTitle: `Tax Invoice ${rec.bill_no}`,
+      defaultMessage: `Dear ${rec.customer_name},\n\nPlease find your tax invoice ${rec.bill_no} dated ${formatTableDate(rec.bill_date)}.\nAmount: ${formatCurrency(rec.grand_total)}\n\n— NEW KANIYAMPARAMBIL STORES`,
+      generatePdf: () => generateInvoicePdfBlob(rec),
+    });
   };
 
   const listDateRangeInvalid = dateFilterMode === "range" && filterFrom > filterTo;
@@ -3110,13 +3208,20 @@ export default function SalesPage() {
                         { icon: Eye, title: "View", fn: () => setViewingSale(rec) },
                         { icon: Edit, title: "Edit", fn: () => handleStartEdit(rec) },
                         { icon: Printer, title: "Print", fn: () => handlePrintInvoice(rec) },
-                        { icon: Download, title: "Download", fn: () => handleDownloadInvoice(rec) },
                       ].map(({ icon: Icon, title, fn }) => (
                         <button key={title} type="button" onClick={fn} title={title}
                           className="text-slate-500 hover:text-slate-900 hover:bg-slate-100 p-1.5 rounded transition-all">
                           <Icon className="w-3.5 h-3.5" />
                         </button>
                       ))}
+                      <button
+                        type="button"
+                        onClick={() => openWhatsAppShare(rec)}
+                        title="Send via WhatsApp"
+                        className="text-green-600 hover:text-green-700 hover:bg-green-50 p-1.5 rounded transition-all"
+                      >
+                        <WhatsAppIcon />
+                      </button>
                       <button type="button" onClick={() => handleDelete(rec.bill_no)} title="Delete"
                         className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1.5 rounded transition-all">
                         <Trash2 className="w-3.5 h-3.5" />
@@ -3745,6 +3850,10 @@ export default function SalesPage() {
                 className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 rounded flex items-center gap-1.5">
                 <Printer className="w-3.5 h-3.5" /> Print Bill
               </button>
+              <button type="button" onClick={() => openWhatsAppShare(viewingSale)}
+                className="btn-secondary px-4 py-2 font-semibold text-xs border border-green-200 text-green-700 hover:bg-green-50 rounded flex items-center gap-1.5">
+                <WhatsAppIcon /> WhatsApp
+              </button>
               <button type="button" onClick={() => setViewingSale(null)}
                 className="btn-primary bg-slate-950 hover:bg-slate-800 px-6 py-2 font-bold text-white rounded text-xs">
                 Close
@@ -3754,6 +3863,7 @@ export default function SalesPage() {
         </div>
       )}
 
+      <WhatsAppShareModal config={whatsappShare} onClose={() => setWhatsappShare(null)} />
     </div>
   );
 }

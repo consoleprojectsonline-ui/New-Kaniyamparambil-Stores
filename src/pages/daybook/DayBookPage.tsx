@@ -21,6 +21,9 @@ import {
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatTableDate } from "@/lib/utils";
+import { WhatsAppIcon } from "@/components/WhatsAppIcon";
+import { WhatsAppShareModal, type WhatsAppShareConfig } from "@/components/WhatsAppShareModal";
+import { renderElementToPdfBlob } from "@/lib/htmlToPdfBlob";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 
@@ -730,6 +733,7 @@ export default function DayBookPage() {
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
   const [viewingTransaction, setViewingTransaction] = useState<DayBookRow | null>(null);
+  const [whatsappShare, setWhatsappShare] = useState<WhatsAppShareConfig | null>(null);
 
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
   const [reportMode, setReportMode] = useState<DayBookReportMode>("day");
@@ -1367,6 +1371,92 @@ export default function DayBookPage() {
     }
   };
 
+  const generateDayBookVoucherPdfBlob = async (rec: DayBookRow) => {
+    let iframe: HTMLIFrameElement | null = null;
+    try {
+      const html = buildDayBookHtml(buildDayBookStatementData([rec], {
+        periodLabel: formatDisplayDate(rec.date),
+        reportType: "Day Book Voucher",
+      }, computeDayTotals([rec])), {
+        renderMode: "pdf",
+        voucher: rec,
+      });
+      iframe = await waitForDayBookFrame(html);
+      const sheet = iframe.contentDocument?.querySelector(".daybook-sheet");
+      if (!(sheet instanceof HTMLElement)) {
+        throw new Error("Unable to prepare the day book layout for PDF export.");
+      }
+      const blob = await renderElementToPdfBlob(sheet, "multipage");
+      const ref = rec.reference_no || rec.id.slice(0, 12);
+      return { blob, filename: `daybook_voucher_${ref}.pdf` };
+    } finally {
+      iframe?.remove();
+    }
+  };
+
+  const resolveDayBookRecipient = useCallback(async (tx: DayBookRow): Promise<{
+    name: string;
+    phone?: string;
+    label: string;
+  }> => {
+    if (tx.category === "Sales" && tx.reference_no) {
+      const { data } = await supabase
+        .from("sales")
+        .select("customer_name, customer_phone")
+        .eq("bill_no", tx.reference_no)
+        .maybeSingle();
+
+      if (data) {
+        return {
+          name: String(data.customer_name ?? tx.description),
+          phone: data.customer_phone ? String(data.customer_phone) : undefined,
+          label: "Customer",
+        };
+      }
+
+      const local = localStorage.getItem("kaniyamparambil_sales_v2");
+      if (local) {
+        try {
+          const sales = JSON.parse(local) as Record<string, unknown>[];
+          const sale = sales.find((row) => String(row.bill_no) === tx.reference_no);
+          if (sale) {
+            return {
+              name: String(sale.customer_name ?? tx.description),
+              phone: sale.customer_phone ? String(sale.customer_phone) : undefined,
+              label: "Customer",
+            };
+          }
+        } catch {
+          // ignore malformed local cache
+        }
+      }
+    }
+
+    if (tx.category === "Purchase") {
+      const parts = tx.description.split(" · ");
+      const supplierName = parts[1]?.replace(" (Pending)", "").trim() || tx.description;
+      return { name: supplierName, label: "Supplier" };
+    }
+
+    return { name: tx.description, label: "Recipient" };
+  }, []);
+
+  const openDayBookWhatsApp = async (rec: DayBookRow) => {
+    try {
+      const recipient = await resolveDayBookRecipient(rec);
+      setWhatsappShare({
+        recipientLabel: recipient.label,
+        recipientName: recipient.name,
+        initialPhone: recipient.phone,
+        documentTitle: `Day Book Voucher ${rec.reference_no || rec.id}`,
+        defaultMessage: `Dear ${recipient.name},\n\nPlease find the day book voucher dated ${formatTableDate(rec.date)}.\n${rec.description}\nAmount: ${formatCurrency(rec.amount)}\n\n— NEW KANIYAMPARAMBIL STORES`,
+        generatePdf: () => generateDayBookVoucherPdfBlob(rec),
+      });
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Could not open WhatsApp share.");
+    }
+  };
+
   const handleDownloadTransaction = async (rec: DayBookRow) => {
     try {
       const ref = rec.reference_no || rec.id.slice(0, 12);
@@ -1639,6 +1729,14 @@ export default function DayBookPage() {
                         </button>
                         <button
                           type="button"
+                          onClick={() => void openDayBookWhatsApp(tx)}
+                          className="text-green-600 hover:text-green-700 hover:bg-green-50 p-1.5 rounded transition-all"
+                          title="Send via WhatsApp"
+                        >
+                          <WhatsAppIcon />
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => handleDeleteTransaction(tx)}
                           disabled={!tx.editable}
                           className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1.5 rounded transition-all disabled:opacity-30 disabled:cursor-not-allowed"
@@ -1903,6 +2001,13 @@ export default function DayBookPage() {
               </button>
               <button
                 type="button"
+                onClick={() => void openDayBookWhatsApp(viewingTransaction)}
+                className="btn-secondary px-4 py-2 font-semibold text-xs border border-green-200 text-green-700 hover:bg-green-50 transition-colors rounded flex items-center gap-1.5"
+              >
+                <WhatsAppIcon /> WhatsApp
+              </button>
+              <button
+                type="button"
                 onClick={() => handlePrintTransaction(viewingTransaction)}
                 className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
               >
@@ -2025,6 +2130,8 @@ export default function DayBookPage() {
           </div>
         </div>
       )}
+
+      <WhatsAppShareModal config={whatsappShare} onClose={() => setWhatsappShare(null)} />
     </div>
   );
 }

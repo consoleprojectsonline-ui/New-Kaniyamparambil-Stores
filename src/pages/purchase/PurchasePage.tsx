@@ -22,6 +22,9 @@ import { jsPDF } from "jspdf";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatTableDate } from "@/lib/utils";
 import { HsnCodeInput } from "@/components/HsnCodeInput";
+import { WhatsAppIcon } from "@/components/WhatsAppIcon";
+import { WhatsAppShareModal, type WhatsAppShareConfig } from "@/components/WhatsAppShareModal";
+import { renderElementToPdfBlob } from "@/lib/htmlToPdfBlob";
 import { useHsnRegistry } from "@/hooks/useHsnRegistry";
 import { normalizeHsnCode } from "@/lib/hsn";
 import {
@@ -1415,6 +1418,7 @@ export default function PurchasePage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [viewingPurchase, setViewingPurchase] = useState<PurchaseRecord | null>(null);
+  const [whatsappShare, setWhatsappShare] = useState<WhatsAppShareConfig | null>(null);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
   const [reportMode, setReportMode] = useState<PurchaseReportMode>("full");
   const [reportDate, setReportDate] = useState(todayIso());
@@ -1996,6 +2000,25 @@ export default function PurchasePage() {
     }
   };
 
+  const generatePurchasePdfBlob = async (rec: PurchaseRecord) => {
+    let iframe: HTMLIFrameElement | null = null;
+    try {
+      const enriched = enrichPurchaseRecordForDocs(rec);
+      iframe = await waitForPurchaseFrame(
+        buildPurchaseHtml(enriched, { renderMode: "pdf" }),
+        ".purchase-sheet",
+      );
+      const sheet = iframe.contentDocument?.querySelector(".purchase-sheet");
+      if (!(sheet instanceof HTMLElement)) {
+        throw new Error("Unable to prepare the purchase layout for PDF export.");
+      }
+      const blob = await renderElementToPdfBlob(sheet, "fit-single");
+      return { blob, filename: `purchase_bill_${rec.invoice_no}.pdf` };
+    } finally {
+      iframe?.remove();
+    }
+  };
+
   const handleDownloadPurchase = async (rec: PurchaseRecord) => {
     try {
       await exportPurchasePdf(
@@ -2005,6 +2028,18 @@ export default function PurchasePage() {
     } catch (err) {
       alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     }
+  };
+
+  const openWhatsAppShare = (rec: PurchaseRecord) => {
+    const enriched = enrichPurchaseRecordForDocs(rec);
+    setWhatsappShare({
+      recipientLabel: "Supplier",
+      recipientName: enriched.supplier_name,
+      initialPhone: undefined,
+      documentTitle: `Purchase Bill ${enriched.invoice_no}`,
+      defaultMessage: `Dear ${enriched.supplier_name},\n\nPlease find purchase bill ${enriched.invoice_no} dated ${formatTableDate(enriched.invoice_date)}.\nNet Amount: ${formatCurrency(enriched.net_amount)}\n\n— NEW KANIYAMPARAMBIL STORES`,
+      generatePdf: () => generatePurchasePdfBlob(rec),
+    });
   };
 
   const handleDeletePurchase = async (invoiceNoToDelete: string) => {
@@ -3000,6 +3035,14 @@ export default function PurchasePage() {
                         </button>
                         <button
                           type="button"
+                          onClick={() => openWhatsAppShare(rec)}
+                          className="text-green-600 hover:text-green-700 hover:bg-green-50 p-1.5 rounded transition-all"
+                          title="Send via WhatsApp"
+                        >
+                          <WhatsAppIcon />
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => handleDeletePurchase(rec.invoice_no)}
                           className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1.5 rounded transition-all"
                           title="Delete bill"
@@ -3262,6 +3305,13 @@ export default function PurchasePage() {
               </button>
               <button
                 type="button"
+                onClick={() => openWhatsAppShare(viewingPurchaseDisplay)}
+                className="btn-secondary px-4 py-2 font-semibold text-xs border border-green-200 text-green-700 hover:bg-green-50 transition-colors rounded flex items-center gap-1.5"
+              >
+                <WhatsAppIcon /> WhatsApp
+              </button>
+              <button
+                type="button"
                 onClick={() => handlePrintPurchase(viewingPurchaseDisplay)}
                 className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
               >
@@ -3385,6 +3435,8 @@ export default function PurchasePage() {
           </div>
         </div>
       )}
+
+      <WhatsAppShareModal config={whatsappShare} onClose={() => setWhatsappShare(null)} />
     </div>
   );
 }

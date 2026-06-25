@@ -5,6 +5,9 @@ import {
 } from "lucide-react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
+import { WhatsAppIcon } from "@/components/WhatsAppIcon";
+import { WhatsAppShareModal, type WhatsAppShareConfig } from "@/components/WhatsAppShareModal";
+import { renderElementToPdfBlob } from "@/lib/htmlToPdfBlob";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatTableDate, numberToWordsIndian, isSampleGstin, reverseChargeLabel, validateGstin } from "@/lib/utils";
 import {
@@ -1784,6 +1787,7 @@ export default function SalesB2BPage() {
   const [isBillFormOpen, setIsBillFormOpen] = useState(false);
   const [editingBill, setEditingBill] = useState<B2BSaleRecord | null>(null);
   const [viewingBill, setViewingBill] = useState<B2BSaleRecord | null>(null);
+  const [whatsappShare, setWhatsappShare] = useState<WhatsAppShareConfig | null>(null);
   const [buyerToDelete, setBuyerToDelete] = useState<B2BBuyer | null>(null);
   const [sampleGstinBuyer, setSampleGstinBuyer] = useState<B2BBuyer | null>(null);
 
@@ -2536,6 +2540,24 @@ export default function SalesB2BPage() {
     }
   };
 
+  const generateB2BBillPdfBlob = async (rec: B2BSaleRecord) => {
+    let iframe: HTMLIFrameElement | null = null;
+    try {
+      iframe = await waitForB2BFrame(
+        buildB2BInvoiceHtml(enrichB2BBill(rec), { renderMode: "pdf" }),
+        ".b2b-sheet",
+      );
+      const sheet = iframe.contentDocument?.querySelector(".b2b-sheet");
+      if (!(sheet instanceof HTMLElement)) {
+        throw new Error("Unable to prepare the B2B document layout for PDF export.");
+      }
+      const blob = await renderElementToPdfBlob(sheet, "fit-single");
+      return { blob, filename: `b2b_tax_invoice_${rec.bill_no}.pdf` };
+    } finally {
+      iframe?.remove();
+    }
+  };
+
   const handleDownloadBill = async (rec: B2BSaleRecord) => {
     try {
       await exportB2BPdf(
@@ -2545,6 +2567,19 @@ export default function SalesB2BPage() {
     } catch (err) {
       alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     }
+  };
+
+  const openWhatsAppShare = (rec: B2BSaleRecord) => {
+    const enriched = enrichB2BBill(rec);
+    const buyer = buyerFromBill(enriched);
+    setWhatsappShare({
+      recipientLabel: "Buyer",
+      recipientName: enriched.buyer_legal_name,
+      initialPhone: buyer.phone,
+      documentTitle: `B2B Tax Invoice ${enriched.bill_no}`,
+      defaultMessage: `Dear ${enriched.buyer_legal_name},\n\nPlease find your B2B tax invoice ${enriched.bill_no} dated ${formatTableDate(enriched.bill_date)}.\nAmount: ${formatCurrency(enriched.grand_total)}\n\n— NEW KANIYAMPARAMBIL STORES`,
+      generatePdf: () => generateB2BBillPdfBlob(enriched),
+    });
   };
 
   const openStatementModal = (prefillBuyerId?: string) => {
@@ -3011,6 +3046,14 @@ export default function SalesB2BPage() {
                             <Icon className="w-3.5 h-3.5" />
                           </button>
                         ))}
+                        <button
+                          type="button"
+                          onClick={() => openWhatsAppShare(b)}
+                          title="Send via WhatsApp"
+                          className="text-green-600 hover:text-green-700 hover:bg-green-50 p-1.5 rounded transition-all"
+                        >
+                          <WhatsAppIcon />
+                        </button>
                         <button type="button" onClick={() => handleDeleteBill(b.bill_no)} title="Delete"
                           className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1.5 rounded transition-all">
                           <Trash2 className="w-3.5 h-3.5" />
@@ -3526,8 +3569,12 @@ export default function SalesB2BPage() {
                   <Printer className="w-3.5 h-3.5" /> Print
                 </button>
                 <button type="button" onClick={() => handleDownloadBill(viewingBill)}
-                  className="btn-primary text-xs flex items-center gap-1.5">
+                  className="btn-secondary text-xs flex items-center gap-1.5">
                   <Download className="w-3.5 h-3.5" /> Download PDF
+                </button>
+                <button type="button" onClick={() => openWhatsAppShare(viewingBill)}
+                  className="btn-secondary text-xs flex items-center gap-1.5 border border-green-200 text-green-700 hover:bg-green-50">
+                  <WhatsAppIcon /> WhatsApp
                 </button>
               </div>
             </div>
@@ -3958,6 +4005,8 @@ export default function SalesB2BPage() {
           </div>
         </div>
       )}
+
+      <WhatsAppShareModal config={whatsappShare} onClose={() => setWhatsappShare(null)} />
     </div>
   );
 }

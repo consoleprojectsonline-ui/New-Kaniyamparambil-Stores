@@ -97,4 +97,4 @@ export function initRightClickProtection(): () => void {
 }
 
 // ── To DISABLE right-click: uncomment the next line  |  To allow right-click: keep it commented ──
-initRightClickProtection();
+// initRightClickProtection();
