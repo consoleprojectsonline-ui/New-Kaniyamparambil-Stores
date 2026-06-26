@@ -16,6 +16,8 @@ import {
   Edit,
   Truck,
   FileText,
+  Upload,
+  Loader2,
 } from "lucide-react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
@@ -25,6 +27,7 @@ import { HsnCodeInput } from "@/components/HsnCodeInput";
 import { WhatsAppIcon } from "@/components/WhatsAppIcon";
 import { WhatsAppShareModal, type WhatsAppShareConfig } from "@/components/WhatsAppShareModal";
 import { renderElementToPdfBlob } from "@/lib/htmlToPdfBlob";
+import { scanPurchaseBillPdf, type ScannedPurchaseDraft, type ScannedPurchaseItem } from "@/lib/purchaseBillScanner";
 import { useHsnRegistry } from "@/hooks/useHsnRegistry";
 import { normalizeHsnCode } from "@/lib/hsn";
 import {
@@ -1417,6 +1420,9 @@ export default function PurchasePage() {
 
   const [formError, setFormError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [billScanBusy, setBillScanBusy] = useState(false);
+  const [billScanMessage, setBillScanMessage] = useState<{ type: "success" | "error" | "info"; text: string } | null>(null);
+  const billPdfInputRef = useRef<HTMLInputElement>(null);
   const [viewingPurchase, setViewingPurchase] = useState<PurchaseRecord | null>(null);
   const [whatsappShare, setWhatsappShare] = useState<WhatsAppShareConfig | null>(null);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
@@ -1697,6 +1703,156 @@ export default function PurchasePage() {
     if (paidNum >= net) setPaymentStatus("Paid");
     else if (paidNum > 0) setPaymentStatus("Partial");
     else setPaymentStatus("Pending");
+  };
+
+  const matchInventoryForScannedItem = (scanned: ScannedPurchaseItem): InventoryItem | undefined => {
+    const codeKey = scanned.code?.trim().toUpperCase();
+    if (codeKey) {
+      const byCode = inventoryItems.find((item) => inventoryLookupKey(item.code) === codeKey);
+      if (byCode) return byCode;
+    }
+
+    const nameKey = scanned.name.trim().toUpperCase();
+    const exactName = inventoryItems.find((item) => String(item.name ?? "").trim().toUpperCase() === nameKey);
+    if (exactName) return exactName;
+
+    return inventoryItems.find((item) => {
+      const invName = String(item.name ?? "").trim().toUpperCase();
+      return invName.includes(nameKey) || nameKey.includes(invName);
+    });
+  };
+
+  const buildGridItemFromScan = (scanned: ScannedPurchaseItem): PurchaseItem => {
+    const matched = matchInventoryForScannedItem(scanned);
+    const code = matched?.code ?? scanned.code ?? "";
+    const name = matched?.name ?? scanned.name;
+    const hsn = resolveItemHsnCode(
+      code,
+      name,
+      scanned.hsn_code,
+      inventoryHsnMap,
+      purchaseHsnMap,
+      inventoryHsnByNameMap,
+      inventoryItems,
+    );
+    const codeKey = inventoryLookupKey(code);
+    const nameKey = normalizeProductName(name);
+    const gst = matched
+      ? resolveLineGstRates({
+          inventoryItem: matched,
+          purchaseByCode: purchaseGstMaps.byCode.get(codeKey),
+          purchaseByName: purchaseGstMaps.byName.get(nameKey),
+        })
+      : {
+          sgst: scanned.sgst ?? 9,
+          cgst: scanned.cgst ?? 9,
+        };
+
+    return {
+      code,
+      name,
+      hsn_code: hsn,
+      qty: scanned.qty,
+      unit: scanned.unit && ["Nos", "Mtr", "Kg", "Ltr", "Box", "Pcs", "Set", "Pair", "Roll", "Bag", "Bundle", "Dozen", "Sqft", "Sqm", "Ton"].includes(scanned.unit)
+        ? scanned.unit
+        : matched?.uom ?? "Nos",
+      rate: scanned.rate,
+      disc: scanned.disc ?? 0,
+      sgst: gst.sgst,
+      cgst: gst.cgst,
+      s_rate: scanned.s_rate,
+      mrp: scanned.mrp,
+    };
+  };
+
+  const applyScannedPurchase = (draft: ScannedPurchaseDraft) => {
+    if (draft.invoice_no) setInvoiceNo(draft.invoice_no);
+    if (draft.serial_no) setSerialNo(draft.serial_no);
+
+    if (draft.supplier_name) {
+      const knownSupplier = availableSuppliers.find(
+        (supplier) => supplier.toLowerCase() === draft.supplier_name!.toLowerCase(),
+      );
+      if (knownSupplier) {
+        setIsCustomSupplier(false);
+        setCustomSupplierText("");
+        setSupplierName(knownSupplier);
+      } else {
+        setIsCustomSupplier(true);
+        setCustomSupplierText(draft.supplier_name);
+        setSupplierName("CUSTOM_OPTION");
+      }
+    }
+
+    if (draft.purchase_type && PURCHASE_TYPES.includes(draft.purchase_type)) {
+      setPurchaseType(draft.purchase_type);
+    }
+    if (draft.branch_godown && BRANCHES_GODOWNS.includes(draft.branch_godown)) {
+      setBranchGodown(draft.branch_godown);
+    }
+    if (draft.entry_date) setEntryDate(draft.entry_date);
+    if (draft.invoice_date) setInvoiceDate(draft.invoice_date);
+    if (draft.vehicle_no) setVehicleNo(draft.vehicle_no);
+
+    if (draft.expenses != null && Number.isFinite(draft.expenses)) {
+      setExpenses(String(draft.expenses));
+    }
+
+    if (draft.items && draft.items.length > 0) {
+      setGridItems(draft.items.map(buildGridItemFromScan));
+    }
+
+    if (draft.paid_amount != null && Number.isFinite(draft.paid_amount)) {
+      setPaidAmount(String(draft.paid_amount));
+    }
+    if (draft.payment_status === "Paid" || draft.payment_status === "Partial" || draft.payment_status === "Pending") {
+      setPaymentStatus(draft.payment_status);
+    }
+  };
+
+  const handleBillPdfSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+      setBillScanMessage({ type: "error", text: "Please upload a PDF purchase bill." });
+      return;
+    }
+
+    setBillScanBusy(true);
+    setBillScanMessage(null);
+    setFormError(null);
+
+    try {
+      const result = await scanPurchaseBillPdf(file);
+      applyScannedPurchase(result.draft);
+      const { draft } = result;
+      const itemCount = draft.items?.length ?? 0;
+      const fields = [
+        draft.invoice_no && "invoice no.",
+        draft.supplier_name && "supplier",
+        itemCount > 0 && `${itemCount} line item${itemCount === 1 ? "" : "s"}`,
+      ].filter(Boolean);
+
+      if (result.warning) {
+        setBillScanMessage({ type: "info", text: result.warning });
+      } else {
+        setBillScanMessage({
+          type: "success",
+          text: fields.length > 0
+            ? `Bill scanned — filled ${fields.join(", ")}. Review all fields before saving.`
+            : "Bill scanned — limited details found. Review and complete the form manually.",
+        });
+      }
+    } catch (err) {
+      setBillScanMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "Failed to scan purchase bill.",
+      });
+    } finally {
+      setBillScanBusy(false);
+    }
   };
 
   // Submit Handler: Creates or Updates Purchases & Stock Quantities
@@ -2019,17 +2175,6 @@ export default function PurchasePage() {
     }
   };
 
-  const handleDownloadPurchase = async (rec: PurchaseRecord) => {
-    try {
-      await exportPurchasePdf(
-        buildPurchaseHtml(enrichPurchaseRecordForDocs(rec), { renderMode: "pdf" }),
-        `purchase_bill_${rec.invoice_no}.pdf`,
-      );
-    } catch (err) {
-      alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
-    }
-  };
-
   const openWhatsAppShare = (rec: PurchaseRecord) => {
     const enriched = enrichPurchaseRecordForDocs(rec);
     setWhatsappShare({
@@ -2119,6 +2264,8 @@ export default function PurchasePage() {
     setPaidAmount("");
     setPaymentStatus("Pending");
     setGridItems([{ code: "", name: "", hsn_code: "", qty: 1, unit: "Nos", rate: 0, disc: 0, sgst: 9, cgst: 9 }]);
+    setBillScanBusy(false);
+    setBillScanMessage(null);
     setEditingPurchase(null);
     setIsFormOpen(false);
     setTimeout(() => setSuccessMsg(null), 4000);
@@ -2368,6 +2515,68 @@ export default function PurchasePage() {
                   <span>{successMsg}</span>
                 </div>
               )}
+
+              {/* PDF bill scan — autofill from supplier invoice */}
+              <div className="bg-purple-50/80 border border-purple-200 rounded-xl p-4">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                  <div>
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-purple-800">
+                      Scan Purchase Bill (PDF)
+                    </h3>
+                    <p className="text-[11px] text-purple-700/90 mt-1 leading-relaxed max-w-2xl">
+                      Upload a supplier invoice PDF to auto-fill header fields, line items, GST, and totals.
+                      {import.meta.env.VITE_GEMINI_API_KEY
+                        ? " AI extraction is enabled."
+                        : " Add VITE_GEMINI_API_KEY to .env for best results on scanned bills."}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <input
+                      ref={billPdfInputRef}
+                      type="file"
+                      accept="application/pdf,.pdf"
+                      className="hidden"
+                      onChange={handleBillPdfSelected}
+                    />
+                    <button
+                      type="button"
+                      disabled={billScanBusy}
+                      onClick={() => billPdfInputRef.current?.click()}
+                      className="btn-primary bg-purple-600 hover:bg-purple-700 active:bg-purple-800 flex items-center gap-2 px-4 py-2 text-xs font-bold shadow-sm disabled:opacity-60"
+                    >
+                      {billScanBusy ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Scanning…
+                        </>
+                      ) : (
+                        <>
+                          <Upload className="w-4 h-4" />
+                          Upload &amp; Scan PDF
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+                {billScanMessage && (
+                  <div
+                    className={`mt-3 text-xs px-3 py-2 rounded-md border flex items-start gap-2 ${
+                      billScanMessage.type === "success"
+                        ? "bg-green-50 border-green-200 text-green-800"
+                        : billScanMessage.type === "error"
+                          ? "bg-red-50 border-red-200 text-red-800"
+                          : "bg-blue-50 border-blue-200 text-blue-800"
+                    }`}
+                  >
+                    {billScanMessage.type === "success" ? (
+                      <Check className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    ) : (
+                      <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    )}
+                    <span>{billScanMessage.text}</span>
+                  </div>
+                )}
+              </div>
 
               {/* ── Section 1: Header (Invoice Details) ── */}
               <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-4 space-y-4">
@@ -3027,14 +3236,6 @@ export default function PurchasePage() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleDownloadPurchase(rec)}
-                          className="text-slate-500 hover:text-slate-900 hover:bg-slate-100 p-1.5 rounded transition-all"
-                          title="Download PDF"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
                           onClick={() => openWhatsAppShare(rec)}
                           className="text-green-600 hover:text-green-700 hover:bg-green-50 p-1.5 rounded transition-all"
                           title="Send via WhatsApp"
@@ -3295,14 +3496,6 @@ export default function PurchasePage() {
 
             {/* Footer Buttons */}
             <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 bg-slate-50 p-4 rounded-b-xl sticky bottom-0 shrink-0">
-              <button
-                type="button"
-                onClick={() => handleDownloadPurchase(viewingPurchaseDisplay)}
-                className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download PDF
-              </button>
               <button
                 type="button"
                 onClick={() => openWhatsAppShare(viewingPurchaseDisplay)}

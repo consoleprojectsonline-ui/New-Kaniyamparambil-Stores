@@ -3698,7 +3698,7 @@ export default function SalesPage() {
                 <button type="submit"
                   className="btn-primary bg-green-600 hover:bg-green-700 active:bg-green-800 px-6 py-2 text-white text-xs font-bold rounded shadow-md flex items-center gap-1.5">
                   <Printer className="w-4 h-4" />
-                  {editingSale ? "Save &amp; Update Bill" : "Save &amp; Print Bill"}
+                  {editingSale ? "Save & Update Bill" : "Save & Print Bill"}
                 </button>
               </div>
             </form>

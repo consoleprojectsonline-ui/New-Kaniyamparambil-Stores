@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Link, useNavigate, useLocation, Routes, Route, Navigate } from "react-router-dom";
 import {
   Menu,
@@ -14,6 +14,7 @@ import {
   Building2,
   LifeBuoy,
   CreditCard,
+  ChevronDown,
 } from "lucide-react";
 import { useAuthStore } from "@/stores/authStore";
 import { cn } from "@/lib/utils";
@@ -28,6 +29,8 @@ import QuotationPage from "@/pages/quotation/QuotationPage";
 import SalesB2BPage from "@/pages/sales-b2b/SalesB2BPage";
 import SupportPage from "@/pages/support/SupportPage";
 import PaymentPage from "@/pages/payment/PaymentPage";
+import BusinessDetailsPage from "@/pages/business/BusinessDetailsPage";
+import { ProfileAvatar } from "@/components/ProfileAvatar";
 import { UtilitiesLauncher } from "@/components/utilities/UtilitiesLauncher";
 
 export default function AppLayout() {
@@ -35,6 +38,8 @@ export default function AppLayout() {
   const navigate = useNavigate();
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const profileMenuRef = useRef<HTMLDivElement>(null);
 
   // Auto-close sidebar on route change (for mobile)
   useEffect(() => {
@@ -43,6 +48,21 @@ export default function AppLayout() {
     }, 0);
     return () => clearTimeout(timer);
   }, [location.pathname]);
+
+  useEffect(() => {
+    setProfileMenuOpen(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!profileMenuOpen) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (profileMenuRef.current && !profileMenuRef.current.contains(event.target as Node)) {
+        setProfileMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [profileMenuOpen]);
 
   // Protect route
   useEffect(() => {
@@ -129,9 +149,10 @@ export default function AppLayout() {
 
       <div className="p-4 border-t border-border bg-gray-50/50">
         <div className="flex items-center gap-3 mb-4">
-          <div className="w-9 h-9 rounded-full bg-primary-100 flex items-center justify-center text-primary font-semibold text-sm">
-            {user.email?.[0].toUpperCase()}
-          </div>
+          <ProfileAvatar
+            className="w-9 h-9"
+            alt={user?.user_metadata?.owner_name || "Proprietor"}
+          />
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium text-text-primary truncate">
               {user?.user_metadata?.owner_name || "Manager"}
@@ -203,10 +224,67 @@ export default function AppLayout() {
             })}
           </nav>
 
-          <div className="flex items-center justify-end">
-            <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-white font-medium text-xs shrink-0">
-              {user.email?.[0].toUpperCase()}
-            </div>
+          <div className="relative flex items-center justify-end gap-2" ref={profileMenuRef}>
+            <button
+              type="button"
+              onClick={() => setProfileMenuOpen((open) => !open)}
+              className={cn(
+                "flex items-center gap-1.5 rounded-full pl-1 pr-2 py-1 transition-colors",
+                profileMenuOpen ? "bg-slate-100" : "hover:bg-slate-50",
+              )}
+              aria-expanded={profileMenuOpen}
+              aria-haspopup="menu"
+              aria-label="Account menu"
+            >
+              <ProfileAvatar
+                className="w-8 h-8"
+                alt={user?.user_metadata?.owner_name || "Proprietor"}
+              />
+              <ChevronDown className={cn("w-3.5 h-3.5 text-text-secondary transition-transform", profileMenuOpen && "rotate-180")} />
+            </button>
+
+            {profileMenuOpen && (
+              <div
+                role="menu"
+                className="absolute top-full right-0 mt-2 w-56 bg-white border border-border rounded-lg shadow-lg py-1 z-20 animate-in fade-in zoom-in-95 duration-100"
+              >
+                <div className="px-3 py-2.5 border-b border-border flex items-center gap-2.5">
+                  <ProfileAvatar className="w-9 h-9" alt={user?.user_metadata?.owner_name || "Proprietor"} />
+                  <div className="min-w-0">
+                    <p className="text-xs font-semibold text-text-primary truncate">
+                      {user?.user_metadata?.owner_name || "Manager"}
+                    </p>
+                    <p className="text-[10px] text-text-secondary truncate">{user.email}</p>
+                  </div>
+                </div>
+                <Link
+                  to="/app/business"
+                  role="menuitem"
+                  className={cn(
+                    "flex items-center gap-2 px-3 py-2.5 text-sm transition-colors",
+                    location.pathname === "/app/business"
+                      ? "bg-primary/5 text-primary font-medium"
+                      : "text-text-secondary hover:bg-gray-50 hover:text-text-primary",
+                  )}
+                  onClick={() => setProfileMenuOpen(false)}
+                >
+                  <Building2 className="w-4 h-4" />
+                  My Business Details
+                </Link>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setProfileMenuOpen(false);
+                    void handleLogout();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2.5 text-sm text-red-600 hover:bg-red-50 transition-colors"
+                >
+                  <LogOut className="w-4 h-4" />
+                  Sign Out
+                </button>
+              </div>
+            )}
           </div>
         </header>
 
@@ -222,6 +300,7 @@ export default function AppLayout() {
             <Route path="quotation" element={<QuotationPage />} />
             <Route path="payment"   element={<PaymentPage />} />
             <Route path="support"   element={<SupportPage />} />
+            <Route path="business"  element={<BusinessDetailsPage />} />
             <Route path="*"         element={<Navigate to="dashboard" replace />} />
           </Routes>
         </main>

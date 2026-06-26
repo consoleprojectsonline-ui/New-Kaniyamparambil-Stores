@@ -1082,22 +1082,6 @@ export default function InventoryPage() {
     }
   };
 
-  const handleDownloadItem = async (item: InventoryItem) => {
-    try {
-      await exportInventoryPdf(
-        buildInventoryItemHtml(item, {
-          renderMode: "pdf",
-          helperText: "Generating product specification PDF...",
-        }),
-        `product_${item.code}.pdf`,
-        true,
-      );
-    } catch (err) {
-      console.error("Failed to download item PDF:", err);
-      alert("Failed to download product specification PDF.");
-    }
-  };
-
   // Delete Item
   const handleDeleteItem = async (itemCode: string) => {
     if (!window.confirm(`Are you sure you want to delete item "${itemCode}"?`)) {
@@ -1734,14 +1718,6 @@ export default function InventoryPage() {
               </button>
               <button
                 type="button"
-                onClick={() => viewingItem && handleDownloadItem(viewingItem)}
-                className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download PDF
-              </button>
-              <button
-                type="button"
                 onClick={() => setViewingItem(null)}
                 className="btn-primary bg-slate-900 hover:bg-slate-800 active:bg-slate-950 px-6 py-2 font-bold shadow-sm text-white transition-colors rounded text-xs"
               >
@@ -1996,14 +1972,6 @@ export default function InventoryPage() {
                           title="Edit Item"
                         >
                           <Edit className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleDownloadItem(item)}
-                          className="text-slate-500 hover:text-slate-900 hover:bg-slate-100 p-1.5 rounded transition-all"
-                          title="Download PDF Catalog"
-                        >
-                          <Download className="w-3.5 h-3.5" />
                         </button>
                         <button
                           type="button"

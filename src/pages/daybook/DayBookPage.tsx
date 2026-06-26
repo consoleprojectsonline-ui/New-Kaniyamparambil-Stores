@@ -1457,24 +1457,6 @@ export default function DayBookPage() {
     }
   };
 
-  const handleDownloadTransaction = async (rec: DayBookRow) => {
-    try {
-      const ref = rec.reference_no || rec.id.slice(0, 12);
-      await exportDayBookPdf(
-        buildDayBookHtml(buildDayBookStatementData([rec], {
-          periodLabel: formatDisplayDate(rec.date),
-          reportType: "Day Book Voucher",
-        }, computeDayTotals([rec])), {
-          renderMode: "pdf",
-          voucher: rec,
-        }),
-        `daybook_voucher_${ref}.pdf`,
-      );
-    } catch (err) {
-      alert(`PDF download failed: ${err instanceof Error ? err.message : "Unknown error"}`);
-    }
-  };
-
   return (
     <div className="p-6 space-y-6">
       {/* ── Page Header ── */}
@@ -1718,14 +1700,6 @@ export default function DayBookPage() {
                           title="Print Voucher"
                         >
                           <Printer className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleDownloadTransaction(tx)}
-                          className="text-slate-500 hover:text-slate-900 hover:bg-slate-100 p-1.5 rounded transition-all"
-                          title="Download voucher PDF"
-                        >
-                          <Download className="w-3.5 h-3.5" />
                         </button>
                         <button
                           type="button"
@@ -1991,14 +1965,6 @@ export default function DayBookPage() {
 
             {/* Footer Buttons */}
             <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200 bg-slate-50 p-4 rounded-b-xl">
-              <button
-                type="button"
-                onClick={() => handleDownloadTransaction(viewingTransaction)}
-                className="btn-secondary px-4 py-2 font-semibold text-xs border border-slate-300 text-slate-700 hover:bg-slate-100 transition-colors rounded flex items-center gap-1.5"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download PDF
-              </button>
               <button
                 type="button"
                 onClick={() => void openDayBookWhatsApp(viewingTransaction)}
